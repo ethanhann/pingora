@@ -106,10 +106,16 @@ where
 /// Attempt to load the native cas into the given root-certificate store
 pub fn load_platform_certs_incl_env_into_store(ca_certs: &mut RootCertStore) -> Result<()> {
     // this includes handling of ENV vars SSL_CERT_FILE & SSL_CERT_DIR
-    for cert in load_native_certs()
-        .or_err(ErrorType::InvalidCert, "Failed to load native certificates")?
-        .into_iter()
-    {
+    let native_certs = load_native_certs();
+    if let Some(error) = native_certs.errors.into_iter().next() {
+        return Error::e_because(
+            ErrorType::InvalidCert,
+            "Failed to load native certificates",
+            error,
+        );
+    }
+
+    for cert in native_certs.certs {
         ca_certs.add(cert).or_err(
             ErrorType::InvalidCert,
             "Failed to load native certificate into root store",
