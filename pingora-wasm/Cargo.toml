@@ -1,0 +1,18 @@
+[package]
+name = "pingora-wasm"
+version = "0.9.0"
+authors = ["Ethan Hann <ethanhann@gmail.com>"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/cloudflare/pingora"
+categories = ["asynchronous", "network-programming"]
+keywords = ["extensibility", "pingora", "wasm"]
+description = """
+WASM extensibility for Pingora.
+"""
+
+[dependencies]
+wasmtime = "48"
+
+[lints]
+workspace = true

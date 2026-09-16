@@ -28,6 +28,7 @@ members = [
     "pingora-prometheus",
     "pingora-foundations",
     "pingora-test-utils",
+    "pingora-wasm",
     "tinyufo",
 ]
 
