@@ -14,18 +14,18 @@
 
 //! Run [Proxy-Wasm](https://github.com/proxy-wasm/spec) plugins in a Pingora proxy.
 //!
-//! A [WasmRuntime] compiles your plugins once and keeps their guests. A [WasmChain] is an
-//! ordered list of those plugins, and a proxy can build one chain for all traffic or one chain
-//! for each route. For each request, create a [WasmCtx] from a chain and call its phases from
-//! your `ProxyHttp` hooks:
+//! A [WasmRuntime] compiles your plugins once, before the server starts. A [WasmChain] is an
+//! ordered list of those plugins. Build one chain for all traffic, or one chain for each route.
+//! For each request, create a [WasmCtx] from a chain and call its phases from your `ProxyHttp`
+//! filters:
 //!
 //! - [WasmCtx::request_filter] from `request_filter`, after the checks your proxy runs itself
 //! - [WasmCtx::response_filter] from `response_filter`
 //! - [WasmCtx::logging] from `logging`, for every request that created a `WasmCtx`
 //!
-//! When a plugin answers a request itself, `request_filter` returns [RequestOutcome::Respond].
-//! When a plugin fails, a phase returns an error of type [ERR_PLUGIN_FAILED], which Pingora
-//! answers with 503.
+//! When a plugin sends its own response, [WasmCtx::request_filter] returns
+//! [RequestOutcome::Respond] and the request does not go to the upstream. When a plugin fails,
+//! a phase returns an error of type [ERR_PLUGIN_FAILED], and Pingora responds with 503.
 //!
 //! ```no_run
 //! use async_trait::async_trait;
@@ -107,9 +107,10 @@ use http::StatusCode;
 use pingora_error::{Error, ErrorType};
 use proxy_wasm_host::abi::v0_2_1::GuestError;
 
-/// The error type of a phase that fails because of a plugin.
+/// The error type that a phase returns when a plugin fails.
 ///
-/// Pingora's default `fail_to_proxy` answers it with 503. Match it there to answer differently.
+/// The default `fail_to_proxy` of `ProxyHttp` responds with 503 for this type. Check for it in
+/// your own `fail_to_proxy` to send a different response.
 pub const ERR_PLUGIN_FAILED: ErrorType =
     ErrorType::HTTPStatus(StatusCode::SERVICE_UNAVAILABLE.as_u16());
 

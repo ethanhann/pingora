@@ -18,8 +18,8 @@ use proxy_wasm_host::abi::v0_2_1::{LogContext, LogSink};
 
 pub(crate) const GUEST_TARGET: &str = "pingora_wasm::guest";
 
-/// Sends guest log lines to the `log` crate, with the target `pingora_wasm::guest` and the
-/// plugin name and context id in front of the message.
+/// The default log sink. It writes each guest log line to the `log` crate with the target
+/// `pingora_wasm::guest`, and puts the plugin name and the context id in front of the message.
 pub(crate) struct LogCrateSink;
 
 impl LogSink for LogCrateSink {

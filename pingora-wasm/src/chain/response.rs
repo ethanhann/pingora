@@ -23,12 +23,12 @@ use pingora_proxy::Session;
 use proxy_wasm_host::abi::v0_2_1::types::Action;
 
 impl WasmCtx {
-    /// Runs `proxy_on_response_headers` of each plugin that saw the request, in reverse chain
+    /// Run `proxy_on_response_headers` of each plugin that saw the request, in reverse chain
     /// order.
     ///
-    /// Call it from `response_filter`. Plugins can read the request headers and can read and
-    /// change the response headers. Informational responses other than 101 are not passed to
-    /// the plugins.
+    /// Call it from `response_filter`. Plugins can read the request headers, and can read and
+    /// change the response headers before they go to the downstream. Informational (1xx)
+    /// responses other than 101 do not run the plugins.
     ///
     /// # Errors
     ///
@@ -48,8 +48,7 @@ impl WasmCtx {
         self.response_pass(session, resp, (0..self.records.len()).rev(), end_of_stream)
     }
 
-    /// Runs `proxy_on_response_headers` of the plugins at `positions`, in that order, on
-    /// `resp`.
+    /// Run `proxy_on_response_headers` of the plugins at `positions`, in that order, on `resp`.
     pub(super) fn response_pass<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -129,7 +128,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_response_on_a_replaced_guest_answers_503() {
+    async fn a_response_on_a_replaced_guest_fails() {
         let (runtime, mut ctx) = one_plugin(add_request_header());
         let (mut session, _client) = session(GET).await;
         ctx.request_filter(&mut session).await.unwrap();

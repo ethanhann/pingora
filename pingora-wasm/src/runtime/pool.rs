@@ -15,7 +15,7 @@
 //! The guests of one plugin.
 //!
 //! A guest runs one callback at a time, so a plugin keeps several guests, one in each slot. A
-//! request stays on the slot it started on, because its plugin contexts live in that guest.
+//! request stays on the slot it started on, because its plugin context is in that guest.
 
 use crate::{plugin_failure, plugin_unavailable};
 use log::{error, warn};
@@ -88,10 +88,10 @@ impl GuestPool {
         }
     }
 
-    /// Picks a slot for a new request and locks it.
+    /// Pick a slot for a new request and lock it.
     ///
-    /// A free slot with a guest comes first. Otherwise one slot whose guest was lost is rebuilt
-    /// when its backoff has passed. When every slot is busy, this waits for one.
+    /// A free slot with a guest comes first. If there is none, one slot whose guest was lost is
+    /// rebuilt when its backoff has passed. When every slot is busy, this waits for one.
     pub(crate) fn pick(&self) -> Result<(usize, SlotGuard<'_>)> {
         let count = self.slots.len();
         let first = self.next.fetch_add(1, Ordering::Relaxed) % count;
@@ -120,8 +120,8 @@ impl GuestPool {
         Err(plugin_unavailable(&self.name, "has no guest"))
     }
 
-    /// Locks the slot of a request, or returns `None` when a new guest replaced the one that
-    /// holds the request's context.
+    /// Lock the slot of a request. Return `None` when a new guest replaced the one that holds
+    /// the context of the request.
     pub(crate) fn lock(&self, index: usize, guest: GuestId) -> Option<SlotGuard<'_>> {
         let guard = self.slots[index].guest.lock();
         match guard.as_ref() {
@@ -130,8 +130,8 @@ impl GuestPool {
         }
     }
 
-    /// Replaces the guest of a slot when it cannot serve after `err`, that is after a trap or
-    /// when it has no context ids left.
+    /// Replace the guest of a slot when `err` leaves it unusable, which happens after a trap or
+    /// when the guest has no context ids left.
     pub(crate) fn check(&self, index: usize, mut guard: SlotGuard<'_>, err: &GuestError) {
         let lost = match guard.as_ref() {
             Some(loaded) => {
@@ -224,7 +224,7 @@ impl GuestPool {
         self.slots[index].guest.lock()
     }
 
-    /// Replaces the guest of a slot, as a trap does.
+    /// Replace the guest of a slot, as a trap does.
     #[cfg(test)]
     pub(crate) fn replace_slot(&self, index: usize) {
         self.slots[index].guest.lock().take();

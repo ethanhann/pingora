@@ -66,7 +66,7 @@ impl log::Log for Capture {
     fn flush(&self) {}
 }
 
-/// Every guest log line so far.
+/// Return every guest log line so far.
 pub fn guest_lines() -> Vec<String> {
     GUEST_LINES.lock().unwrap().clone()
 }
@@ -131,7 +131,7 @@ impl ProxyHttp for TestProxy {
 
 static RUNTIMES: OnceCell<HashMap<u16, WasmRuntime>> = OnceCell::new();
 
-/// The runtime that serves `port`.
+/// The runtime of the service on `port`.
 pub fn runtime(port: u16) -> &'static WasmRuntime {
     &RUNTIMES.get().expect("the test server is started")[&port]
 }
@@ -246,7 +246,7 @@ pub async fn init() {
     .unwrap();
 }
 
-/// An origin that echoes each request header as `x-echo-<name>` and the body length as
+/// Start an origin that echoes each request header as `x-echo-<name>` and the body length as
 /// `x-echo-body-len`, and counts its requests.
 pub async fn echo_origin() -> (HttpOrigin, Arc<AtomicUsize>) {
     let count = Arc::new(AtomicUsize::new(0));
@@ -280,7 +280,7 @@ pub fn url(port: u16, path: &str) -> String {
     format!("http://127.0.0.1:{port}{path}")
 }
 
-/// Waits until `check` answers true, for up to five seconds.
+/// Wait until `check` returns true, for up to five seconds.
 pub async fn eventually(check: impl Fn() -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {

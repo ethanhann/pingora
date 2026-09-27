@@ -79,7 +79,7 @@ async fn a_plugin_adds_a_response_header_from_its_configuration() {
 }
 
 #[tokio::test]
-async fn a_plugin_answers_a_request_itself() {
+async fn a_plugin_sends_its_own_response() {
     init().await;
     let (origin, count) = echo_origin().await;
 
@@ -111,7 +111,7 @@ async fn a_denied_request_never_reaches_the_origin() {
 }
 
 #[tokio::test]
-async fn a_trap_answers_503_and_the_next_request_is_served() {
+async fn a_trap_responds_with_503_and_the_next_request_succeeds() {
     init().await;
     let (origin, _) = echo_origin().await;
 

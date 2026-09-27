@@ -23,7 +23,8 @@ use proxy_wasm_host::HeaderMap;
 use std::fmt;
 use std::mem;
 
-/// Where a plugin keeps its context for one request: the slot, the guest, and the context id.
+/// The location of the context of one plugin for one request: the slot, the guest, and the
+/// context id.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PluginRecord {
     pub(crate) slot: usize,
@@ -33,12 +34,12 @@ pub(crate) struct PluginRecord {
 
 /// The state of one request in the plugins of one chain.
 ///
-/// Create it with [WasmChain::new_ctx] and keep it in the `CTX` of your proxy. It keeps its
-/// chain and runtime alive, so a request finishes on the runtime it started on.
+/// Create it with [WasmChain::new_ctx] and keep it in the `CTX` of your proxy. It holds a
+/// reference to its chain and runtime, so a request finishes on the runtime it started on.
 ///
-/// Call [WasmCtx::logging] for every `WasmCtx` you create, so each plugin sees the end of its
-/// request. If the request task ends first, dropping the `WasmCtx` ends each open context
-/// without `proxy_on_log`.
+/// Call [WasmCtx::logging] for every `WasmCtx` you create, so that each plugin sees the end of
+/// its request. If the request task ends before `logging`, dropping the `WasmCtx` ends each open
+/// context without `proxy_on_log`.
 pub struct WasmCtx {
     pub(crate) chain: WasmChain,
     pub(crate) records: Vec<Option<PluginRecord>>,
@@ -71,7 +72,7 @@ impl WasmCtx {
         }
     }
 
-    /// Runs `body` with the guest while the guest holds the stream state.
+    /// Run `body` on the guest while the guest holds the stream state.
     pub(crate) fn run<R>(
         &mut self,
         guest: &mut Guest,
@@ -82,8 +83,8 @@ impl WasmCtx {
         result
     }
 
-    /// Moves the request header from the session into the stream state for a callback, and
-    /// leaves a placeholder in the session.
+    /// Move the request header from the session into the stream state for a callback, and put
+    /// a placeholder in the session.
     pub(crate) fn request_in(&mut self, header: &mut RequestHeader) {
         let spare = self
             .spare_request
@@ -93,7 +94,7 @@ impl WasmCtx {
         self.stream.request = Some(RequestHeaders::new(request, self.scheme.clone()));
     }
 
-    /// Moves the request header back into the session.
+    /// Move the request header back into the session.
     pub(crate) fn request_out(&mut self, header: &mut RequestHeader) {
         if let Some(request) = self.stream.request.take() {
             self.spare_request = Some(mem::replace(header, request.header));

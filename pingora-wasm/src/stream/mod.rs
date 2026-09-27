@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! What a plugin reads and writes during a callback: the request and response headers, and the
-//! response it can send in place of the upstream response.
+//! What a plugin can read and write during a callback: the request and response headers, and
+//! the response it can send in place of the upstream response.
 
 mod names;
 mod plugin_response;
@@ -30,9 +30,9 @@ use proxy_wasm_host::abi::v0_2_1::types::{MapType, Status};
 use proxy_wasm_host::abi::v0_2_1::{Access, Callback, Invocation, LocalResponse, StreamState};
 use proxy_wasm_host::{HeaderMap, VecHeaderMap};
 
-/// The state a guest can reach during one callback.
+/// The state that a guest can read and write during one callback.
 ///
-/// The phases move the Pingora headers in before each callback and back after it.
+/// The phases move the Pingora headers into it before each callback, and back after it.
 #[derive(Default)]
 pub(crate) struct PingoraStream {
     pub(crate) request: Option<RequestHeaders>,
@@ -211,9 +211,9 @@ mod tests {
     fn send_local_response_records_the_response() {
         let mut s = stream(false);
 
-        let answer = s.send_local_response(call(Callback::RequestHeaders), local(403));
+        let result = s.send_local_response(call(Callback::RequestHeaders), local(403));
 
-        assert_eq!(answer, Ok(()));
+        assert_eq!(result, Ok(()));
         let recorded = s.plugin_response.unwrap();
         assert_eq!(recorded.header.status, 403);
         assert_eq!(&recorded.body[..], b"body");
@@ -242,9 +242,9 @@ mod tests {
         for (callback, status, refusal) in cases {
             let mut s = stream(true);
 
-            let answer = s.send_local_response(call(callback), local(status));
+            let result = s.send_local_response(call(callback), local(status));
 
-            assert_eq!(answer, Err(refusal));
+            assert_eq!(result, Err(refusal));
             assert!(s.plugin_response.is_none());
         }
     }

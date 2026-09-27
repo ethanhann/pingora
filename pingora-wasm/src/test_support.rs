@@ -76,7 +76,8 @@ pub(crate) fn wat_guest(label: &str, guest: Wat) -> PathBuf {
     path
 }
 
-/// A session that has read `request`, and the client end of its connection.
+/// Build a session that has read `request`, and return it with the client end of its
+/// connection.
 pub(crate) async fn session(request: &[u8]) -> (Session, DuplexStream) {
     let (mut client, server) = tokio::io::duplex(4096);
     client.write_all(request).await.unwrap();
@@ -87,7 +88,7 @@ pub(crate) async fn session(request: &[u8]) -> (Session, DuplexStream) {
 
 pub(crate) const GET: &[u8] = b"GET /original HTTP/1.1\r\nHost: example.test\r\n\r\n";
 
-/// A runtime with one plugin named `a`, and a request context from a chain of it.
+/// Build a runtime with one plugin named `a`, and a request context from a chain of it.
 pub(crate) fn one_plugin(conf: WasmPluginConf) -> (WasmRuntime, WasmCtx) {
     let runtime = WasmRuntime::new(vec![conf]).unwrap();
     let ctx = runtime.chain(&["a"]).unwrap().new_ctx();
@@ -98,7 +99,8 @@ pub(crate) fn add_request_header() -> WasmPluginConf {
     plugin("a", fixture("add-request-header"), 1)
 }
 
-/// A WAT plugin named `a` whose `proxy_on_request_headers` runs `request_headers`.
+/// Build the configuration of a WAT plugin named `a` whose `proxy_on_request_headers` runs
+/// `request_headers`.
 pub(crate) fn wat_plugin(label: &str, request_headers: &'static str) -> WasmPluginConf {
     let wat = Wat {
         request_headers,
@@ -107,7 +109,7 @@ pub(crate) fn wat_plugin(label: &str, request_headers: &'static str) -> WasmPlug
     plugin("a", wat_guest(label, wat), 1)
 }
 
-/// Every pair of a header map, as text.
+/// Return every pair of a header map, as text.
 pub(crate) fn pairs(map: &dyn HeaderMap) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let _ = map.for_each_pair(&mut |k, v| {

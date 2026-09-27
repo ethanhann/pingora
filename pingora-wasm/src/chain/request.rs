@@ -24,12 +24,15 @@ use proxy_wasm_host::abi::v0_2_1::types::Action;
 use proxy_wasm_host::abi::v0_2_1::StreamKind;
 
 impl WasmCtx {
-    /// Runs `proxy_on_request_headers` of each plugin, in chain order.
+    /// Run `proxy_on_request_headers` of each plugin, in chain order.
     ///
     /// Call it from `request_filter`, after the checks your proxy runs itself. Plugins can read
-    /// and change the request headers. When a plugin answers the request, the later plugins do
-    /// not run, the earlier plugins see the response headers, and the response is returned as
-    /// [RequestOutcome::Respond]. Subrequests are not passed to the plugins.
+    /// and change the request headers.
+    ///
+    /// When a plugin sends its own response, the later plugins do not run and the earlier
+    /// plugins see the response headers. The response comes back as [RequestOutcome::Respond].
+    ///
+    /// Subrequests do not run the plugins.
     ///
     /// # Errors
     ///

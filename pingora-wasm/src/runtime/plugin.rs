@@ -25,13 +25,13 @@ use std::sync::Arc;
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct WasmPluginConf {
-    /// A name that is unique in the runtime. Chains refer to the plugin by it, and guest log
-    /// lines start with it.
+    /// A name that is unique in the runtime. Chains refer to the plugin by this name, and guest
+    /// log lines start with it.
     pub name: String,
     /// The path of the compiled `.wasm` file.
     pub path: PathBuf,
-    /// The root id that the plugin receives when it is configured. SDKs use it to pick a root
-    /// context.
+    /// The root id that the plugin receives when it is configured. Proxy-Wasm SDKs use it to
+    /// select the root context of the plugin.
     pub root_id: String,
     /// The VM id. Plugins with the same VM id share data and queues.
     pub vm_id: String,
@@ -40,18 +40,20 @@ pub struct WasmPluginConf {
     /// Bytes that the plugin reads when it is configured, for example a JSON document.
     pub configuration: Vec<u8>,
     /// The level that the plugin receives when it asks the host for its log level. Most SDKs
-    /// set their own level and never ask.
+    /// set their own level and do not ask.
     pub log_level: LogLevel,
     /// The memory and CPU time limits of each guest. Fuel limits are not supported.
     pub limits: Limits,
-    /// The number of guests. A guest runs one callback at a time, so set it to the thread
-    /// count of the service.
+    /// The number of guests. A guest runs one callback at a time, so set this to the thread
+    /// count of the service that uses the plugin.
     pub slots: usize,
 }
 
 impl WasmPluginConf {
-    /// A plugin at `path` with one slot, its name as the VM id, no configuration, the log
-    /// level `Info`, and default limits.
+    /// Create the configuration of the plugin at `path`.
+    ///
+    /// The plugin has one slot, its name as the VM id, no configuration, the log level `Info`,
+    /// and the default limits.
     pub fn new(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
         let name = name.into();
         WasmPluginConf {

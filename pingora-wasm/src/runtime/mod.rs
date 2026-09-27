@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Plugins and their guests. They are built once and shared by every request.
+//! The plugins of a proxy and their guests, built once and shared by every request.
 
 mod log_sink;
 mod plugin;
@@ -32,12 +32,14 @@ use std::fmt;
 use std::sync::Arc;
 use ticker::{with_ticker, Ticker};
 
-/// Compiled plugins and their guests.
+/// The compiled plugins of a proxy and their guests.
 ///
-/// Build it once, before the server starts, and clone it where you need it. Each plugin gets
-/// its own guests, and all plugins share one data store that is separated by VM id. To reload
-/// plugins, build a new runtime and use it for new requests. Requests that started on the old
-/// runtime finish on it.
+/// Build it once, before the server starts, and clone it where you need it. Clones share the
+/// same plugins. All plugins share one data store, and plugins with the same VM id see the same
+/// data.
+///
+/// To reload plugins, build a new runtime and use it for new requests. A request that started
+/// on the old runtime finishes on it.
 #[derive(Clone)]
 pub struct WasmRuntime {
     pub(crate) inner: Arc<RuntimeInner>,
@@ -51,21 +53,24 @@ pub(crate) struct RuntimeInner {
 }
 
 impl WasmRuntime {
-    /// Compiles each plugin and starts its guests.
+    /// Compile each plugin and start its guests.
     ///
     /// Guest log lines go to the `log` crate with the target `pingora_wasm::guest`.
     ///
     /// # Errors
     ///
-    /// The error names the plugin. A plugin fails when its file cannot be read, when it is not
-    /// a Proxy-Wasm module, when it refuses to start or traps while it starts, when its name is
-    /// used twice, when it has zero slots, or when its limits set fuel.
+    /// The error message names the plugin. The build fails when a file cannot be read, when a
+    /// file is not a Proxy-Wasm module, when a plugin refuses to start or traps while it starts,
+    /// when two plugins have the same name, when a plugin has zero slots, or when its limits set
+    /// fuel.
     pub fn new(plugins: Vec<WasmPluginConf>) -> Result<Self> {
         Self::new_with_log_sink(plugins, Arc::new(LogCrateSink))
     }
 
-    /// Like [WasmRuntime::new], with guest log lines sent to `sink`, for example to keep them
-    /// in the `tracing` span of the request.
+    /// Compile each plugin and start its guests, with guest log lines sent to `sink`.
+    ///
+    /// Use it to send guest log lines to your own logger, for example to keep them in the
+    /// `tracing` span of the request. Otherwise it is the same as [WasmRuntime::new].
     pub fn new_with_log_sink(plugins: Vec<WasmPluginConf>, sink: Arc<dyn LogSink>) -> Result<Self> {
         if plugins.is_empty() {
             return Error::e_explain(ErrorType::InternalError, "no wasm plugin to run");
@@ -127,10 +132,10 @@ impl WasmRuntime {
         })
     }
 
-    /// Builds a chain of the named plugins.
+    /// Build a chain of the named plugins.
     ///
     /// The request phase runs the plugins in this order, and the response phase runs them in
-    /// reverse. A plugin can be in several chains, and its guests serve all of them.
+    /// reverse. A plugin can be in several chains, and all of them use its guests.
     ///
     /// # Errors
     ///
@@ -158,17 +163,18 @@ impl WasmRuntime {
         Ok(WasmChain::new(self.inner.clone(), plugins))
     }
 
-    /// The number of plugin contexts of requests that are in progress.
+    /// Return the number of plugin contexts that are open.
     ///
-    /// Each plugin of a chain opens one context for each request, and `logging` closes it.
+    /// Each plugin of a chain opens one context for each request, and [WasmCtx::logging](crate::WasmCtx::logging) closes
+    /// it. The number returns to zero when no request is in progress.
     pub fn open_contexts(&self) -> usize {
         self.inner.pools.iter().map(GuestPool::open_contexts).sum()
     }
 
-    /// The number of plugin contexts that a guest keeps after its request ended.
+    /// Return the number of plugin contexts that a guest keeps after its request ended.
     ///
-    /// A guest keeps a context when it answers `false` from `proxy_on_done`. The context is
-    /// released when that guest is replaced.
+    /// A guest keeps a context when its `proxy_on_done` returns `false`. The context stays until
+    /// that guest is replaced.
     pub fn held_contexts(&self) -> usize {
         self.inner.pools.iter().map(GuestPool::held_contexts).sum()
     }
@@ -183,7 +189,7 @@ impl fmt::Debug for WasmRuntime {
 }
 
 impl RuntimeInner {
-    /// Starts the epoch ticker on the first call, as [Ticker::start] describes.
+    /// Start the epoch ticker on the first call, as [Ticker::start] describes.
     pub(crate) fn start_ticker(self: &Arc<Self>) -> Result<()> {
         self.ticker.start(self)
     }

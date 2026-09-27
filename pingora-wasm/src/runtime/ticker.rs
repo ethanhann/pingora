@@ -14,7 +14,8 @@
 
 //! The epoch ticker.
 //!
-//! A guest's CPU time is measured in epochs, so without the ticker no guest has a time limit.
+//! Wasmtime measures the CPU time of a guest in epochs, and the ticker advances the epoch.
+//! Without it, a guest has no CPU time limit.
 
 use super::RuntimeInner;
 use crate::ERR_PLUGIN_FAILED;
@@ -45,12 +46,12 @@ impl Ticker {
         }
     }
 
-    /// Starts the ticker thread on the first call.
+    /// Start the ticker thread on the first call.
     ///
-    /// The thread does not start in [WasmRuntime::new](crate::WasmRuntime::new), because
-    /// Pingora forks in daemon mode after the runtime is built, and a fork keeps no thread. It
-    /// stops when the runtime is dropped. A failed start is an error, and the next call tries
-    /// again.
+    /// The thread does not start in [WasmRuntime::new](crate::WasmRuntime::new), because in
+    /// daemon mode Pingora forks after the runtime is built, and the forked process has no
+    /// threads of its parent. The thread stops when the runtime is dropped. If the thread cannot
+    /// start, this returns an error and the next call tries again.
     pub(crate) fn start(&self, runtime: &Arc<RuntimeInner>) -> Result<()> {
         if self.started.load(Ordering::Acquire) {
             return Ok(());
@@ -88,8 +89,8 @@ fn tick(runtime: &Weak<RuntimeInner>, period: Duration) {
     }
 }
 
-/// Runs `f` with a ticker that stops when `f` returns, so a guest start that loops forever
-/// reaches its time limit.
+/// Run `f` with a ticker that stops when `f` returns, so a guest that loops forever while it
+/// starts reaches its time limit.
 pub(super) fn with_ticker<R>(engine: &Engine, f: impl FnOnce() -> R) -> R {
     struct Done<'a>(&'a AtomicBool);
 

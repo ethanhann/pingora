@@ -30,7 +30,7 @@ pub(crate) struct PluginResponse {
 }
 
 impl PluginResponse {
-    /// Builds the response, or `None` for a status or a header that is not valid.
+    /// Build the response. Return `None` when the status or a header is not valid.
     pub(crate) fn build(response: &LocalResponse<'_>) -> Option<Self> {
         let status = u16::try_from(response.status_code)
             .ok()
@@ -60,10 +60,11 @@ impl PluginResponse {
     }
 }
 
-/// Writes a response that a plugin sent, as [RequestOutcome::Respond](crate::RequestOutcome).
+/// Write the response that a plugin sent to the downstream.
 ///
-/// A proxy that writes its responses with its own code, for example to add headers or record
-/// metrics, can write the header and the body itself.
+/// Use it for the header and the body of [RequestOutcome::Respond](crate::RequestOutcome). If
+/// your proxy writes its responses with its own code, for example to add headers or record
+/// metrics, write the header and the body with that code instead.
 pub async fn write_plugin_response<DS: DownstreamSession>(
     session: &mut Session<DS>,
     header: Box<ResponseHeader>,
@@ -76,7 +77,7 @@ pub async fn write_plugin_response<DS: DownstreamSession>(
     session.write_response_body(Some(body), true).await
 }
 
-/// A status that ends a response, from 200 to 599.
+/// Whether `status` ends a response, which is true from 200 to 599.
 fn is_final(status: &StatusCode) -> bool {
     status.is_success()
         || status.is_redirection()

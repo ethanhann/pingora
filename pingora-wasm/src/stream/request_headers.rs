@@ -48,7 +48,8 @@ impl RequestHeaders {
         }
     }
 
-    /// The path in origin form. For an absolute form target, the path and query of its URI.
+    /// Return the path in origin form. For an absolute form target, return the path and query
+    /// of its URI.
     fn path(&self) -> Option<&[u8]> {
         if self.header.method == Method::CONNECT {
             return None;
@@ -107,7 +108,8 @@ fn set_request_pseudo(
     }
 }
 
-/// A guest writes a path in origin form, or `*`, as an HTTP/2 `:path` must be.
+/// Whether a guest can write `value` as `:path`. It must be in origin form, or `*`, as an
+/// HTTP/2 `:path` must be.
 fn is_origin_path(value: &[u8]) -> bool {
     (value.first() == Some(&b'/') || value == b"*")
         && !value.iter().any(|b| *b == b' ' || b.is_ascii_control())

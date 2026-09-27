@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The work done for each request: a chain of plugins and the phases that run them.
+//! A chain of plugins and the phases that run them on each request.
 
 mod ctx;
 mod logging;
@@ -43,7 +43,7 @@ pub struct WasmChain {
 pub enum RequestOutcome {
     /// Every plugin let the request continue to the upstream.
     Continue,
-    /// A plugin answered the request. Write this response, for example with
+    /// A plugin sent its own response. Write it to the downstream, for example with
     /// [write_plugin_response](crate::write_plugin_response), and return `Ok(true)` from
     /// `request_filter`.
     Respond(Box<ResponseHeader>, Bytes),
@@ -57,7 +57,7 @@ impl WasmChain {
         }
     }
 
-    /// Creates the state of one request. Keep it in the `CTX` of your proxy.
+    /// Create the state of one request. Keep it in the `CTX` of your proxy.
     pub fn new_ctx(&self) -> WasmCtx {
         WasmCtx::new(self.clone())
     }

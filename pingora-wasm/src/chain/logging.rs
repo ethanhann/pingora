@@ -20,11 +20,12 @@ use pingora_proxy::Session;
 use proxy_wasm_host::abi::v0_2_1::{CallScope, ContextId, GuestError, StreamState};
 
 impl WasmCtx {
-    /// Ends the request in each plugin that saw it, in reverse chain order, with
-    /// `proxy_on_done`, `proxy_on_log`, and `proxy_on_delete`.
+    /// End the request in each plugin that saw it, in reverse chain order.
     ///
-    /// Call it from `logging`, for every request that created this `WasmCtx`. A plugin failure
-    /// here is logged and not returned, because the response is already sent.
+    /// Call it from `logging`, for every request that created this `WasmCtx`. Each plugin runs
+    /// `proxy_on_done`, `proxy_on_log`, and `proxy_on_delete`, and can read the request headers
+    /// and the response headers. A plugin failure here is logged and not returned, because the
+    /// response is already sent.
     pub async fn logging<DS: DownstreamSession>(&mut self, session: &mut Session<DS>) {
         let runtime = self.chain.runtime.clone();
         let mut response = session.response_written().cloned();
@@ -55,9 +56,9 @@ impl WasmCtx {
     }
 }
 
-/// Ends a context: `on_done`, then `on_log` when `log` is set, then `on_delete`.
+/// End a context with `on_done`, then `on_log` when `log` is set, then `on_delete`.
 ///
-/// Answers `false` when the guest holds the context.
+/// Return `false` when the guest keeps the context.
 pub(super) fn finish<H: StreamState>(
     scope: &mut CallScope<'_, H>,
     context: ContextId,
