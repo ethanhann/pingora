@@ -60,9 +60,10 @@ impl PluginResponse {
     }
 }
 
-/// Writes a plugin response that a [WasmCtx](crate::WasmCtx) returned.
+/// Writes a response that a plugin sent, as [RequestOutcome::Respond](crate::RequestOutcome).
 ///
-/// A proxy that writes responses with its own code can use that code instead.
+/// A proxy that writes its responses with its own code, for example to add headers or record
+/// metrics, can write the header and the body itself.
 pub async fn write_plugin_response<DS: DownstreamSession>(
     session: &mut Session<DS>,
     header: Box<ResponseHeader>,

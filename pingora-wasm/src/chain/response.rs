@@ -23,9 +23,18 @@ use pingora_proxy::Session;
 use proxy_wasm_host::abi::v0_2_1::types::Action;
 
 impl WasmCtx {
-    /// Runs `on_response_headers` of each plugin that saw the request, in reverse order.
+    /// Runs `proxy_on_response_headers` of each plugin that saw the request, in reverse chain
+    /// order.
     ///
-    /// Call it from `response_filter`.
+    /// Call it from `response_filter`. Plugins can read the request headers and can read and
+    /// change the response headers. Informational responses other than 101 are not passed to
+    /// the plugins.
+    ///
+    /// # Errors
+    ///
+    /// An error of type [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) when a plugin traps,
+    /// fails, or pauses the response, or when the guest that held this request was replaced
+    /// after a failure.
     pub async fn response_filter<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -39,7 +48,8 @@ impl WasmCtx {
         self.response_pass(session, resp, (0..self.records.len()).rev(), end_of_stream)
     }
 
-    /// Runs `on_response_headers` of the plugins at `positions` on `resp`.
+    /// Runs `proxy_on_response_headers` of the plugins at `positions`, in that order, on
+    /// `resp`.
     pub(super) fn response_pass<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,

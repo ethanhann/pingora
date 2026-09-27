@@ -29,20 +29,23 @@ use std::sync::Arc;
 
 /// An ordered list of plugins from one [WasmRuntime](crate::WasmRuntime).
 ///
-/// The request phase runs the plugins in order, and the response phase runs them in reverse.
+/// Build it with [WasmRuntime::chain](crate::WasmRuntime::chain) and clone it where you need
+/// it. Create a [WasmCtx] from it for each request.
 #[derive(Clone)]
 pub struct WasmChain {
     pub(crate) runtime: Arc<RuntimeInner>,
     pub(crate) plugins: Arc<[usize]>,
 }
 
-/// What a proxy does after the request phase of a chain.
+/// The result of [WasmCtx::request_filter].
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RequestOutcome {
-    /// Every plugin let the request continue.
+    /// Every plugin let the request continue to the upstream.
     Continue,
-    /// A plugin answered the request. Write this response and end the request.
+    /// A plugin answered the request. Write this response, for example with
+    /// [write_plugin_response](crate::write_plugin_response), and return `Ok(true)` from
+    /// `request_filter`.
     Respond(Box<ResponseHeader>, Bytes),
 }
 
@@ -54,7 +57,7 @@ impl WasmChain {
         }
     }
 
-    /// The state of one request in this chain.
+    /// Creates the state of one request. Keep it in the `CTX` of your proxy.
     pub fn new_ctx(&self) -> WasmCtx {
         WasmCtx::new(self.clone())
     }

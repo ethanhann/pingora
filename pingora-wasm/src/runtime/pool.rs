@@ -14,7 +14,8 @@
 
 //! The guests of one plugin.
 //!
-//! A request keeps the slot it started on, because its contexts live in that guest.
+//! A guest runs one callback at a time, so a plugin keeps several guests, one in each slot. A
+//! request stays on the slot it started on, because its plugin contexts live in that guest.
 
 use crate::{plugin_failure, plugin_unavailable};
 use log::{error, warn};
@@ -119,7 +120,8 @@ impl GuestPool {
         Err(plugin_unavailable(&self.name, "has no guest"))
     }
 
-    /// Locks the slot of a request, or `None` when its guest was replaced.
+    /// Locks the slot of a request, or returns `None` when a new guest replaced the one that
+    /// holds the request's context.
     pub(crate) fn lock(&self, index: usize, guest: GuestId) -> Option<SlotGuard<'_>> {
         let guard = self.slots[index].guest.lock();
         match guard.as_ref() {
@@ -128,7 +130,8 @@ impl GuestPool {
         }
     }
 
-    /// Replaces the guest of a slot after `err` when the guest cannot serve any more.
+    /// Replaces the guest of a slot when it cannot serve after `err`, that is after a trap or
+    /// when it has no context ids left.
     pub(crate) fn check(&self, index: usize, mut guard: SlotGuard<'_>, err: &GuestError) {
         let lost = match guard.as_ref() {
             Some(loaded) => {

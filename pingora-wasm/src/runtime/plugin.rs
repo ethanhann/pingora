@@ -20,32 +20,38 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The configuration of one Proxy-Wasm plugin.
+///
+/// Start from [WasmPluginConf::new] and set the fields you need.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct WasmPluginConf {
-    /// The plugin name, which must be unique in a runtime.
+    /// A name that is unique in the runtime. Chains refer to the plugin by it, and guest log
+    /// lines start with it.
     pub name: String,
-    /// The path of the `.wasm` module.
+    /// The path of the compiled `.wasm` file.
     pub path: PathBuf,
-    /// The root id that the guest receives with its plugin configuration.
+    /// The root id that the plugin receives when it is configured. SDKs use it to pick a root
+    /// context.
     pub root_id: String,
     /// The VM id. Plugins with the same VM id share data and queues.
     pub vm_id: String,
-    /// The configuration that the guest reads in `proxy_on_vm_start`.
+    /// Bytes that the plugin reads when its VM starts.
     pub vm_configuration: Vec<u8>,
-    /// The configuration that the guest reads in `proxy_on_configure`.
+    /// Bytes that the plugin reads when it is configured, for example a JSON document.
     pub configuration: Vec<u8>,
-    /// The level a guest receives when it asks for its log level.
+    /// The level that the plugin receives when it asks the host for its log level. Most SDKs
+    /// set their own level and never ask.
     pub log_level: LogLevel,
-    /// Limits for each guest. A fuel limit is refused.
+    /// The memory and CPU time limits of each guest. Fuel limits are not supported.
     pub limits: Limits,
-    /// The number of guests. Set it to the thread count of the service.
+    /// The number of guests. A guest runs one callback at a time, so set it to the thread
+    /// count of the service.
     pub slots: usize,
 }
 
 impl WasmPluginConf {
-    /// A plugin at `path` with one slot, no configuration, the log level `Info`, and default
-    /// limits.
+    /// A plugin at `path` with one slot, its name as the VM id, no configuration, the log
+    /// level `Info`, and default limits.
     pub fn new(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
         let name = name.into();
         WasmPluginConf {

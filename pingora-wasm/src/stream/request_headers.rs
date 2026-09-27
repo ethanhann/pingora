@@ -14,8 +14,9 @@
 
 //! The request header map that a guest sees.
 //!
-//! The pseudo headers are computed from the typed fields. The map hides `host` and serves it as
-//! `:authority`.
+//! `:method`, `:path`, `:authority`, and `:scheme` are computed from the typed fields of the
+//! Pingora header. The map hides `host` and shows it as `:authority`, as Proxy-Wasm plugins
+//! expect.
 
 use super::names::{classify, value_of, visit_headers, Name, Regular, WriteResult};
 use http::header::{HeaderValue, HOST};
@@ -26,7 +27,7 @@ use proxy_wasm_host::{HeaderMap, NotAllowed, PairVisitor};
 use std::borrow::Cow;
 use std::ops::ControlFlow;
 
-/// The request header map that a guest sees.
+/// The request header map of a guest.
 pub(crate) struct RequestHeaders {
     pub(crate) header: RequestHeader,
     scheme: Scheme,
@@ -47,7 +48,7 @@ impl RequestHeaders {
         }
     }
 
-    /// The path in origin form. An absolute form target shows its path and query.
+    /// The path in origin form. For an absolute form target, the path and query of its URI.
     fn path(&self) -> Option<&[u8]> {
         if self.header.method == Method::CONNECT {
             return None;

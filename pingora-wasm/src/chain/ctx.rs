@@ -23,7 +23,7 @@ use proxy_wasm_host::HeaderMap;
 use std::fmt;
 use std::mem;
 
-/// Where one plugin keeps the context of one request.
+/// Where a plugin keeps its context for one request: the slot, the guest, and the context id.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PluginRecord {
     pub(crate) slot: usize,
@@ -31,11 +31,14 @@ pub(crate) struct PluginRecord {
     pub(crate) context: ContextId,
 }
 
-/// The state of one request in each plugin of one chain.
+/// The state of one request in the plugins of one chain.
 ///
-/// Create it with [WasmChain::new_ctx] and keep it in the context of your proxy. Call
-/// [WasmCtx::logging] for every `WasmCtx` you create, so each plugin sees the end of the
-/// request.
+/// Create it with [WasmChain::new_ctx] and keep it in the `CTX` of your proxy. It keeps its
+/// chain and runtime alive, so a request finishes on the runtime it started on.
+///
+/// Call [WasmCtx::logging] for every `WasmCtx` you create, so each plugin sees the end of its
+/// request. If the request task ends first, dropping the `WasmCtx` ends each open context
+/// without `proxy_on_log`.
 pub struct WasmCtx {
     pub(crate) chain: WasmChain,
     pub(crate) records: Vec<Option<PluginRecord>>,
@@ -79,7 +82,8 @@ impl WasmCtx {
         result
     }
 
-    /// Moves the session request header in for the guest, and a placeholder into the session.
+    /// Moves the request header from the session into the stream state for a callback, and
+    /// leaves a placeholder in the session.
     pub(crate) fn request_in(&mut self, header: &mut RequestHeader) {
         let spare = self
             .spare_request

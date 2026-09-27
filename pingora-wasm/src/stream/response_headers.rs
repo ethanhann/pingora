@@ -21,7 +21,7 @@ use proxy_wasm_host::{HeaderMap, NotAllowed, PairVisitor};
 use std::borrow::Cow;
 use std::ops::ControlFlow;
 
-/// The response header map that a guest sees.
+/// The response header map of a guest.
 pub(crate) struct ResponseHeaders {
     pub(crate) header: ResponseHeader,
 }

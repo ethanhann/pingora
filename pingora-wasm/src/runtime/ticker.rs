@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The epoch ticker that enforces the CPU time limit of every guest.
+//! The epoch ticker.
+//!
+//! A guest's CPU time is measured in epochs, so without the ticker no guest has a time limit.
 
 use super::RuntimeInner;
 use crate::ERR_PLUGIN_FAILED;
@@ -45,10 +47,10 @@ impl Ticker {
 
     /// Starts the ticker thread on the first call.
     ///
-    /// It starts here and not in [WasmRuntime::new](crate::WasmRuntime::new), because a daemon
-    /// fork after `new` would lose the thread. The thread stops when the runtime is dropped.
-    /// Without the ticker no guest has a CPU time limit, so a failed start is an error and the
-    /// next call tries again.
+    /// The thread does not start in [WasmRuntime::new](crate::WasmRuntime::new), because
+    /// Pingora forks in daemon mode after the runtime is built, and a fork keeps no thread. It
+    /// stops when the runtime is dropped. A failed start is an error, and the next call tries
+    /// again.
     pub(crate) fn start(&self, runtime: &Arc<RuntimeInner>) -> Result<()> {
         if self.started.load(Ordering::Acquire) {
             return Ok(());

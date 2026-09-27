@@ -24,11 +24,17 @@ use proxy_wasm_host::abi::v0_2_1::types::Action;
 use proxy_wasm_host::abi::v0_2_1::StreamKind;
 
 impl WasmCtx {
-    /// Runs `on_request_headers` of each plugin, in order.
+    /// Runs `proxy_on_request_headers` of each plugin, in chain order.
     ///
-    /// Call it from `request_filter`. A [RequestOutcome::Respond] means a plugin answered the
-    /// request: write it, for example with [write_plugin_response](crate::write_plugin_response),
-    /// and return `Ok(true)`.
+    /// Call it from `request_filter`, after the checks your proxy runs itself. Plugins can read
+    /// and change the request headers. When a plugin answers the request, the later plugins do
+    /// not run, the earlier plugins see the response headers, and the response is returned as
+    /// [RequestOutcome::Respond]. Subrequests are not passed to the plugins.
+    ///
+    /// # Errors
+    ///
+    /// An error of type [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) when a plugin traps,
+    /// fails, or pauses the request. Pausing a request is not supported.
     pub async fn request_filter<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,

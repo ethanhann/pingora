@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! What a guest reads and writes during a callback.
+//! What a plugin reads and writes during a callback: the request and response headers, and the
+//! response it can send in place of the upstream response.
 
 mod names;
 mod plugin_response;
@@ -29,7 +30,9 @@ use proxy_wasm_host::abi::v0_2_1::types::{MapType, Status};
 use proxy_wasm_host::abi::v0_2_1::{Access, Callback, Invocation, LocalResponse, StreamState};
 use proxy_wasm_host::{HeaderMap, VecHeaderMap};
 
-/// The request state that a guest reads and writes during one callback.
+/// The state a guest can reach during one callback.
+///
+/// The phases move the Pingora headers in before each callback and back after it.
 #[derive(Default)]
 pub(crate) struct PingoraStream {
     pub(crate) request: Option<RequestHeaders>,

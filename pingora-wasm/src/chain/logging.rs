@@ -20,10 +20,11 @@ use pingora_proxy::Session;
 use proxy_wasm_host::abi::v0_2_1::{CallScope, ContextId, GuestError, StreamState};
 
 impl WasmCtx {
-    /// Runs `on_done`, `on_log`, and `on_delete` of each plugin that saw the request, in
-    /// reverse order.
+    /// Ends the request in each plugin that saw it, in reverse chain order, with
+    /// `proxy_on_done`, `proxy_on_log`, and `proxy_on_delete`.
     ///
-    /// Call it from `logging`.
+    /// Call it from `logging`, for every request that created this `WasmCtx`. A plugin failure
+    /// here is logged and not returned, because the response is already sent.
     pub async fn logging<DS: DownstreamSession>(&mut self, session: &mut Session<DS>) {
         let runtime = self.chain.runtime.clone();
         let mut response = session.response_written().cloned();

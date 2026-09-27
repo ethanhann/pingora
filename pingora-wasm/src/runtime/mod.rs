@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Plugins and their guests, built once and shared by every request.
+//! Plugins and their guests. They are built once and shared by every request.
 
 mod log_sink;
 mod plugin;
@@ -32,10 +32,12 @@ use std::fmt;
 use std::sync::Arc;
 use ticker::{with_ticker, Ticker};
 
-/// The engine, the shared store, and the guests of a set of plugins.
+/// Compiled plugins and their guests.
 ///
-/// Build it before the server starts. A proxy can build a new runtime to reload its plugins,
-/// and requests that started on the old runtime finish on it.
+/// Build it once, before the server starts, and clone it where you need it. Each plugin gets
+/// its own guests, and all plugins share one data store that is separated by VM id. To reload
+/// plugins, build a new runtime and use it for new requests. Requests that started on the old
+/// runtime finish on it.
 #[derive(Clone)]
 pub struct WasmRuntime {
     pub(crate) inner: Arc<RuntimeInner>,
@@ -49,12 +51,21 @@ pub(crate) struct RuntimeInner {
 }
 
 impl WasmRuntime {
-    /// Compiles and starts the plugins, with guest logs sent to the `log` crate.
+    /// Compiles each plugin and starts its guests.
+    ///
+    /// Guest log lines go to the `log` crate with the target `pingora_wasm::guest`.
+    ///
+    /// # Errors
+    ///
+    /// The error names the plugin. A plugin fails when its file cannot be read, when it is not
+    /// a Proxy-Wasm module, when it refuses to start or traps while it starts, when its name is
+    /// used twice, when it has zero slots, or when its limits set fuel.
     pub fn new(plugins: Vec<WasmPluginConf>) -> Result<Self> {
         Self::new_with_log_sink(plugins, Arc::new(LogCrateSink))
     }
 
-    /// Compiles and starts the plugins, with guest logs sent to `sink`.
+    /// Like [WasmRuntime::new], with guest log lines sent to `sink`, for example to keep them
+    /// in the `tracing` span of the request.
     pub fn new_with_log_sink(plugins: Vec<WasmPluginConf>, sink: Arc<dyn LogSink>) -> Result<Self> {
         if plugins.is_empty() {
             return Error::e_explain(ErrorType::InternalError, "no wasm plugin to run");
@@ -116,7 +127,14 @@ impl WasmRuntime {
         })
     }
 
-    /// A chain of the named plugins, in request order.
+    /// Builds a chain of the named plugins.
+    ///
+    /// The request phase runs the plugins in this order, and the response phase runs them in
+    /// reverse. A plugin can be in several chains, and its guests serve all of them.
+    ///
+    /// # Errors
+    ///
+    /// An empty list, a name that is not in the runtime, or a name listed twice.
     pub fn chain(&self, names: &[&str]) -> Result<WasmChain> {
         if names.is_empty() {
             return Error::e_explain(ErrorType::InternalError, "a wasm chain needs a plugin");
@@ -140,12 +158,17 @@ impl WasmRuntime {
         Ok(WasmChain::new(self.inner.clone(), plugins))
     }
 
-    /// The number of stream contexts that are open in every guest.
+    /// The number of plugin contexts of requests that are in progress.
+    ///
+    /// Each plugin of a chain opens one context for each request, and `logging` closes it.
     pub fn open_contexts(&self) -> usize {
         self.inner.pools.iter().map(GuestPool::open_contexts).sum()
     }
 
-    /// The number of stream contexts that a guest holds after the request ended.
+    /// The number of plugin contexts that a guest keeps after its request ended.
+    ///
+    /// A guest keeps a context when it answers `false` from `proxy_on_done`. The context is
+    /// released when that guest is replaced.
     pub fn held_contexts(&self) -> usize {
         self.inner.pools.iter().map(GuestPool::held_contexts).sum()
     }
@@ -160,7 +183,7 @@ impl fmt::Debug for WasmRuntime {
 }
 
 impl RuntimeInner {
-    /// Starts the epoch ticker on the first call. See [Ticker::start].
+    /// Starts the epoch ticker on the first call, as [Ticker::start] describes.
     pub(crate) fn start_ticker(self: &Arc<Self>) -> Result<()> {
         self.ticker.start(self)
     }
