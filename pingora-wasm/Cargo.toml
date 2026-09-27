@@ -12,7 +12,8 @@ WASM extensibility for Pingora.
 """
 
 [dependencies]
-wasmtime = "48"
+proxy-wasm-host = "0.1"
+tracing = "0.1"
 
 [lints]
 workspace = true
