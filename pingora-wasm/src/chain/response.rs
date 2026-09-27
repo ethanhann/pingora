@@ -108,7 +108,7 @@ fn response_ends(method: &Method, resp: &ResponseHeader) -> bool {
 mod tests {
     use super::*;
     use crate::test_support::{add_request_header, one_plugin, session, GET};
-    use pingora_error::ErrorType;
+    use crate::ERR_PLUGIN_FAILED;
 
     fn response(status: u16, length: Option<&str>) -> ResponseHeader {
         let mut resp = ResponseHeader::build(status, None).unwrap();
@@ -131,7 +131,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(err.etype(), &ErrorType::HTTPStatus(503));
+        assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
         assert!(err.to_string().contains("lost the guest of this request"));
     }
 

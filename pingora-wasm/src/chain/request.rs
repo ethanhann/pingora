@@ -110,7 +110,7 @@ fn scheme_of<DS: DownstreamSession>(session: &Session<DS>) -> Scheme {
 #[cfg(test)]
 mod tests {
     use crate::test_support::{one_plugin, session, wat_plugin, GET};
-    use pingora_error::ErrorType;
+    use crate::ERR_PLUGIN_FAILED;
 
     #[tokio::test]
     async fn a_guest_error_restores_the_session_header() {
@@ -119,9 +119,20 @@ mod tests {
 
         let err = ctx.request_filter(&mut session).await.unwrap_err();
 
-        assert_eq!(err.etype(), &ErrorType::HTTPStatus(503));
+        assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
         assert_eq!(session.req_header().raw_path(), b"/original");
         assert_eq!(session.req_header().headers["host"], "example.test");
+    }
+
+    #[tokio::test]
+    async fn a_pause_without_a_plugin_response_fails() {
+        let (_runtime, mut ctx) = one_plugin(wat_plugin("pause-unit", "i32.const 1"));
+        let (mut session, _client) = session(GET).await;
+
+        let err = ctx.request_filter(&mut session).await.unwrap_err();
+
+        assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
+        assert!(err.to_string().contains("paused a request"));
     }
 
     #[tokio::test]
@@ -131,7 +142,7 @@ mod tests {
 
         let err = ctx.request_filter(&mut session).await.unwrap_err();
 
-        assert_eq!(err.etype(), &ErrorType::HTTPStatus(503));
+        assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
         assert_eq!(runtime.open_contexts(), 0);
         let slot = runtime.inner.pools[0].lock_slot(0);
         assert!(slot.as_ref().unwrap().guest.is_serving());

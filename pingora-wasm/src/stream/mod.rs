@@ -229,22 +229,20 @@ mod tests {
     }
 
     #[test]
-    fn send_local_response_refuses_a_bad_status() {
-        let mut s = stream(false);
+    fn send_local_response_refuses_a_bad_status_and_other_callbacks() {
+        let cases = [
+            (Callback::RequestHeaders, 99, Status::BadArgument),
+            (Callback::ResponseHeaders, 403, Status::Unimplemented),
+            (Callback::Log, 403, Status::Unimplemented),
+        ];
 
-        let answer = s.send_local_response(call(Callback::RequestHeaders), local(99));
+        for (callback, status, refusal) in cases {
+            let mut s = stream(true);
 
-        assert_eq!(answer, Err(Status::BadArgument));
-        assert!(s.plugin_response.is_none());
-    }
+            let answer = s.send_local_response(call(callback), local(status));
 
-    #[test]
-    fn send_local_response_works_only_in_request_headers() {
-        let mut s = stream(true);
-
-        let answer = s.send_local_response(call(Callback::ResponseHeaders), local(403));
-
-        assert_eq!(answer, Err(Status::Unimplemented));
-        assert!(s.plugin_response.is_none());
+            assert_eq!(answer, Err(refusal));
+            assert!(s.plugin_response.is_none());
+        }
     }
 }

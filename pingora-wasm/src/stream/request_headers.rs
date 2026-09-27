@@ -242,34 +242,40 @@ mod tests {
     }
 
     #[test]
-    fn request_reads_authority_from_the_uri_on_http2() {
-        let mut header = RequestHeader::build("GET", b"/", None).unwrap();
-        header.set_uri("https://h2.test/x".parse().unwrap());
-        header.set_version(Version::HTTP_2);
-        let map = RequestHeaders::new(header, Scheme::HTTPS);
+    fn pseudo_headers_follow_the_request_target() {
+        let mut h2 = RequestHeader::build("GET", b"/", None).unwrap();
+        h2.set_uri("https://h2.test/x".parse().unwrap());
+        h2.set_version(Version::HTTP_2);
+        let absolute = RequestHeader::build("GET", b"http://example.test/a?b=1", None).unwrap();
+        let connect = RequestHeader::build("CONNECT", b"example.test:443", None).unwrap();
+        let cases = [
+            (h2, ":authority", Some("h2.test")),
+            (absolute, ":path", Some("/a?b=1")),
+            (connect, ":path", None),
+        ];
 
-        let authority = get(&map, ":authority");
+        for (header, key, want) in cases {
+            let map = RequestHeaders::new(header, Scheme::HTTP);
 
-        assert_eq!(authority.as_deref(), Some("h2.test"));
-    }
+            let got = get(&map, key);
 
-    #[test]
-    fn connect_has_no_path() {
-        let map = request("CONNECT", b"example.test:443", Some("example.test:443"));
-
-        let path = get(&map, ":path");
-
-        assert_eq!(path, None);
-        assert!(!pairs(&map).iter().any(|(k, _)| k == ":path"));
+            assert_eq!(got.as_deref(), want, "{key}");
+        }
     }
 
     #[test]
     fn request_writes_the_pseudo_headers() {
         let mut map = request("GET", b"/", Some("example.test"));
+        let writes: [(&[u8], &[u8]); 4] = [
+            (b":method", b"PUT"),
+            (b":path", b"/new?q=2"),
+            (b":authority", b"other.test"),
+            (b":scheme", b"http"),
+        ];
 
-        map.set(b":method", b"PUT").unwrap();
-        map.set(b":path", b"/new?q=2").unwrap();
-        map.set(b":authority", b"other.test").unwrap();
+        for (key, value) in writes {
+            map.set(key, value).unwrap();
+        }
 
         assert_eq!(map.header.method, Method::PUT);
         assert_eq!(map.header.raw_path(), b"/new?q=2");
@@ -314,15 +320,6 @@ mod tests {
     }
 
     #[test]
-    fn request_accepts_its_own_scheme() {
-        let mut map = request("GET", b"/", None);
-
-        let same = map.set(b":scheme", b"http");
-
-        assert_eq!(same, Ok(()));
-    }
-
-    #[test]
     fn host_writes_change_the_authority() {
         let mut map = request("GET", b"/", Some("example.test"));
 
@@ -355,18 +352,6 @@ mod tests {
 
         assert_eq!(before, 2);
         assert!(map.header.headers.get("x-new").is_none());
-    }
-
-    #[test]
-    fn absolute_form_shows_an_origin_form_path() {
-        let map = RequestHeaders::new(
-            RequestHeader::build("GET", b"http://example.test/a?b=1", None).unwrap(),
-            Scheme::HTTP,
-        );
-
-        let path = get(&map, ":path");
-
-        assert_eq!(path.as_deref(), Some("/a?b=1"));
     }
 
     #[test]

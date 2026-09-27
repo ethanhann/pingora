@@ -33,37 +33,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const FIRST_PORT: u16 = 6380;
-pub const LAST_PORT: u16 = 6393;
+pub const LAST_PORT: u16 = 6390;
 
 pub fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(format!("{name}.wasm"))
-}
-
-/// A guest that answers `request_action` from `proxy_on_request_headers` and `done` from
-/// `proxy_on_done`.
-fn wat_guest(label: &str, request_action: i32, done: i32) -> PathBuf {
-    let wat = format!(
-        r#"(module
-  (memory (export "memory") 1)
-  (func (export "proxy_on_memory_allocate") (param i32) (result i32) i32.const 1024)
-  (func (export "proxy_abi_version_0_2_1"))
-  (func (export "proxy_on_context_create") (param i32 i32))
-  (func (export "proxy_on_vm_start") (param i32 i32) (result i32) i32.const 1)
-  (func (export "proxy_on_configure") (param i32 i32) (result i32) i32.const 1)
-  (func (export "proxy_on_request_headers") (param i32 i32 i32) (result i32)
-    i32.const {request_action})
-  (func (export "proxy_on_done") (param i32) (result i32) i32.const {done})
-  (func (export "proxy_on_log") (param i32))
-  (func (export "proxy_on_delete") (param i32)))"#
-    );
-    let path = std::env::temp_dir().join(format!(
-        "pingora-wasm-it-{label}-{}.wasm",
-        std::process::id()
-    ));
-    std::fs::write(&path, wat::parse_str(wat).unwrap()).unwrap();
-    path
 }
 
 fn plugin(name: &str, path: PathBuf, slots: usize, configuration: &str) -> WasmPluginConf {
@@ -215,23 +190,8 @@ fn services() -> Vec<(u16, WasmRuntime, Vec<&'static str>, Option<usize>)> {
         None,
     );
     push(6388, single("example", example(2)), None);
-    push(
-        6389,
-        single("held", plugin("held", wat_guest("held", 0, 0), 1, "")),
-        None,
-    );
-    push(
-        6390,
-        single("pause", plugin("pause", wat_guest("pause", 1, 1), 1, "")),
-        None,
-    );
-    push(6391, (shared.clone(), vec!["add"]), None);
-    push(6392, (shared, vec!["add", "config"]), None);
-    push(
-        6393,
-        single("bad", plugin("bad", wat_guest("bad", 7, 1), 1, "")),
-        None,
-    );
+    push(6389, (shared.clone(), vec!["add"]), None);
+    push(6390, (shared, vec!["add", "config"]), None);
     services
 }
 

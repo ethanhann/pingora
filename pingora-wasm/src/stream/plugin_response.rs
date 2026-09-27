@@ -129,20 +129,13 @@ mod tests {
     }
 
     #[test]
-    fn build_refuses_a_status_outside_200_to_599() {
-        let statuses = [0, 100, 199, 600, 999];
-
-        let built: Vec<_> = statuses
-            .iter()
-            .map(|s| PluginResponse::build(&response(*s, &[])).is_some())
-            .collect();
-
-        assert_eq!(built, [false; 5]);
-    }
-
-    #[test]
-    fn build_refuses_a_bad_header() {
+    fn build_refuses_a_bad_status_or_header() {
         let bad = [
+            response(0, &[]),
+            response(100, &[]),
+            response(199, &[]),
+            response(600, &[]),
+            response(999, &[]),
             response(200, &[("bad name", "v")]),
             response(200, &[("x-ok", "bad\nvalue")]),
             response(200, &[(":status", "200")]),
@@ -153,6 +146,6 @@ mod tests {
             .map(|r| PluginResponse::build(r).is_some())
             .collect();
 
-        assert_eq!(built, [false; 3]);
+        assert_eq!(built, [false; 8]);
     }
 }

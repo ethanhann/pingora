@@ -116,25 +116,16 @@ mod tests {
     }
 
     #[test]
-    fn check_refuses_zero_slots() {
-        let mut conf = WasmPluginConf::new("auth", "auth.wasm");
-        conf.slots = 0;
+    fn check_refuses_zero_slots_and_a_fuel_limit() {
+        let mut zero = WasmPluginConf::new("zero", "zero.wasm");
+        zero.slots = 0;
+        let mut fuel = WasmPluginConf::new("fuel", "fuel.wasm");
+        fuel.limits = Limits::default().with_fuel(1000);
 
-        let err = conf.check().unwrap_err();
+        let errors = [zero.check(), fuel.check()].map(|r| r.unwrap_err().to_string());
 
-        assert!(err.to_string().contains("wasm plugin auth has zero slots"));
-    }
-
-    #[test]
-    fn check_refuses_a_fuel_limit() {
-        let mut conf = WasmPluginConf::new("auth", "auth.wasm");
-        conf.limits = Limits::default().with_fuel(1000);
-
-        let err = conf.check().unwrap_err();
-
-        assert!(err
-            .to_string()
-            .contains("wasm plugin auth sets a fuel limit"));
+        assert!(errors[0].contains("wasm plugin zero has zero slots"));
+        assert!(errors[1].contains("wasm plugin fuel sets a fuel limit"));
     }
 
     #[test]

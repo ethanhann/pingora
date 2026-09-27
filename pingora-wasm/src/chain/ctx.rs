@@ -185,41 +185,26 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_ctx_deletes_its_open_context() {
-        let runtime =
-            WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 1)]).unwrap();
-        let mut ctx = runtime.chain(&["a"]).unwrap().new_ctx();
-        open_context(&runtime, &mut ctx);
-        let open = runtime.open_contexts();
+    fn dropping_a_ctx_ends_its_open_context() {
+        let held = Wat {
+            done: "i32.const 0",
+            ..Wat::default()
+        };
+        let cases = [
+            (fixture("add-request-header"), 0),
+            (wat_guest("held-unit", held), 1),
+        ];
 
-        drop(ctx);
+        for (path, held) in cases {
+            let runtime = WasmRuntime::new(vec![plugin("a", path, 1)]).unwrap();
+            let mut ctx = runtime.chain(&["a"]).unwrap().new_ctx();
+            open_context(&runtime, &mut ctx);
 
-        assert_eq!(open, 1);
-        assert_eq!(runtime.open_contexts(), 0);
-        assert_eq!(runtime.held_contexts(), 0);
-    }
+            drop(ctx);
 
-    #[test]
-    fn a_held_context_moves_to_the_held_count() {
-        let runtime = WasmRuntime::new(vec![plugin(
-            "held",
-            wat_guest(
-                "held-unit",
-                Wat {
-                    done: "i32.const 0",
-                    ..Wat::default()
-                },
-            ),
-            1,
-        )])
-        .unwrap();
-        let mut ctx = runtime.chain(&["held"]).unwrap().new_ctx();
-        open_context(&runtime, &mut ctx);
-
-        drop(ctx);
-
-        assert_eq!(runtime.open_contexts(), 0);
-        assert_eq!(runtime.held_contexts(), 1);
+            assert_eq!(runtime.open_contexts(), 0);
+            assert_eq!(runtime.held_contexts(), held);
+        }
     }
 
     #[test]

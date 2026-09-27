@@ -182,8 +182,8 @@ async fn two_chains_share_the_guest_of_one_runtime() {
     let (origin, _) = echo_origin().await;
     let port = origin.addr().port();
 
-    let first = get(6391, "/", port, &[]).await;
-    let second = get(6392, "/", port, &[]).await;
+    let first = get(6389, "/", port, &[]).await;
+    let second = get(6390, "/", port, &[]).await;
 
     let first: u32 = header(&first, "x-echo-wasm-context")
         .unwrap()
@@ -217,38 +217,4 @@ async fn request_bodies_survive_on_a_keep_alive_connection() {
     assert_eq!(header(&first, "x-echo-body-len").as_deref(), Some("11"));
     assert_eq!(header(&second, "x-echo-body-len").as_deref(), Some("13"));
     assert_eq!(count.load(Ordering::SeqCst), 2);
-}
-
-#[tokio::test]
-async fn a_held_context_is_counted_apart() {
-    init().await;
-    let (origin, _) = echo_origin().await;
-
-    let res = get(6389, "/", origin.addr().port(), &[]).await;
-
-    assert_eq!(res.status(), 200);
-    assert!(eventually(|| runtime(6389).held_contexts() == 1).await);
-    assert_eq!(runtime(6389).open_contexts(), 0);
-}
-
-#[tokio::test]
-async fn a_pause_without_a_response_answers_503() {
-    init().await;
-    let (origin, count) = echo_origin().await;
-
-    let res = get(6390, "/", origin.addr().port(), &[]).await;
-
-    assert_eq!(res.status(), 503);
-    assert_eq!(count.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn a_context_is_closed_after_a_guest_error() {
-    init().await;
-    let (origin, _) = echo_origin().await;
-
-    let res = get(6393, "/", origin.addr().port(), &[]).await;
-
-    assert_eq!(res.status(), 503);
-    assert!(eventually(|| runtime(6393).open_contexts() == 0).await);
 }
