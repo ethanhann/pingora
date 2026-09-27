@@ -12,30 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Proxy-Wasm plugins for Pingora proxies.
+//!
+//! A [WasmRuntime] compiles and runs a set of plugins, and a [WasmChain] is an ordered list of
+//! them. For each request, a proxy creates a [WasmCtx] from a chain and calls its phases from
+//! its own `ProxyHttp` hooks, at the place in the request it chooses.
+
+mod chain;
+mod ctx;
+mod headers;
+mod local;
 mod logging;
+mod plugin;
+mod pool;
+mod runtime;
+mod stream;
+#[cfg(test)]
+mod test_support;
 
-use crate::logging::TracingSink;
-use proxy_wasm_host::abi::v0_2_1::{GuestSpec, Host, VmServices};
-use proxy_wasm_host::{Engine, Limits, Module};
-use std::sync::Arc;
-
-/// The plugin this example runs when no path is given.
-const DEFAULT_GUEST: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/add-request-header.wasm"
-);
-
-pub fn bootstrap() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Todo:
-    // Need to create the WASM host.
-    // Need to hook the engine into at least one filter.
-    // Need to expose a module loading mechanism
-
-    let path = std::env::args().nth(1).unwrap_or(DEFAULT_GUEST.to_owned());
-    let bytes = std::fs::read(&path)?;
-    let engine = Engine::new()?;
-    let module = Module::new(&engine, &bytes)?;
-    let services = VmServices::new(Arc::new(TracingSink)).with_vm_id(*b"example");
-    let spec = GuestSpec::new(&Host::new(&engine)?, &module, services, &Limits::default())?;
-    Ok(())
-}
+pub use chain::{RequestOutcome, WasmChain};
+pub use ctx::WasmCtx;
+pub use local::write_local_response;
+pub use plugin::WasmPluginConf;
+pub use proxy_wasm_host::abi::v0_2_1::types::LogLevel;
+pub use proxy_wasm_host::abi::v0_2_1::{LogContext, LogSink};
+pub use proxy_wasm_host::Limits;
+pub use runtime::WasmRuntime;

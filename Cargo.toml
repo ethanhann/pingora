@@ -54,3 +54,16 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 [profile.bench]
 debug = true
+
+# Cranelift compiles Wasm modules at run time. Without optimization, the pingora-wasm tests
+# spend most of their time compiling guests.
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+[profile.dev.package.regalloc2]
+opt-level = 3
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3
+[profile.dev.package.wasmtime-environ]
+opt-level = 3
+[profile.dev.package.wasmparser]
+opt-level = 3

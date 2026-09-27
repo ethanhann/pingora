@@ -12,67 +12,61 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use log::Level;
 use proxy_wasm_host::abi::v0_2_1::types::LogLevel;
 use proxy_wasm_host::abi::v0_2_1::{LogContext, LogSink};
-use std::borrow::Cow;
 
-macro_rules! emit {
-    ($level:expr, $context:expr, $line:expr) => {
-        match $level {
-            LogLevel::Trace => tracing::trace!(
-                target: "guest",
-                plugin = %plugin_of(&$context),
-                context = context_of(&$context),
-                "{}", $line
-            ),
-            LogLevel::Debug => tracing::debug!(
-                target: "guest",
-                plugin = %plugin_of(&$context),
-                context = context_of(&$context),
-                "{}", $line
-            ),
-            LogLevel::Info => tracing::info!(
-                target: "guest",
-                plugin = %plugin_of(&$context),
-                context = context_of(&$context),
-                "{}", $line
-            ),
-            LogLevel::Warn => tracing::warn!(
-                target: "guest",
-                plugin = %plugin_of(&$context),
-                context = context_of(&$context),
-                "{}", $line
-            ),
-            LogLevel::Error | LogLevel::Critical => tracing::error!(
-                target: "guest",
-                plugin = %plugin_of(&$context),
-                context = context_of(&$context),
-                "{}", $line
-            ),
+pub(crate) const GUEST_TARGET: &str = "pingora_wasm::guest";
+
+/// Sends guest log lines to the `log` crate.
+pub(crate) struct LogCrateSink;
+
+impl LogSink for LogCrateSink {
+    fn log(&self, context: LogContext<'_>, level: LogLevel, message: &[u8]) {
+        let level = log_level(level);
+        if !log::log_enabled!(target: GUEST_TARGET, level) {
+            return;
         }
-    };
-}
-
-/// The plugin a line came from, for a root that has not been configured yet.
-const UNCONFIGURED: &str = "<unconfigured>";
-
-/// The plugin a line came from, as text.
-fn plugin_of<'a>(context: &'a LogContext<'_>) -> Cow<'a, str> {
-    match &context.plugin_name {
-        Some(name) => String::from_utf8_lossy(name),
-        None => Cow::Borrowed(UNCONFIGURED),
+        let plugin = context.plugin_name.as_deref().unwrap_or(&context.vm_id);
+        log::log!(
+            target: GUEST_TARGET,
+            level,
+            "{} #{}: {}",
+            String::from_utf8_lossy(plugin),
+            context.call.map_or(0, |call| call.context.get()),
+            String::from_utf8_lossy(message)
+        );
     }
 }
 
-/// The context a line came from, or zero when no callback was running.
-fn context_of(context: &LogContext<'_>) -> u32 {
-    context.call.map_or(0, |call| call.context.get())
+pub(crate) fn log_level(level: LogLevel) -> Level {
+    match level {
+        LogLevel::Trace => Level::Trace,
+        LogLevel::Debug => Level::Debug,
+        LogLevel::Info => Level::Info,
+        LogLevel::Warn => Level::Warn,
+        LogLevel::Error | LogLevel::Critical => Level::Error,
+    }
 }
 
-pub(crate) struct TracingSink;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl LogSink for TracingSink {
-    fn log(&self, context: LogContext<'_>, level: LogLevel, message: &[u8]) {
-        emit!(level, context, String::from_utf8_lossy(message));
+    #[test]
+    fn log_level_maps_every_guest_level() {
+        let levels: Vec<_> = LogLevel::ALL.iter().map(|l| log_level(*l)).collect();
+
+        assert_eq!(
+            levels,
+            [
+                Level::Trace,
+                Level::Debug,
+                Level::Info,
+                Level::Warn,
+                Level::Error,
+                Level::Error
+            ]
+        );
     }
 }

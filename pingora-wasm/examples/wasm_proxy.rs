@@ -1,0 +1,117 @@
+// Copyright 2026 Cloudflare, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use async_trait::async_trait;
+use pingora_core::server::Server;
+use pingora_core::upstreams::peer::HttpPeer;
+use pingora_core::{Error, Result};
+use pingora_http::{RequestHeader, ResponseHeader};
+use pingora_proxy::{ProxyHttp, Session};
+use pingora_wasm::{
+    write_local_response, RequestOutcome, WasmChain, WasmCtx, WasmPluginConf, WasmRuntime,
+};
+use std::path::PathBuf;
+
+const DEFAULT_PLUGIN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/add-request-header.wasm"
+);
+
+pub struct PluginProxy {
+    chain: WasmChain,
+}
+
+#[async_trait]
+impl ProxyHttp for PluginProxy {
+    type CTX = WasmCtx;
+
+    fn new_ctx(&self) -> Self::CTX {
+        self.chain.new_ctx()
+    }
+
+    async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
+        match ctx.request_filter(session).await? {
+            RequestOutcome::Respond(header, body) => {
+                write_local_response(session, header, body).await?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        let peer = HttpPeer::new(("httpbin.org", 80), false, "httpbin.org".into());
+        Ok(Box::new(peer))
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        upstream_request.insert_header("Host", "httpbin.org")
+    }
+
+    async fn response_filter(
+        &self,
+        session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        ctx.response_filter(session, upstream_response).await
+    }
+
+    async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut Self::CTX) {
+        ctx.logging(session).await
+    }
+}
+
+// RUST_LOG=INFO cargo run --example wasm_proxy -- tests/fixtures/add-request-header.wasm
+// curl 127.0.0.1:6190/headers
+fn main() {
+    env_logger::init();
+
+    let mut my_server = Server::new(None).unwrap();
+    my_server.bootstrap();
+
+    let mut paths: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
+    if paths.is_empty() {
+        paths.push(DEFAULT_PLUGIN.into());
+    }
+    let plugins: Vec<WasmPluginConf> = paths
+        .iter()
+        .map(|path| {
+            let name = path.file_stem().unwrap().to_string_lossy();
+            let mut plugin = WasmPluginConf::new(name, path);
+            plugin.slots = my_server.configuration.threads;
+            plugin
+        })
+        .collect();
+    let names: Vec<String> = plugins.iter().map(|p| p.name.clone()).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let runtime = WasmRuntime::new(plugins).unwrap();
+    let chain = runtime.chain(&names).unwrap();
+
+    let mut my_proxy =
+        pingora_proxy::http_proxy_service(&my_server.configuration, PluginProxy { chain });
+    my_proxy.add_tcp("127.0.0.1:6190");
+
+    my_server.add_service(my_proxy);
+    my_server.run_forever();
+}

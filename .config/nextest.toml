@@ -9,3 +9,7 @@ test-group = 'pingora-fixed-port-integration'
 [[profile.default.overrides]]
 filter = 'package(pingora-proxy) & (binary(test_basic) | binary(test_upstream))'
 test-group = 'pingora-fixed-port-integration'
+
+[[profile.default.overrides]]
+filter = 'package(pingora-wasm) & binary(test_wasm)'
+test-group = 'pingora-fixed-port-integration'

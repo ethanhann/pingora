@@ -1,0 +1,703 @@
+// Copyright 2026 Cloudflare, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! The Proxy-Wasm view of Pingora request and response headers.
+//!
+//! The pseudo headers are computed from the typed fields. The request map hides `host` and
+//! serves it as `:authority`.
+
+use http::header::{HeaderName, HeaderValue, HOST};
+use http::uri::{Authority, PathAndQuery};
+use http::{Method, Uri, Version};
+use pingora_http::{RequestHeader, ResponseHeader};
+use proxy_wasm_host::{HeaderMap, NotAllowed, PairVisitor};
+use std::borrow::Cow;
+use std::ops::ControlFlow;
+
+type WriteResult = Result<(), NotAllowed>;
+
+/// What a key refers to, found without an allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Name<'a> {
+    Method,
+    Path,
+    Authority,
+    Scheme,
+    Status,
+    OtherPseudo,
+    Host,
+    Regular(&'a str),
+}
+
+const PSEUDO: [(&[u8], Name<'static>); 5] = [
+    (b":method", Name::Method),
+    (b":path", Name::Path),
+    (b":authority", Name::Authority),
+    (b":scheme", Name::Scheme),
+    (b":status", Name::Status),
+];
+
+fn classify(key: &[u8]) -> Option<Name<'_>> {
+    if key.first() == Some(&b':') {
+        let found = PSEUDO
+            .iter()
+            .find(|(name, _)| key.eq_ignore_ascii_case(name));
+        return Some(found.map_or(Name::OtherPseudo, |(_, name)| *name));
+    }
+    if key.eq_ignore_ascii_case(b"host") {
+        return Some(Name::Host);
+    }
+    std::str::from_utf8(key).ok().map(Name::Regular)
+}
+
+fn name_of(key: &[u8]) -> Result<String, NotAllowed> {
+    let name = std::str::from_utf8(key).map_err(|_| NotAllowed)?;
+    HeaderName::from_bytes(name.as_bytes()).map_err(|_| NotAllowed)?;
+    Ok(name.to_string())
+}
+
+fn value_of(value: &[u8]) -> Result<HeaderValue, NotAllowed> {
+    HeaderValue::from_bytes(value).map_err(|_| NotAllowed)
+}
+
+fn visit_headers(
+    map: &http::HeaderMap,
+    skip_host: bool,
+    f: &mut PairVisitor<'_>,
+) -> ControlFlow<()> {
+    for (name, value) in map {
+        if skip_host && name == HOST {
+            continue;
+        }
+        if f(name.as_str().as_bytes(), value.as_bytes()).is_break() {
+            return ControlFlow::Break(());
+        }
+    }
+    ControlFlow::Continue(())
+}
+
+trait Regular {
+    fn map(&self) -> &http::HeaderMap;
+    fn insert(&mut self, key: &[u8], value: &[u8]) -> WriteResult;
+    fn append(&mut self, key: &[u8], value: &[u8]) -> WriteResult;
+    fn remove(&mut self, key: &str);
+    fn strip(&mut self, keep_host: bool) {
+        let names: Vec<HeaderName> = self
+            .map()
+            .keys()
+            .filter(|name| !(keep_host && *name == HOST))
+            .cloned()
+            .collect();
+        for name in names {
+            self.remove(name.as_str());
+        }
+    }
+}
+
+macro_rules! impl_regular {
+    ($type:ty) => {
+        impl Regular for $type {
+            fn map(&self) -> &http::HeaderMap {
+                &self.headers
+            }
+
+            fn insert(&mut self, key: &[u8], value: &[u8]) -> WriteResult {
+                self.insert_header(name_of(key)?, value_of(value)?)
+                    .map_err(|_| NotAllowed)
+            }
+
+            fn append(&mut self, key: &[u8], value: &[u8]) -> WriteResult {
+                self.append_header(name_of(key)?, value_of(value)?)
+                    .map(|_| ())
+                    .map_err(|_| NotAllowed)
+            }
+
+            fn remove(&mut self, key: &str) {
+                self.remove_header(key);
+            }
+        }
+    };
+}
+
+impl_regular!(RequestHeader);
+impl_regular!(ResponseHeader);
+
+/// The request header map that a guest sees.
+pub(crate) struct RequestHeaders {
+    pub(crate) header: RequestHeader,
+    scheme: &'static str,
+}
+
+impl RequestHeaders {
+    pub(crate) fn new(header: RequestHeader, scheme: &'static str) -> Self {
+        RequestHeaders { header, scheme }
+    }
+
+    fn authority(&self) -> Option<&[u8]> {
+        let from_uri = self.header.uri.authority().map(|a| a.as_str().as_bytes());
+        let from_host = self.header.headers.get(HOST).map(HeaderValue::as_bytes);
+        if self.header.version == Version::HTTP_2 {
+            from_uri.or(from_host)
+        } else {
+            from_host.or(from_uri)
+        }
+    }
+
+    /// The path in origin form. An absolute form target shows its path and query.
+    fn path(&self) -> Option<&[u8]> {
+        if self.header.method == Method::CONNECT {
+            return None;
+        }
+        let raw = self.header.raw_path();
+        if raw.first() == Some(&b'/') || raw == b"*" {
+            return Some(raw);
+        }
+        Some(
+            self.header
+                .uri
+                .path_and_query()
+                .map_or(&b"/"[..], |path| path.as_str().as_bytes()),
+        )
+    }
+}
+
+fn set_request_pseudo(
+    header: &mut RequestHeader,
+    scheme: &str,
+    name: Name<'_>,
+    value: &[u8],
+) -> WriteResult {
+    match name {
+        Name::Method => {
+            header.set_method(Method::from_bytes(value).map_err(|_| NotAllowed)?);
+            Ok(())
+        }
+        Name::Path if header.method != Method::CONNECT => {
+            if !is_origin_path(value) {
+                return Err(NotAllowed);
+            }
+            if header.uri.authority().is_some() {
+                let mut parts = header.uri.clone().into_parts();
+                parts.path_and_query = Some(PathAndQuery::try_from(value).map_err(|_| NotAllowed)?);
+                header.set_uri(Uri::from_parts(parts).map_err(|_| NotAllowed)?);
+                Ok(())
+            } else {
+                header.set_raw_path(value).map_err(|_| NotAllowed)
+            }
+        }
+        Name::Authority | Name::Host => {
+            let host = value_of(value)?;
+            if header.uri.authority().is_some() {
+                let mut parts = header.uri.clone().into_parts();
+                parts.authority = Some(Authority::try_from(value).map_err(|_| NotAllowed)?);
+                header.set_uri(Uri::from_parts(parts).map_err(|_| NotAllowed)?);
+            }
+            if header.version != Version::HTTP_2 || header.headers.contains_key(HOST) {
+                header.insert_header("Host", host).map_err(|_| NotAllowed)?;
+            }
+            Ok(())
+        }
+        Name::Scheme if value == scheme.as_bytes() => Ok(()),
+        _ => Err(NotAllowed),
+    }
+}
+
+/// A guest writes a path in origin form, or `*`, as an HTTP/2 `:path` must be.
+fn is_origin_path(value: &[u8]) -> bool {
+    (value.first() == Some(&b'/') || value == b"*")
+        && !value.iter().any(|b| *b <= b' ' || *b == 0x7f)
+}
+
+impl HeaderMap for RequestHeaders {
+    fn get(&self, key: &[u8]) -> Option<Cow<'_, [u8]>> {
+        let value = match classify(key)? {
+            Name::Method => Some(self.header.method.as_str().as_bytes()),
+            Name::Path => self.path(),
+            Name::Authority | Name::Host => self.authority(),
+            Name::Scheme => Some(self.scheme.as_bytes()),
+            Name::Status | Name::OtherPseudo => None,
+            Name::Regular(name) => self.header.headers.get(name).map(HeaderValue::as_bytes),
+        };
+        value.map(Cow::Borrowed)
+    }
+
+    fn for_each_pair(&self, f: &mut PairVisitor<'_>) -> ControlFlow<()> {
+        let pseudo = [
+            Some((&b":method"[..], self.header.method.as_str().as_bytes())),
+            Some((&b":scheme"[..], self.scheme.as_bytes())),
+            self.authority().map(|value| (&b":authority"[..], value)),
+            self.path().map(|value| (&b":path"[..], value)),
+        ];
+        for (name, value) in pseudo.into_iter().flatten() {
+            if f(name, value).is_break() {
+                return ControlFlow::Break(());
+            }
+        }
+        visit_headers(&self.header.headers, true, f)
+    }
+
+    fn set(&mut self, key: &[u8], value: &[u8]) -> WriteResult {
+        match classify(key).ok_or(NotAllowed)? {
+            Name::Regular(_) => self.header.insert(key, value),
+            name => set_request_pseudo(&mut self.header, self.scheme, name, value),
+        }
+    }
+
+    fn add(&mut self, key: &[u8], value: &[u8]) -> WriteResult {
+        match classify(key).ok_or(NotAllowed)? {
+            Name::Regular(_) => self.header.append(key, value),
+            _ => Err(NotAllowed),
+        }
+    }
+
+    fn remove(&mut self, key: &[u8]) -> WriteResult {
+        match classify(key).ok_or(NotAllowed)? {
+            Name::Regular(name) => {
+                self.header.remove(name);
+                Ok(())
+            }
+            _ => Err(NotAllowed),
+        }
+    }
+
+    fn replace_all(&mut self, pairs: &[(&[u8], &[u8])]) -> WriteResult {
+        let mut next = self.header.clone();
+        next.strip(true);
+        for (key, value) in pairs {
+            match classify(key).ok_or(NotAllowed)? {
+                Name::Regular(_) => next.append(key, value)?,
+                name => set_request_pseudo(&mut next, self.scheme, name, value)?,
+            }
+        }
+        self.header = next;
+        Ok(())
+    }
+}
+
+/// The response header map that a guest sees.
+pub(crate) struct ResponseHeaders {
+    pub(crate) header: ResponseHeader,
+}
+
+impl ResponseHeaders {
+    pub(crate) fn new(header: ResponseHeader) -> Self {
+        ResponseHeaders { header }
+    }
+}
+
+fn set_status(header: &mut ResponseHeader, value: &[u8]) -> WriteResult {
+    let code: u16 = std::str::from_utf8(value)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .ok_or(NotAllowed)?;
+    header.set_status(code).map_err(|_| NotAllowed)
+}
+
+/// In a response map `host` is an ordinary header.
+fn classify_response(key: &[u8]) -> Option<Name<'_>> {
+    match classify(key)? {
+        Name::Host => std::str::from_utf8(key).ok().map(Name::Regular),
+        name => Some(name),
+    }
+}
+
+impl HeaderMap for ResponseHeaders {
+    fn get(&self, key: &[u8]) -> Option<Cow<'_, [u8]>> {
+        let value = match classify_response(key)? {
+            Name::Status => Some(self.header.status.as_str().as_bytes()),
+            Name::Regular(name) => self.header.headers.get(name).map(HeaderValue::as_bytes),
+            _ => None,
+        };
+        value.map(Cow::Borrowed)
+    }
+
+    fn for_each_pair(&self, f: &mut PairVisitor<'_>) -> ControlFlow<()> {
+        if f(b":status", self.header.status.as_str().as_bytes()).is_break() {
+            return ControlFlow::Break(());
+        }
+        visit_headers(&self.header.headers, false, f)
+    }
+
+    fn set(&mut self, key: &[u8], value: &[u8]) -> WriteResult {
+        match classify_response(key).ok_or(NotAllowed)? {
+            Name::Status => set_status(&mut self.header, value),
+            Name::Regular(_) => self.header.insert(key, value),
+            _ => Err(NotAllowed),
+        }
+    }
+
+    fn add(&mut self, key: &[u8], value: &[u8]) -> WriteResult {
+        match classify_response(key).ok_or(NotAllowed)? {
+            Name::Regular(_) => self.header.append(key, value),
+            _ => Err(NotAllowed),
+        }
+    }
+
+    fn remove(&mut self, key: &[u8]) -> WriteResult {
+        match classify_response(key).ok_or(NotAllowed)? {
+            Name::Regular(name) => {
+                self.header.remove(name);
+                Ok(())
+            }
+            _ => Err(NotAllowed),
+        }
+    }
+
+    fn replace_all(&mut self, pairs: &[(&[u8], &[u8])]) -> WriteResult {
+        let mut next = self.header.clone();
+        next.strip(false);
+        for (key, value) in pairs {
+            match classify_response(key).ok_or(NotAllowed)? {
+                Name::Status => set_status(&mut next, value)?,
+                Name::Regular(_) => next.append(key, value)?,
+                _ => return Err(NotAllowed),
+            }
+        }
+        self.header = next;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BytesMut;
+
+    fn request(method: &str, path: &[u8], host: Option<&str>) -> RequestHeaders {
+        let mut header = RequestHeader::build(method, path, None).unwrap();
+        if let Some(host) = host {
+            header.insert_header("Host", host).unwrap();
+        }
+        header.insert_header("X-Trace", "abc").unwrap();
+        RequestHeaders::new(header, "http")
+    }
+
+    fn pairs(map: &dyn HeaderMap) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let _ = map.for_each_pair(&mut |k, v| {
+            out.push((
+                String::from_utf8_lossy(k).into_owned(),
+                String::from_utf8_lossy(v).into_owned(),
+            ));
+            ControlFlow::Continue(())
+        });
+        out
+    }
+
+    fn get(map: &dyn HeaderMap, key: &str) -> Option<String> {
+        map.get(key.as_bytes())
+            .map(|v| String::from_utf8_lossy(&v).into_owned())
+    }
+
+    #[test]
+    fn request_reads_the_pseudo_headers() {
+        let map = request("POST", b"/a?b=1", Some("example.test"));
+
+        let read: Vec<_> = [
+            ":method",
+            ":path",
+            ":authority",
+            ":scheme",
+            ":other",
+            "host",
+        ]
+        .iter()
+        .map(|k| get(&map, k))
+        .collect();
+
+        assert_eq!(
+            read,
+            [
+                Some("POST".to_string()),
+                Some("/a?b=1".to_string()),
+                Some("example.test".to_string()),
+                Some("http".to_string()),
+                None,
+                Some("example.test".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn request_lists_pseudo_headers_first_and_hides_host() {
+        let map = request("GET", b"/", Some("example.test"));
+
+        let listed = pairs(&map);
+
+        assert_eq!(
+            listed,
+            [
+                (":method".to_string(), "GET".to_string()),
+                (":scheme".to_string(), "http".to_string()),
+                (":authority".to_string(), "example.test".to_string()),
+                (":path".to_string(), "/".to_string()),
+                ("x-trace".to_string(), "abc".to_string()),
+            ]
+        );
+        assert_eq!(map.len(), 5);
+    }
+
+    #[test]
+    fn request_reads_authority_from_the_uri_on_http2() {
+        let mut header = RequestHeader::build("GET", b"/", None).unwrap();
+        header.set_uri("https://h2.test/x".parse().unwrap());
+        header.set_version(Version::HTTP_2);
+        let map = RequestHeaders::new(header, "https");
+
+        let authority = get(&map, ":authority");
+
+        assert_eq!(authority.as_deref(), Some("h2.test"));
+    }
+
+    #[test]
+    fn connect_has_no_path() {
+        let map = request("CONNECT", b"example.test:443", Some("example.test:443"));
+
+        let path = get(&map, ":path");
+
+        assert_eq!(path, None);
+        assert!(!pairs(&map).iter().any(|(k, _)| k == ":path"));
+    }
+
+    #[test]
+    fn request_writes_the_pseudo_headers() {
+        let mut map = request("GET", b"/", Some("example.test"));
+
+        map.set(b":method", b"PUT").unwrap();
+        map.set(b":path", b"/new?q=2").unwrap();
+        map.set(b":authority", b"other.test").unwrap();
+
+        assert_eq!(map.header.method, Method::PUT);
+        assert_eq!(map.header.raw_path(), b"/new?q=2");
+        assert_eq!(map.header.headers[HOST], "other.test");
+        assert_eq!(get(&map, ":authority").as_deref(), Some("other.test"));
+    }
+
+    #[test]
+    fn request_path_write_keeps_the_http2_authority() {
+        let mut header = RequestHeader::build("GET", b"/", None).unwrap();
+        header.set_uri("https://h2.test/x".parse().unwrap());
+        header.set_version(Version::HTTP_2);
+        let mut map = RequestHeaders::new(header, "https");
+
+        map.set(b":path", b"/y").unwrap();
+
+        assert_eq!(map.header.uri.to_string(), "https://h2.test/y");
+    }
+
+    #[test]
+    fn request_refuses_bad_pseudo_writes() {
+        let mut map = request("GET", b"/", Some("example.test"));
+
+        let refused = [
+            map.set(b":method", b"BAD METHOD"),
+            map.set(b":path", b"no slash"),
+            map.set(b":authority", b"bad\nhost"),
+            map.set(b":scheme", b"https"),
+            map.set(b":other", b"x"),
+            map.add(b":path", b"/x"),
+            map.add(b"host", b"x"),
+            map.remove(b":path"),
+            map.remove(b"host"),
+            map.set(b"bad name", b"x"),
+            map.set(b"x-ok", b"bad\nvalue"),
+        ];
+
+        assert!(refused.iter().all(|r| *r == Err(NotAllowed)));
+        assert_eq!(map.header.method, Method::GET);
+        assert_eq!(map.header.raw_path(), b"/");
+        assert_eq!(map.header.headers[HOST], "example.test");
+    }
+
+    #[test]
+    fn request_accepts_its_own_scheme() {
+        let mut map = request("GET", b"/", None);
+
+        let same = map.set(b":scheme", b"http");
+
+        assert_eq!(same, Ok(()));
+    }
+
+    #[test]
+    fn host_writes_change_the_authority() {
+        let mut map = request("GET", b"/", Some("example.test"));
+
+        map.set(b"Host", b"moved.test").unwrap();
+
+        assert_eq!(get(&map, ":authority").as_deref(), Some("moved.test"));
+    }
+
+    #[test]
+    fn reads_ignore_ascii_case() {
+        let map = request("GET", b"/", None);
+
+        let read = [
+            get(&map, "x-trace"),
+            get(&map, "X-TRACE"),
+            get(&map, ":METHOD"),
+        ];
+
+        assert_eq!(read.map(|v| v.unwrap()), ["abc", "abc", "GET"]);
+    }
+
+    #[test]
+    fn writes_ignore_ascii_case() {
+        let mut map = request("GET", b"/", None);
+        map.set(b"X-NEW", b"1").unwrap();
+        map.add(b"x-new", b"2").unwrap();
+        let before = map.header.headers.get_all("x-new").iter().count();
+
+        map.remove(b"X-New").unwrap();
+
+        assert_eq!(before, 2);
+        assert!(map.header.headers.get("x-new").is_none());
+    }
+
+    #[test]
+    fn absolute_form_shows_an_origin_form_path() {
+        let map = RequestHeaders::new(
+            RequestHeader::build("GET", b"http://example.test/a?b=1", None).unwrap(),
+            "http",
+        );
+
+        let path = get(&map, ":path");
+
+        assert_eq!(path.as_deref(), Some("/a?b=1"));
+    }
+
+    #[test]
+    fn writes_keep_the_case_map_in_step() {
+        let mut map = request("GET", b"/", Some("example.test"));
+
+        map.set(b"Wasm-Context", b"7").unwrap();
+        map.remove(b"x-trace").unwrap();
+
+        let mut wire = BytesMut::new();
+        map.header.header_to_h1_wire(&mut wire);
+        let wire = String::from_utf8(wire.to_vec()).unwrap();
+        assert!(wire.contains("Wasm-Context: 7\r\n"));
+        assert!(!wire.to_ascii_lowercase().contains("x-trace"));
+    }
+
+    #[test]
+    fn replace_all_keeps_left_out_pseudo_headers_and_host() {
+        let mut map = request("GET", b"/keep", Some("example.test"));
+
+        map.replace_all(&[(b"x-a", b"1"), (b"x-a", b"2"), (b":method", b"POST")])
+            .unwrap();
+
+        assert_eq!(map.header.method, Method::POST);
+        assert_eq!(map.header.raw_path(), b"/keep");
+        assert_eq!(map.header.headers[HOST], "example.test");
+        assert!(map.header.headers.get("x-trace").is_none());
+        let values: Vec<_> = map.header.headers.get_all("x-a").iter().collect();
+        assert_eq!(values, ["1", "2"]);
+    }
+
+    #[test]
+    fn replace_all_with_a_refused_pair_changes_nothing() {
+        let mut map = request("GET", b"/", Some("example.test"));
+
+        let refused = map.replace_all(&[(b"x-a", b"1"), (b":scheme", b"https")]);
+
+        assert_eq!(refused, Err(NotAllowed));
+        assert_eq!(map.header.headers["x-trace"], "abc");
+        assert!(map.header.headers.get("x-a").is_none());
+    }
+
+    #[test]
+    fn replace_all_round_trips_every_listed_pair() {
+        let mut map = request("POST", b"/a?b=1", Some("example.test"));
+        let before = pairs(&map);
+        let owned: Vec<(Vec<u8>, Vec<u8>)> = before
+            .iter()
+            .map(|(k, v)| (k.clone().into_bytes(), v.clone().into_bytes()))
+            .collect();
+        let borrowed: Vec<(&[u8], &[u8])> = owned
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+
+        map.replace_all(&borrowed).unwrap();
+
+        assert_eq!(pairs(&map), before);
+    }
+
+    fn response() -> ResponseHeaders {
+        let mut header = ResponseHeader::build(200, None).unwrap();
+        header.insert_header("X-Up", "1").unwrap();
+        ResponseHeaders::new(header)
+    }
+
+    #[test]
+    fn response_reads_the_status() {
+        let map = response();
+
+        let status = get(&map, ":status");
+
+        assert_eq!(status.as_deref(), Some("200"));
+    }
+
+    #[test]
+    fn response_writes_the_status() {
+        let mut map = response();
+
+        map.set(b":status", b"404").unwrap();
+
+        assert_eq!(map.header.status, 404);
+        assert_eq!(
+            pairs(&map),
+            [
+                (":status".to_string(), "404".to_string()),
+                ("x-up".to_string(), "1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn response_host_is_an_ordinary_header() {
+        let mut map = response();
+
+        map.set(b"Host", b"origin.test").unwrap();
+
+        assert_eq!(get(&map, "host").as_deref(), Some("origin.test"));
+    }
+
+    #[test]
+    fn response_refuses_bad_status_writes() {
+        let mut map = response();
+
+        let refused = [
+            map.set(b":status", b"abc"),
+            map.set(b":status", b"99999"),
+            map.set(b":path", b"/"),
+            map.add(b":status", b"200"),
+            map.remove(b":status"),
+        ];
+
+        assert!(refused.iter().all(|r| *r == Err(NotAllowed)));
+        assert_eq!(map.header.status, 200);
+    }
+
+    #[test]
+    fn response_replace_all_keeps_the_status() {
+        let mut map = response();
+
+        map.replace_all(&[(b"x-new", b"1")]).unwrap();
+
+        assert_eq!(map.header.status, 200);
+        assert!(map.header.headers.get("x-up").is_none());
+        assert_eq!(map.header.headers["x-new"], "1");
+    }
+}

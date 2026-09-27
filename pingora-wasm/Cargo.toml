@@ -4,16 +4,43 @@ version = "0.9.0"
 authors = ["Ethan Hann <ethanhann@gmail.com>"]
 license = "Apache-2.0"
 edition = "2021"
+rust-version = "1.96"
 repository = "https://github.com/cloudflare/pingora"
-categories = ["asynchronous", "network-programming"]
-keywords = ["extensibility", "pingora", "wasm"]
+categories = ["asynchronous", "network-programming", "wasm"]
+keywords = ["proxy-wasm", "pingora", "wasm", "proxy"]
+exclude = ["tests/*"]
 description = """
-WASM extensibility for Pingora.
+Proxy-Wasm plugins for Pingora proxies.
 """
 
+[lib]
+name = "pingora_wasm"
+path = "src/lib.rs"
+
 [dependencies]
+pingora-core = { version = "0.9.0", path = "../pingora-core", default-features = false }
+pingora-proxy = { version = "0.9.0", path = "../pingora-proxy", default-features = false }
+pingora-http = { version = "0.9.0", path = "../pingora-http" }
+pingora-error = { version = "0.9.0", path = "../pingora-error" }
 proxy-wasm-host = "0.1"
-tracing = "0.1"
+bytes = { workspace = true }
+http = { workspace = true }
+log = { workspace = true }
+parking_lot = "0.12"
+tracing = { version = "0.1", features = ["log"] }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+pingora-test-utils = { version = "0.9.0", path = "../pingora-test-utils" }
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "time"] }
+once_cell = { workspace = true }
+futures = { workspace = true }
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+wat = "1"
+env_logger = "0.11"
+
+[package.metadata.cargo-machete]
+ignored = ["tracing"]
 
 [lints]
 workspace = true
