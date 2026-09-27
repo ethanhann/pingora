@@ -19,22 +19,34 @@
 //! its own `ProxyHttp` hooks, at the place in the request it chooses.
 
 mod chain;
-mod ctx;
-mod headers;
-mod local;
-mod logging;
-mod plugin;
-mod pool;
 mod runtime;
 mod stream;
 #[cfg(test)]
 mod test_support;
 
-pub use chain::{RequestOutcome, WasmChain};
-pub use ctx::WasmCtx;
-pub use local::write_local_response;
-pub use plugin::WasmPluginConf;
+pub use chain::{RequestOutcome, WasmChain, WasmCtx};
 pub use proxy_wasm_host::abi::v0_2_1::types::LogLevel;
 pub use proxy_wasm_host::abi::v0_2_1::{LogContext, LogSink};
 pub use proxy_wasm_host::Limits;
-pub use runtime::WasmRuntime;
+pub use runtime::{WasmPluginConf, WasmRuntime};
+pub use stream::write_plugin_response;
+
+use http::StatusCode;
+use pingora_error::{Error, ErrorType};
+use proxy_wasm_host::abi::v0_2_1::GuestError;
+
+/// The error type of a phase that fails because of a plugin. Pingora answers it with 503.
+pub const ERR_PLUGIN_FAILED: ErrorType =
+    ErrorType::HTTPStatus(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+
+pub(crate) fn plugin_failure(name: &str, what: &str, cause: GuestError) -> Box<Error> {
+    Error::because(
+        ERR_PLUGIN_FAILED,
+        format!("wasm plugin {name} {what}"),
+        cause,
+    )
+}
+
+pub(crate) fn plugin_unavailable(name: &str, what: &str) -> Box<Error> {
+    Error::explain(ERR_PLUGIN_FAILED, format!("wasm plugin {name} {what}"))
+}

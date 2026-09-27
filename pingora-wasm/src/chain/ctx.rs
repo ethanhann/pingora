@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::chain::{finish, finished, WasmChain};
-use crate::headers::{RequestHeaders, ResponseHeaders};
-use crate::stream::PingoraStream;
+use super::logging::{finish, finished};
+use super::WasmChain;
+use crate::stream::{PingoraStream, RequestHeaders, ResponseHeaders};
+use http::uri::Scheme;
+use http::{Method, StatusCode};
 use pingora_http::{RequestHeader, ResponseHeader};
 use proxy_wasm_host::abi::v0_2_1::{CallScope, ContextId, Guest, GuestId};
 use proxy_wasm_host::HeaderMap;
@@ -37,7 +39,7 @@ pub(crate) struct PluginRecord {
 pub struct WasmCtx {
     pub(crate) chain: WasmChain,
     pub(crate) records: Vec<Option<PluginRecord>>,
-    pub(crate) scheme: &'static str,
+    pub(crate) scheme: Scheme,
     stream: PingoraStream,
     spare_request: Option<RequestHeader>,
     spare_response: Option<ResponseHeader>,
@@ -59,7 +61,7 @@ impl WasmCtx {
         WasmCtx {
             chain,
             records,
-            scheme: "http",
+            scheme: Scheme::HTTP,
             stream: PingoraStream::default(),
             spare_request: None,
             spare_response: None,
@@ -84,7 +86,7 @@ impl WasmCtx {
             .take()
             .unwrap_or_else(placeholder_request);
         let request = mem::replace(header, spare);
-        self.stream.request = Some(RequestHeaders::new(request, self.scheme));
+        self.stream.request = Some(RequestHeaders::new(request, self.scheme.clone()));
     }
 
     /// Moves the request header back into the session.
@@ -147,9 +149,123 @@ impl Drop for WasmCtx {
 }
 
 fn placeholder_request() -> RequestHeader {
-    RequestHeader::build("GET", b"/", Some(0)).expect("a static request line is valid")
+    RequestHeader::build(Method::GET, b"/", Some(0)).expect("a static request line is valid")
 }
 
 fn placeholder_response() -> ResponseHeader {
-    ResponseHeader::build(200, Some(0)).expect("a static status is valid")
+    ResponseHeader::build(StatusCode::OK, Some(0)).expect("a static status is valid")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{
+        add_request_header, fixture, one_plugin, plugin, session, wat_guest, Wat, GET,
+    };
+    use crate::WasmRuntime;
+    use std::sync::Arc;
+
+    fn open_context(runtime: &WasmRuntime, ctx: &mut WasmCtx) {
+        let pool = &runtime.inner.pools[0];
+        let (slot, mut guard) = pool.pick().unwrap();
+        let loaded = guard.as_mut().unwrap();
+        let root = loaded.root;
+        let guest = loaded.guest.id();
+        let context = ctx
+            .run(&mut loaded.guest, |scope| {
+                scope.on_context_create(Some(root))
+            })
+            .unwrap();
+        pool.opened(slot);
+        ctx.records[0] = Some(PluginRecord {
+            slot,
+            guest,
+            context,
+        });
+    }
+
+    #[test]
+    fn dropping_a_ctx_deletes_its_open_context() {
+        let runtime =
+            WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 1)]).unwrap();
+        let mut ctx = runtime.chain(&["a"]).unwrap().new_ctx();
+        open_context(&runtime, &mut ctx);
+        let open = runtime.open_contexts();
+
+        drop(ctx);
+
+        assert_eq!(open, 1);
+        assert_eq!(runtime.open_contexts(), 0);
+        assert_eq!(runtime.held_contexts(), 0);
+    }
+
+    #[test]
+    fn a_held_context_moves_to_the_held_count() {
+        let runtime = WasmRuntime::new(vec![plugin(
+            "held",
+            wat_guest(
+                "held-unit",
+                Wat {
+                    done: "i32.const 0",
+                    ..Wat::default()
+                },
+            ),
+            1,
+        )])
+        .unwrap();
+        let mut ctx = runtime.chain(&["held"]).unwrap().new_ctx();
+        open_context(&runtime, &mut ctx);
+
+        drop(ctx);
+
+        assert_eq!(runtime.open_contexts(), 0);
+        assert_eq!(runtime.held_contexts(), 1);
+    }
+
+    #[test]
+    fn a_swap_returns_the_session_header() {
+        let runtime =
+            WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 1)]).unwrap();
+        let mut ctx = runtime.chain(&["a"]).unwrap().new_ctx();
+        let mut session_header =
+            pingora_http::RequestHeader::build("POST", b"/original", None).unwrap();
+
+        ctx.request_in(&mut session_header);
+        let during = session_header.raw_path().to_vec();
+        ctx.request_out(&mut session_header);
+
+        assert_eq!(during, b"/");
+        assert_eq!(session_header.method, http::Method::POST);
+        assert_eq!(session_header.raw_path(), b"/original");
+    }
+
+    #[tokio::test]
+    async fn a_ctx_finishes_on_its_runtime_after_a_swap() {
+        let (old, mut ctx) = one_plugin(add_request_header());
+        let (mut session, _client) = session(GET).await;
+        ctx.request_filter(&mut session).await.unwrap();
+        let weak = Arc::downgrade(&old.inner);
+        let (new, _) = one_plugin(add_request_header());
+        drop(old);
+
+        ctx.logging(&mut session).await;
+
+        let old = weak.upgrade().expect("the request keeps its runtime");
+        assert_eq!(old.pools[0].open_contexts(), 0);
+        assert_eq!(new.open_contexts(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_last_ctx_releases_an_old_runtime() {
+        let (old, mut ctx) = one_plugin(add_request_header());
+        let (mut session, _client) = session(GET).await;
+        ctx.request_filter(&mut session).await.unwrap();
+        ctx.logging(&mut session).await;
+        let weak = Arc::downgrade(&old.inner);
+        drop(old);
+
+        drop(ctx);
+
+        assert!(weak.upgrade().is_none());
+    }
 }

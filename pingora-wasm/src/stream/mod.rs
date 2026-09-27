@@ -12,8 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::headers::{RequestHeaders, ResponseHeaders};
-use crate::local::Local;
+//! What a guest reads and writes during a callback.
+
+mod names;
+mod plugin_response;
+mod request_headers;
+mod response_headers;
+
+pub use plugin_response::write_plugin_response;
+pub(crate) use plugin_response::PluginResponse;
+pub(crate) use request_headers::RequestHeaders;
+pub(crate) use response_headers::ResponseHeaders;
+
 use log::{debug, warn};
 use proxy_wasm_host::abi::v0_2_1::types::{MapType, Status};
 use proxy_wasm_host::abi::v0_2_1::{Access, Callback, Invocation, LocalResponse, StreamState};
@@ -24,7 +34,7 @@ use proxy_wasm_host::{HeaderMap, VecHeaderMap};
 pub(crate) struct PingoraStream {
     pub(crate) request: Option<RequestHeaders>,
     pub(crate) response: Option<ResponseHeaders>,
-    pub(crate) local: Option<Local>,
+    pub(crate) plugin_response: Option<PluginResponse>,
     empty: VecHeaderMap,
 }
 
@@ -75,18 +85,18 @@ impl StreamState for PingoraStream {
         if call.callback != Some(Callback::RequestHeaders) {
             return Err(Status::Unimplemented);
         }
-        let local = Local::build(&response).ok_or(Status::BadArgument)?;
+        let plugin_response = PluginResponse::build(&response).ok_or(Status::BadArgument)?;
         if !response.status_code_details.is_empty() {
             debug!(
-                "local response {}: {}",
+                "plugin response {}: {}",
                 response.status_code,
                 String::from_utf8_lossy(&response.status_code_details)
             );
         }
         if let Some(grpc_status) = response.grpc_status {
-            warn!("local response gRPC status {grpc_status} is not sent");
+            warn!("plugin response gRPC status {grpc_status} is not sent");
         }
-        self.local = Some(local);
+        self.plugin_response = Some(plugin_response);
         Ok(())
     }
 }
@@ -94,6 +104,7 @@ impl StreamState for PingoraStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::uri::Scheme;
     use pingora_http::{RequestHeader, ResponseHeader};
     use proxy_wasm_host::abi::v0_2_1::{ContextId, GuestId};
     use std::borrow::Cow;
@@ -106,7 +117,7 @@ mod tests {
         PingoraStream {
             request: Some(RequestHeaders::new(
                 RequestHeader::build("GET", b"/", None).unwrap(),
-                "http",
+                Scheme::HTTP,
             )),
             response: with_response
                 .then(|| ResponseHeaders::new(ResponseHeader::build(200, None).unwrap())),
@@ -200,7 +211,7 @@ mod tests {
         let answer = s.send_local_response(call(Callback::RequestHeaders), local(403));
 
         assert_eq!(answer, Ok(()));
-        let recorded = s.local.unwrap();
+        let recorded = s.plugin_response.unwrap();
         assert_eq!(recorded.header.status, 403);
         assert_eq!(&recorded.body[..], b"body");
     }
@@ -214,7 +225,7 @@ mod tests {
         s.send_local_response(call(Callback::RequestHeaders), local(401))
             .unwrap();
 
-        assert_eq!(s.local.unwrap().header.status, 401);
+        assert_eq!(s.plugin_response.unwrap().header.status, 401);
     }
 
     #[test]
@@ -224,7 +235,7 @@ mod tests {
         let answer = s.send_local_response(call(Callback::RequestHeaders), local(99));
 
         assert_eq!(answer, Err(Status::BadArgument));
-        assert!(s.local.is_none());
+        assert!(s.plugin_response.is_none());
     }
 
     #[test]
@@ -234,6 +245,6 @@ mod tests {
         let answer = s.send_local_response(call(Callback::ResponseHeaders), local(403));
 
         assert_eq!(answer, Err(Status::Unimplemented));
-        assert!(s.local.is_none());
+        assert!(s.plugin_response.is_none());
     }
 }

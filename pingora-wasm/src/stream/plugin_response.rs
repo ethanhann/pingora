@@ -14,28 +14,29 @@
 
 use bytes::Bytes;
 use http::header::{HeaderValue, CONTENT_LENGTH, TRANSFER_ENCODING};
-use http::Method;
+use http::{Method, StatusCode};
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_error::Result;
 use pingora_http::ResponseHeader;
 use pingora_proxy::Session;
 use proxy_wasm_host::abi::v0_2_1::LocalResponse;
 
-/// A response that a guest sent with `proxy_send_local_response`.
+/// A response that a plugin sent in place of the upstream response, with
+/// `proxy_send_local_response`.
 #[derive(Debug)]
-pub(crate) struct Local {
+pub(crate) struct PluginResponse {
     pub(crate) header: ResponseHeader,
     pub(crate) body: Bytes,
 }
 
-impl Local {
+impl PluginResponse {
     /// Builds the response, or `None` for a status or a header that is not valid.
     pub(crate) fn build(response: &LocalResponse<'_>) -> Option<Self> {
-        if !(200..=599).contains(&response.status_code) {
-            return None;
-        }
-        let code = u16::try_from(response.status_code).ok()?;
-        let mut header = ResponseHeader::build(code, Some(response.headers.len() + 1)).ok()?;
+        let status = u16::try_from(response.status_code)
+            .ok()
+            .and_then(|code| StatusCode::from_u16(code).ok())
+            .filter(is_final)?;
+        let mut header = ResponseHeader::build(status, Some(response.headers.len() + 1)).ok()?;
         for (key, value) in &response.headers {
             let name = std::str::from_utf8(key).ok()?;
             if name.starts_with(':') {
@@ -52,17 +53,17 @@ impl Local {
         header
             .insert_header(CONTENT_LENGTH, response.body.len())
             .ok()?;
-        Some(Local {
+        Some(PluginResponse {
             header,
             body: Bytes::copy_from_slice(&response.body),
         })
     }
 }
 
-/// Writes a local response that a [WasmCtx](crate::WasmCtx) returned.
+/// Writes a plugin response that a [WasmCtx](crate::WasmCtx) returned.
 ///
 /// A proxy that writes responses with its own code can use that code instead.
-pub async fn write_local_response<DS: DownstreamSession>(
+pub async fn write_plugin_response<DS: DownstreamSession>(
     session: &mut Session<DS>,
     header: Box<ResponseHeader>,
     body: Bytes,
@@ -72,6 +73,14 @@ pub async fn write_local_response<DS: DownstreamSession>(
     }
     session.write_response_header(header, false).await?;
     session.write_response_body(Some(body), true).await
+}
+
+/// A status that ends a response, from 200 to 599.
+fn is_final(status: &StatusCode) -> bool {
+    status.is_success()
+        || status.is_redirection()
+        || status.is_client_error()
+        || status.is_server_error()
 }
 
 #[cfg(test)]
@@ -93,7 +102,7 @@ mod tests {
     fn build_sets_the_status_the_headers_and_the_length() {
         let local = response(403, &[("x-denied", "yes"), ("X-Case", "Kept")]);
 
-        let built = Local::build(&local).unwrap();
+        let built = PluginResponse::build(&local).unwrap();
 
         assert_eq!(built.header.status, 403);
         assert_eq!(built.header.headers["x-denied"], "yes");
@@ -109,7 +118,7 @@ mod tests {
             &[("Content-Length", "999"), ("transfer-encoding", "chunked")],
         );
 
-        let built = Local::build(&local).unwrap();
+        let built = PluginResponse::build(&local).unwrap();
 
         assert_eq!(
             built.header.headers.get_all(CONTENT_LENGTH).iter().count(),
@@ -125,7 +134,7 @@ mod tests {
 
         let built: Vec<_> = statuses
             .iter()
-            .map(|s| Local::build(&response(*s, &[])).is_some())
+            .map(|s| PluginResponse::build(&response(*s, &[])).is_some())
             .collect();
 
         assert_eq!(built, [false; 5]);
@@ -139,7 +148,10 @@ mod tests {
             response(200, &[(":status", "200")]),
         ];
 
-        let built: Vec<_> = bad.iter().map(|r| Local::build(r).is_some()).collect();
+        let built: Vec<_> = bad
+            .iter()
+            .map(|r| PluginResponse::build(r).is_some())
+            .collect();
 
         assert_eq!(built, [false; 3]);
     }

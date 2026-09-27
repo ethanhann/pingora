@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::WasmPluginConf;
+use crate::{WasmCtx, WasmPluginConf, WasmRuntime};
 use pingora_proxy::Session;
+use proxy_wasm_host::HeaderMap;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use tokio::io::{AsyncWriteExt, DuplexStream};
 
@@ -81,4 +83,44 @@ pub(crate) async fn session(request: &[u8]) -> (Session, DuplexStream) {
     let mut session = Session::new_h1(Box::new(server));
     session.read_request().await.unwrap();
     (session, client)
+}
+
+pub(crate) const GET: &[u8] = b"GET /original HTTP/1.1\r\nHost: example.test\r\n\r\n";
+
+/// A runtime with one plugin named `a`, and a request context from a chain of it.
+pub(crate) fn one_plugin(conf: WasmPluginConf) -> (WasmRuntime, WasmCtx) {
+    let runtime = WasmRuntime::new(vec![conf]).unwrap();
+    let ctx = runtime.chain(&["a"]).unwrap().new_ctx();
+    (runtime, ctx)
+}
+
+pub(crate) fn add_request_header() -> WasmPluginConf {
+    plugin("a", fixture("add-request-header"), 1)
+}
+
+/// A WAT plugin named `a` whose `proxy_on_request_headers` runs `request_headers`.
+pub(crate) fn wat_plugin(label: &str, request_headers: &'static str) -> WasmPluginConf {
+    let wat = Wat {
+        request_headers,
+        ..Wat::default()
+    };
+    plugin("a", wat_guest(label, wat), 1)
+}
+
+/// Every pair of a header map, as text.
+pub(crate) fn pairs(map: &dyn HeaderMap) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let _ = map.for_each_pair(&mut |k, v| {
+        out.push((
+            String::from_utf8_lossy(k).into_owned(),
+            String::from_utf8_lossy(v).into_owned(),
+        ));
+        ControlFlow::Continue(())
+    });
+    out
+}
+
+pub(crate) fn get(map: &dyn HeaderMap, key: &str) -> Option<String> {
+    map.get(key.as_bytes())
+        .map(|v| String::from_utf8_lossy(&v).into_owned())
 }

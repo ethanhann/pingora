@@ -12,135 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The Proxy-Wasm view of Pingora request and response headers.
+//! The request header map that a guest sees.
 //!
-//! The pseudo headers are computed from the typed fields. The request map hides `host` and
-//! serves it as `:authority`.
+//! The pseudo headers are computed from the typed fields. The map hides `host` and serves it as
+//! `:authority`.
 
-use http::header::{HeaderName, HeaderValue, HOST};
-use http::uri::{Authority, PathAndQuery};
+use super::names::{classify, value_of, visit_headers, Name, Regular, WriteResult};
+use http::header::{HeaderValue, HOST};
+use http::uri::{Authority, PathAndQuery, Scheme};
 use http::{Method, Uri, Version};
-use pingora_http::{RequestHeader, ResponseHeader};
+use pingora_http::RequestHeader;
 use proxy_wasm_host::{HeaderMap, NotAllowed, PairVisitor};
 use std::borrow::Cow;
 use std::ops::ControlFlow;
 
-type WriteResult = Result<(), NotAllowed>;
-
-/// What a key refers to, found without an allocation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Name<'a> {
-    Method,
-    Path,
-    Authority,
-    Scheme,
-    Status,
-    OtherPseudo,
-    Host,
-    Regular(&'a str),
-}
-
-const PSEUDO: [(&[u8], Name<'static>); 5] = [
-    (b":method", Name::Method),
-    (b":path", Name::Path),
-    (b":authority", Name::Authority),
-    (b":scheme", Name::Scheme),
-    (b":status", Name::Status),
-];
-
-fn classify(key: &[u8]) -> Option<Name<'_>> {
-    if key.first() == Some(&b':') {
-        let found = PSEUDO
-            .iter()
-            .find(|(name, _)| key.eq_ignore_ascii_case(name));
-        return Some(found.map_or(Name::OtherPseudo, |(_, name)| *name));
-    }
-    if key.eq_ignore_ascii_case(b"host") {
-        return Some(Name::Host);
-    }
-    std::str::from_utf8(key).ok().map(Name::Regular)
-}
-
-fn name_of(key: &[u8]) -> Result<String, NotAllowed> {
-    let name = std::str::from_utf8(key).map_err(|_| NotAllowed)?;
-    HeaderName::from_bytes(name.as_bytes()).map_err(|_| NotAllowed)?;
-    Ok(name.to_string())
-}
-
-fn value_of(value: &[u8]) -> Result<HeaderValue, NotAllowed> {
-    HeaderValue::from_bytes(value).map_err(|_| NotAllowed)
-}
-
-fn visit_headers(
-    map: &http::HeaderMap,
-    skip_host: bool,
-    f: &mut PairVisitor<'_>,
-) -> ControlFlow<()> {
-    for (name, value) in map {
-        if skip_host && name == HOST {
-            continue;
-        }
-        if f(name.as_str().as_bytes(), value.as_bytes()).is_break() {
-            return ControlFlow::Break(());
-        }
-    }
-    ControlFlow::Continue(())
-}
-
-trait Regular {
-    fn map(&self) -> &http::HeaderMap;
-    fn insert(&mut self, key: &[u8], value: &[u8]) -> WriteResult;
-    fn append(&mut self, key: &[u8], value: &[u8]) -> WriteResult;
-    fn remove(&mut self, key: &str);
-    fn strip(&mut self, keep_host: bool) {
-        let names: Vec<HeaderName> = self
-            .map()
-            .keys()
-            .filter(|name| !(keep_host && *name == HOST))
-            .cloned()
-            .collect();
-        for name in names {
-            self.remove(name.as_str());
-        }
-    }
-}
-
-macro_rules! impl_regular {
-    ($type:ty) => {
-        impl Regular for $type {
-            fn map(&self) -> &http::HeaderMap {
-                &self.headers
-            }
-
-            fn insert(&mut self, key: &[u8], value: &[u8]) -> WriteResult {
-                self.insert_header(name_of(key)?, value_of(value)?)
-                    .map_err(|_| NotAllowed)
-            }
-
-            fn append(&mut self, key: &[u8], value: &[u8]) -> WriteResult {
-                self.append_header(name_of(key)?, value_of(value)?)
-                    .map(|_| ())
-                    .map_err(|_| NotAllowed)
-            }
-
-            fn remove(&mut self, key: &str) {
-                self.remove_header(key);
-            }
-        }
-    };
-}
-
-impl_regular!(RequestHeader);
-impl_regular!(ResponseHeader);
-
 /// The request header map that a guest sees.
 pub(crate) struct RequestHeaders {
     pub(crate) header: RequestHeader,
-    scheme: &'static str,
+    scheme: Scheme,
 }
 
 impl RequestHeaders {
-    pub(crate) fn new(header: RequestHeader, scheme: &'static str) -> Self {
+    pub(crate) fn new(header: RequestHeader, scheme: Scheme) -> Self {
         RequestHeaders { header, scheme }
     }
 
@@ -204,7 +97,7 @@ fn set_request_pseudo(
                 header.set_uri(Uri::from_parts(parts).map_err(|_| NotAllowed)?);
             }
             if header.version != Version::HTTP_2 || header.headers.contains_key(HOST) {
-                header.insert_header("Host", host).map_err(|_| NotAllowed)?;
+                header.insert_header(HOST, host).map_err(|_| NotAllowed)?;
             }
             Ok(())
         }
@@ -216,7 +109,7 @@ fn set_request_pseudo(
 /// A guest writes a path in origin form, or `*`, as an HTTP/2 `:path` must be.
 fn is_origin_path(value: &[u8]) -> bool {
     (value.first() == Some(&b'/') || value == b"*")
-        && !value.iter().any(|b| *b <= b' ' || *b == 0x7f)
+        && !value.iter().any(|b| *b == b' ' || b.is_ascii_control())
 }
 
 impl HeaderMap for RequestHeaders {
@@ -225,7 +118,7 @@ impl HeaderMap for RequestHeaders {
             Name::Method => Some(self.header.method.as_str().as_bytes()),
             Name::Path => self.path(),
             Name::Authority | Name::Host => self.authority(),
-            Name::Scheme => Some(self.scheme.as_bytes()),
+            Name::Scheme => Some(self.scheme.as_str().as_bytes()),
             Name::Status | Name::OtherPseudo => None,
             Name::Regular(name) => self.header.headers.get(name).map(HeaderValue::as_bytes),
         };
@@ -235,7 +128,7 @@ impl HeaderMap for RequestHeaders {
     fn for_each_pair(&self, f: &mut PairVisitor<'_>) -> ControlFlow<()> {
         let pseudo = [
             Some((&b":method"[..], self.header.method.as_str().as_bytes())),
-            Some((&b":scheme"[..], self.scheme.as_bytes())),
+            Some((&b":scheme"[..], self.scheme.as_str().as_bytes())),
             self.authority().map(|value| (&b":authority"[..], value)),
             self.path().map(|value| (&b":path"[..], value)),
         ];
@@ -250,7 +143,7 @@ impl HeaderMap for RequestHeaders {
     fn set(&mut self, key: &[u8], value: &[u8]) -> WriteResult {
         match classify(key).ok_or(NotAllowed)? {
             Name::Regular(_) => self.header.insert(key, value),
-            name => set_request_pseudo(&mut self.header, self.scheme, name, value),
+            name => set_request_pseudo(&mut self.header, self.scheme.as_str(), name, value),
         }
     }
 
@@ -277,91 +170,7 @@ impl HeaderMap for RequestHeaders {
         for (key, value) in pairs {
             match classify(key).ok_or(NotAllowed)? {
                 Name::Regular(_) => next.append(key, value)?,
-                name => set_request_pseudo(&mut next, self.scheme, name, value)?,
-            }
-        }
-        self.header = next;
-        Ok(())
-    }
-}
-
-/// The response header map that a guest sees.
-pub(crate) struct ResponseHeaders {
-    pub(crate) header: ResponseHeader,
-}
-
-impl ResponseHeaders {
-    pub(crate) fn new(header: ResponseHeader) -> Self {
-        ResponseHeaders { header }
-    }
-}
-
-fn set_status(header: &mut ResponseHeader, value: &[u8]) -> WriteResult {
-    let code: u16 = std::str::from_utf8(value)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .ok_or(NotAllowed)?;
-    header.set_status(code).map_err(|_| NotAllowed)
-}
-
-/// In a response map `host` is an ordinary header.
-fn classify_response(key: &[u8]) -> Option<Name<'_>> {
-    match classify(key)? {
-        Name::Host => std::str::from_utf8(key).ok().map(Name::Regular),
-        name => Some(name),
-    }
-}
-
-impl HeaderMap for ResponseHeaders {
-    fn get(&self, key: &[u8]) -> Option<Cow<'_, [u8]>> {
-        let value = match classify_response(key)? {
-            Name::Status => Some(self.header.status.as_str().as_bytes()),
-            Name::Regular(name) => self.header.headers.get(name).map(HeaderValue::as_bytes),
-            _ => None,
-        };
-        value.map(Cow::Borrowed)
-    }
-
-    fn for_each_pair(&self, f: &mut PairVisitor<'_>) -> ControlFlow<()> {
-        if f(b":status", self.header.status.as_str().as_bytes()).is_break() {
-            return ControlFlow::Break(());
-        }
-        visit_headers(&self.header.headers, false, f)
-    }
-
-    fn set(&mut self, key: &[u8], value: &[u8]) -> WriteResult {
-        match classify_response(key).ok_or(NotAllowed)? {
-            Name::Status => set_status(&mut self.header, value),
-            Name::Regular(_) => self.header.insert(key, value),
-            _ => Err(NotAllowed),
-        }
-    }
-
-    fn add(&mut self, key: &[u8], value: &[u8]) -> WriteResult {
-        match classify_response(key).ok_or(NotAllowed)? {
-            Name::Regular(_) => self.header.append(key, value),
-            _ => Err(NotAllowed),
-        }
-    }
-
-    fn remove(&mut self, key: &[u8]) -> WriteResult {
-        match classify_response(key).ok_or(NotAllowed)? {
-            Name::Regular(name) => {
-                self.header.remove(name);
-                Ok(())
-            }
-            _ => Err(NotAllowed),
-        }
-    }
-
-    fn replace_all(&mut self, pairs: &[(&[u8], &[u8])]) -> WriteResult {
-        let mut next = self.header.clone();
-        next.strip(false);
-        for (key, value) in pairs {
-            match classify_response(key).ok_or(NotAllowed)? {
-                Name::Status => set_status(&mut next, value)?,
-                Name::Regular(_) => next.append(key, value)?,
-                _ => return Err(NotAllowed),
+                name => set_request_pseudo(&mut next, self.scheme.as_str(), name, value)?,
             }
         }
         self.header = next;
@@ -372,6 +181,7 @@ impl HeaderMap for ResponseHeaders {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{get, pairs};
     use bytes::BytesMut;
 
     fn request(method: &str, path: &[u8], host: Option<&str>) -> RequestHeaders {
@@ -380,24 +190,7 @@ mod tests {
             header.insert_header("Host", host).unwrap();
         }
         header.insert_header("X-Trace", "abc").unwrap();
-        RequestHeaders::new(header, "http")
-    }
-
-    fn pairs(map: &dyn HeaderMap) -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        let _ = map.for_each_pair(&mut |k, v| {
-            out.push((
-                String::from_utf8_lossy(k).into_owned(),
-                String::from_utf8_lossy(v).into_owned(),
-            ));
-            ControlFlow::Continue(())
-        });
-        out
-    }
-
-    fn get(map: &dyn HeaderMap, key: &str) -> Option<String> {
-        map.get(key.as_bytes())
-            .map(|v| String::from_utf8_lossy(&v).into_owned())
+        RequestHeaders::new(header, Scheme::HTTP)
     }
 
     #[test]
@@ -453,7 +246,7 @@ mod tests {
         let mut header = RequestHeader::build("GET", b"/", None).unwrap();
         header.set_uri("https://h2.test/x".parse().unwrap());
         header.set_version(Version::HTTP_2);
-        let map = RequestHeaders::new(header, "https");
+        let map = RequestHeaders::new(header, Scheme::HTTPS);
 
         let authority = get(&map, ":authority");
 
@@ -489,7 +282,7 @@ mod tests {
         let mut header = RequestHeader::build("GET", b"/", None).unwrap();
         header.set_uri("https://h2.test/x".parse().unwrap());
         header.set_version(Version::HTTP_2);
-        let mut map = RequestHeaders::new(header, "https");
+        let mut map = RequestHeaders::new(header, Scheme::HTTPS);
 
         map.set(b":path", b"/y").unwrap();
 
@@ -568,7 +361,7 @@ mod tests {
     fn absolute_form_shows_an_origin_form_path() {
         let map = RequestHeaders::new(
             RequestHeader::build("GET", b"http://example.test/a?b=1", None).unwrap(),
-            "http",
+            Scheme::HTTP,
         );
 
         let path = get(&map, ":path");
@@ -632,72 +425,5 @@ mod tests {
         map.replace_all(&borrowed).unwrap();
 
         assert_eq!(pairs(&map), before);
-    }
-
-    fn response() -> ResponseHeaders {
-        let mut header = ResponseHeader::build(200, None).unwrap();
-        header.insert_header("X-Up", "1").unwrap();
-        ResponseHeaders::new(header)
-    }
-
-    #[test]
-    fn response_reads_the_status() {
-        let map = response();
-
-        let status = get(&map, ":status");
-
-        assert_eq!(status.as_deref(), Some("200"));
-    }
-
-    #[test]
-    fn response_writes_the_status() {
-        let mut map = response();
-
-        map.set(b":status", b"404").unwrap();
-
-        assert_eq!(map.header.status, 404);
-        assert_eq!(
-            pairs(&map),
-            [
-                (":status".to_string(), "404".to_string()),
-                ("x-up".to_string(), "1".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn response_host_is_an_ordinary_header() {
-        let mut map = response();
-
-        map.set(b"Host", b"origin.test").unwrap();
-
-        assert_eq!(get(&map, "host").as_deref(), Some("origin.test"));
-    }
-
-    #[test]
-    fn response_refuses_bad_status_writes() {
-        let mut map = response();
-
-        let refused = [
-            map.set(b":status", b"abc"),
-            map.set(b":status", b"99999"),
-            map.set(b":path", b"/"),
-            map.add(b":status", b"200"),
-            map.remove(b":status"),
-        ];
-
-        assert!(refused.iter().all(|r| *r == Err(NotAllowed)));
-        assert_eq!(map.header.status, 200);
-    }
-
-    #[test]
-    fn response_replace_all_keeps_the_status() {
-        let mut map = response();
-
-        map.replace_all(&[(b"x-new", b"1")]).unwrap();
-
-        assert_eq!(map.header.status, 200);
-        assert!(map.header.headers.get("x-up").is_none());
-        assert_eq!(map.header.headers["x-new"], "1");
     }
 }

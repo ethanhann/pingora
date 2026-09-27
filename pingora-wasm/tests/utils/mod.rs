@@ -23,7 +23,7 @@ use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session};
 use pingora_test_utils::http_origin::HttpOrigin;
 use pingora_wasm::{
-    write_local_response, RequestOutcome, WasmChain, WasmCtx, WasmPluginConf, WasmRuntime,
+    write_plugin_response, RequestOutcome, WasmChain, WasmCtx, WasmPluginConf, WasmRuntime,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -112,7 +112,7 @@ impl ProxyHttp for TestProxy {
         let wasm = ctx.insert(self.chain.new_ctx());
         match wasm.request_filter(session).await? {
             RequestOutcome::Respond(header, body) => {
-                write_local_response(session, header, body).await?;
+                write_plugin_response(session, header, body).await?;
                 Ok(true)
             }
             _ => Ok(false),

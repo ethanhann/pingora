@@ -19,7 +19,7 @@ use pingora_core::{Error, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use pingora_wasm::{
-    write_local_response, RequestOutcome, WasmChain, WasmCtx, WasmPluginConf, WasmRuntime,
+    write_plugin_response, RequestOutcome, WasmChain, WasmCtx, WasmPluginConf, WasmRuntime,
 };
 use std::path::PathBuf;
 
@@ -43,7 +43,7 @@ impl ProxyHttp for PluginProxy {
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         match ctx.request_filter(session).await? {
             RequestOutcome::Respond(header, body) => {
-                write_local_response(session, header, body).await?;
+                write_plugin_response(session, header, body).await?;
                 Ok(true)
             }
             _ => Ok(false),

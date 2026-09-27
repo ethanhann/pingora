@@ -16,9 +16,10 @@
 //!
 //! A request keeps the slot it started on, because its contexts live in that guest.
 
+use crate::{plugin_failure, plugin_unavailable};
 use log::{error, warn};
 use parking_lot::{Mutex, MutexGuard};
-use pingora_error::{Error, ErrorType, Result};
+use pingora_error::Result;
 use proxy_wasm_host::abi::v0_2_1::{
     ContextId, Guest, GuestError, GuestId, GuestSpec, PluginConfig, Started,
 };
@@ -51,21 +52,6 @@ pub(crate) struct GuestPool {
     slots: Vec<Slot>,
 }
 
-pub(crate) fn failure(name: &str, what: &str, cause: GuestError) -> Box<Error> {
-    Error::because(
-        ErrorType::HTTPStatus(503),
-        format!("wasm plugin {name} {what}"),
-        cause,
-    )
-}
-
-pub(crate) fn unavailable(name: &str, what: &str) -> Box<Error> {
-    Error::explain(
-        ErrorType::HTTPStatus(503),
-        format!("wasm plugin {name} {what}"),
-    )
-}
-
 impl GuestPool {
     pub(crate) fn new(
         name: String,
@@ -90,14 +76,14 @@ impl GuestPool {
         let mut guest = self
             .spec
             .build()
-            .map_err(|e| failure(&self.name, "could not be built", e))?;
+            .map_err(|e| plugin_failure(&self.name, "could not be built", e))?;
         match guest.start(self.plugin.clone()) {
             Ok(Started::Serving(root)) => Ok(Loaded { guest, root }),
-            Ok(Started::Refused { callback, .. }) => Err(unavailable(
+            Ok(Started::Refused { callback, .. }) => Err(plugin_unavailable(
                 &self.name,
                 &format!("refused its start in {callback}"),
             )),
-            Err(e) => Err(failure(&self.name, "failed to start", e)),
+            Err(e) => Err(plugin_failure(&self.name, "failed to start", e)),
         }
     }
 
@@ -130,7 +116,7 @@ impl GuestPool {
                 return Ok((index, guard));
             }
         }
-        Err(unavailable(&self.name, "has no guest"))
+        Err(plugin_unavailable(&self.name, "has no guest"))
     }
 
     /// Locks the slot of a request, or `None` when its guest was replaced.
@@ -246,5 +232,46 @@ impl GuestPool {
     pub(crate) fn fail_slot(&self, index: usize) {
         self.slots[index].guest.lock().take();
         *self.slots[index].failed_at.lock() = Some(Instant::now());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{fixture, plugin};
+    use crate::WasmRuntime;
+    use std::thread;
+
+    #[test]
+    fn pick_skips_a_locked_slot_and_a_slot_with_no_guest() {
+        let runtime =
+            WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 3)]).unwrap();
+        let pool = &runtime.inner.pools[0];
+        pool.fail_slot(1);
+        let held = pool.lock_slot(0);
+
+        let picked: Vec<_> = (0..4).map(|_| pool.pick().unwrap().0).collect();
+
+        drop(held);
+        assert_eq!(picked, [2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn a_recent_failed_rebuild_waits_for_its_backoff() {
+        let runtime =
+            WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 2)]).unwrap();
+        let pool = &runtime.inner.pools[0];
+        pool.fail_slot(0);
+        let busy = pool.lock_slot(1);
+
+        let picked = thread::scope(|scope| {
+            let picker = scope.spawn(|| pool.pick().map(|(slot, _)| slot).ok());
+            thread::sleep(Duration::from_millis(50));
+            drop(busy);
+            picker.join().unwrap()
+        });
+
+        assert_eq!(picked, Some(1));
+        assert!(pool.lock_slot(0).is_none());
     }
 }

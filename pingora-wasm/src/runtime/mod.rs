@@ -12,19 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Plugins and their guests, built once and shared by every request.
+
+mod log_sink;
+mod plugin;
+pub(crate) mod pool;
+mod ticker;
+
+pub use plugin::WasmPluginConf;
+
 use crate::chain::WasmChain;
-use crate::logging::LogCrateSink;
-use crate::plugin::WasmPluginConf;
-use crate::pool::GuestPool;
-use parking_lot::Mutex;
+use log_sink::LogCrateSink;
 use pingora_error::{Error, ErrorType, OrErr, Result};
+use pool::GuestPool;
 use proxy_wasm_host::abi::v0_2_1::{GuestSpec, Host, InMemoryStore, LogSink, SharedServices};
 use proxy_wasm_host::{Engine, EngineConfig, Module};
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
-use std::thread;
+use std::sync::Arc;
+use ticker::{with_ticker, Ticker};
 
 /// The engine, the shared store, and the guests of a set of plugins.
 ///
@@ -37,20 +43,9 @@ pub struct WasmRuntime {
 
 pub(crate) struct RuntimeInner {
     engine: Engine,
-    ticker_started: AtomicBool,
-    ticker_lock: Mutex<()>,
-    #[cfg(test)]
-    ticking: Arc<AtomicBool>,
+    ticker: Ticker,
     pub(crate) pools: Vec<GuestPool>,
     names: HashMap<String, usize>,
-}
-
-impl fmt::Debug for WasmRuntime {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WasmRuntime")
-            .field("plugins", &self.inner.plugin_names())
-            .finish()
-    }
 }
 
 impl WasmRuntime {
@@ -114,10 +109,7 @@ impl WasmRuntime {
         Ok(WasmRuntime {
             inner: Arc::new(RuntimeInner {
                 engine,
-                ticker_started: AtomicBool::new(false),
-                ticker_lock: Mutex::new(()),
-                #[cfg(test)]
-                ticking: Arc::new(AtomicBool::new(false)),
+                ticker: Ticker::new(),
                 pools,
                 names,
             }),
@@ -159,95 +151,32 @@ impl WasmRuntime {
     }
 }
 
+impl fmt::Debug for WasmRuntime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WasmRuntime")
+            .field("plugins", &self.inner.plugin_names())
+            .finish()
+    }
+}
+
 impl RuntimeInner {
-    /// Starts the epoch ticker on the first call.
-    ///
-    /// It starts here and not in [WasmRuntime::new], because a daemon fork after `new` would
-    /// lose the thread. The thread stops when the runtime is dropped. Without the ticker no guest
-    /// has a CPU time limit, so a failed start is an error and the next call tries again.
+    /// Starts the epoch ticker on the first call. See [Ticker::start].
     pub(crate) fn start_ticker(self: &Arc<Self>) -> Result<()> {
-        if self.ticker_started.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let _lock = self.ticker_lock.lock();
-        if self.ticker_started.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let runtime = Arc::downgrade(self);
-        let period = self.engine.epoch_period();
-        #[cfg(test)]
-        let ticking = self.ticking.clone();
-        #[cfg(test)]
-        ticking.store(true, Ordering::Relaxed);
-        thread::Builder::new()
-            .name("pingora-wasm-epoch".to_string())
-            .spawn(move || {
-                tick(&runtime, period);
-                #[cfg(test)]
-                ticking.store(false, Ordering::Relaxed);
-            })
-            .or_err(
-                ErrorType::HTTPStatus(503),
-                "failed to start the wasm epoch ticker",
-            )?;
-        self.ticker_started.store(true, Ordering::Release);
-        Ok(())
+        self.ticker.start(self)
     }
 
     pub(crate) fn plugin_names(&self) -> Vec<&str> {
         self.pools.iter().map(|pool| pool.name.as_str()).collect()
     }
-
-    #[cfg(test)]
-    pub(crate) fn ticking(&self) -> Arc<AtomicBool> {
-        self.ticking.clone()
-    }
-}
-
-fn tick(runtime: &Weak<RuntimeInner>, period: std::time::Duration) {
-    loop {
-        thread::sleep(period);
-        match runtime.upgrade() {
-            Some(runtime) => runtime.engine.increment_epoch(),
-            None => return,
-        }
-    }
-}
-
-/// Runs `f` with a ticker that stops when `f` returns, so a guest start that loops forever
-/// reaches its time limit.
-fn with_ticker<R>(engine: &Engine, f: impl FnOnce() -> R) -> R {
-    struct Done<'a>(&'a AtomicBool);
-
-    impl Drop for Done<'_> {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Relaxed);
-        }
-    }
-
-    let done = AtomicBool::new(false);
-    let period = engine.epoch_period();
-    thread::scope(|scope| {
-        scope.spawn(|| {
-            while !done.load(Ordering::Relaxed) {
-                thread::sleep(period);
-                engine.increment_epoch();
-            }
-        });
-        let _done = Done(&done);
-        f()
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ctx::PluginRecord;
     use crate::test_support::{fixture, plugin, wat_guest, Wat};
     use proxy_wasm_host::abi::v0_2_1::types::LogLevel;
     use proxy_wasm_host::abi::v0_2_1::LogContext;
     use proxy_wasm_host::Limits;
-    use std::time::Duration;
 
     fn refusal(plugins: Vec<WasmPluginConf>) -> String {
         WasmRuntime::new(plugins).err().unwrap().to_string()
@@ -366,161 +295,6 @@ mod tests {
 
         assert_eq!(stores.len(), 3);
         assert!(stores.iter().all(|s| Arc::ptr_eq(s, &stores[0])));
-    }
-
-    #[test]
-    fn the_ticker_starts_on_the_first_call() {
-        let runtime =
-            WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 1)]).unwrap();
-        let ticking = runtime.inner.ticking();
-        let before = ticking.load(Ordering::Relaxed);
-
-        runtime.inner.start_ticker().unwrap();
-
-        assert!(!before);
-        assert!(ticking.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn the_ticker_stops_when_the_runtime_drops() {
-        let runtime =
-            WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 1)]).unwrap();
-        runtime.inner.start_ticker().unwrap();
-        let ticking = runtime.inner.ticking();
-
-        drop(runtime);
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while ticking.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
-        }
-        assert!(!ticking.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn with_ticker_returns_when_the_closure_panics() {
-        let engine = EngineConfig::new()
-            .with_external_ticks(true)
-            .build()
-            .unwrap();
-        let (sender, receiver) = std::sync::mpsc::channel();
-
-        thread::spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                with_ticker(&engine, || panic!("the guest start failed"))
-            }));
-            let _ = sender.send(result.is_err());
-        });
-
-        let panicked = receiver.recv_timeout(Duration::from_secs(5));
-        assert_eq!(panicked, Ok(true));
-    }
-
-    #[test]
-    fn pick_skips_a_locked_slot_and_a_slot_with_no_guest() {
-        let runtime =
-            WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 3)]).unwrap();
-        let pool = &runtime.inner.pools[0];
-        pool.fail_slot(1);
-        let held = pool.lock_slot(0);
-
-        let picked: Vec<_> = (0..4).map(|_| pool.pick().unwrap().0).collect();
-
-        drop(held);
-        assert_eq!(picked, [2, 2, 2, 2]);
-    }
-
-    #[test]
-    fn a_recent_failed_rebuild_waits_for_its_backoff() {
-        let runtime =
-            WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 2)]).unwrap();
-        let pool = &runtime.inner.pools[0];
-        pool.fail_slot(0);
-        let busy = pool.lock_slot(1);
-
-        let picked = thread::scope(|scope| {
-            let picker = scope.spawn(|| pool.pick().map(|(slot, _)| slot).ok());
-            thread::sleep(Duration::from_millis(50));
-            drop(busy);
-            picker.join().unwrap()
-        });
-
-        assert_eq!(picked, Some(1));
-        assert!(pool.lock_slot(0).is_none());
-    }
-
-    fn open_context(runtime: &WasmRuntime, ctx: &mut crate::WasmCtx) {
-        let pool = &runtime.inner.pools[0];
-        let (slot, mut guard) = pool.pick().unwrap();
-        let loaded = guard.as_mut().unwrap();
-        let root = loaded.root;
-        let guest = loaded.guest.id();
-        let context = ctx
-            .run(&mut loaded.guest, |scope| {
-                scope.on_context_create(Some(root))
-            })
-            .unwrap();
-        pool.opened(slot);
-        ctx.records[0] = Some(PluginRecord {
-            slot,
-            guest,
-            context,
-        });
-    }
-
-    #[test]
-    fn dropping_a_ctx_deletes_its_open_context() {
-        let runtime =
-            WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 1)]).unwrap();
-        let mut ctx = runtime.chain(&["a"]).unwrap().new_ctx();
-        open_context(&runtime, &mut ctx);
-        let open = runtime.open_contexts();
-
-        drop(ctx);
-
-        assert_eq!(open, 1);
-        assert_eq!(runtime.open_contexts(), 0);
-        assert_eq!(runtime.held_contexts(), 0);
-    }
-
-    #[test]
-    fn a_held_context_moves_to_the_held_count() {
-        let runtime = WasmRuntime::new(vec![plugin(
-            "held",
-            wat_guest(
-                "held-unit",
-                Wat {
-                    done: "i32.const 0",
-                    ..Wat::default()
-                },
-            ),
-            1,
-        )])
-        .unwrap();
-        let mut ctx = runtime.chain(&["held"]).unwrap().new_ctx();
-        open_context(&runtime, &mut ctx);
-
-        drop(ctx);
-
-        assert_eq!(runtime.open_contexts(), 0);
-        assert_eq!(runtime.held_contexts(), 1);
-    }
-
-    #[test]
-    fn a_swap_returns_the_session_header() {
-        let runtime =
-            WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 1)]).unwrap();
-        let mut ctx = runtime.chain(&["a"]).unwrap().new_ctx();
-        let mut session_header =
-            pingora_http::RequestHeader::build("POST", b"/original", None).unwrap();
-
-        ctx.request_in(&mut session_header);
-        let during = session_header.raw_path().to_vec();
-        ctx.request_out(&mut session_header);
-
-        assert_eq!(during, b"/");
-        assert_eq!(session_header.method, http::Method::POST);
-        assert_eq!(session_header.raw_path(), b"/original");
     }
 
     #[derive(Default)]
