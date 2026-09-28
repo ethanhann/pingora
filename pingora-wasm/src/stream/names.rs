@@ -49,7 +49,7 @@ pub(super) fn classify(key: &[u8]) -> Option<Name<'_>> {
             .find(|(name, _)| key.eq_ignore_ascii_case(name));
         return Some(found.map_or(Name::OtherPseudo, |(_, name)| *name));
     }
-    if key.eq_ignore_ascii_case(b"host") {
+    if key.eq_ignore_ascii_case(HOST.as_str().as_bytes()) {
         return Some(Name::Host);
     }
     std::str::from_utf8(key).ok().map(Name::Regular)
