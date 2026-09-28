@@ -57,6 +57,8 @@ pub struct WasmPluginConf {
     /// guest. The wait can be as long as the CPU time in [limits](Self::limits). Turn this on only
     /// for a plugin that reads request bodies, and set [slots](Self::slots) to the thread count of
     /// the service.
+    ///
+    /// When the runtime starts, it logs the phases that each plugin runs on.
     pub request_body: bool,
     /// Whether to run the plugin on response bodies. Default `false`.
     ///

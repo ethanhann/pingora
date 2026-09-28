@@ -18,7 +18,7 @@
 //! request stays on the slot it started on, because its plugin context is in that guest.
 
 use crate::{plugin_failure, plugin_unavailable};
-use log::{error, warn};
+use log::{error, info, warn};
 use parking_lot::{Mutex, MutexGuard};
 use pingora_error::Result;
 use proxy_wasm_host::abi::v0_2_1::{
@@ -37,6 +37,23 @@ pub(crate) struct PluginPhases {
     pub(crate) trailers: bool,
     pub(crate) request_limit: usize,
     pub(crate) response_limit: usize,
+}
+
+impl PluginPhases {
+    /// Return the names of the phases that the plugin runs on, for the log.
+    fn list(&self) -> String {
+        let phases = [
+            (true, "headers"),
+            (self.request, "request bodies"),
+            (self.response, "response bodies"),
+            (self.trailers, "response trailers"),
+        ];
+        let names: Vec<_> = phases
+            .iter()
+            .filter_map(|(runs, name)| runs.then_some(*name))
+            .collect();
+        names.join(", ")
+    }
 }
 
 /// A started guest and the root context of its plugin.
@@ -91,6 +108,7 @@ impl GuestPool {
             phases.trailers &= exports(Callback::ResponseTrailers);
         }
         pool.phases = phases;
+        info!("wasm plugin {} runs on {}", pool.name, phases.list());
         Ok(pool)
     }
 
@@ -265,6 +283,40 @@ mod tests {
     use crate::test_support::{body_plugin, fixture, plugin, Wat, CONTINUE, HOLD};
     use crate::WasmRuntime;
     use std::thread;
+
+    #[test]
+    fn the_phases_of_a_plugin_are_listed_for_the_log() {
+        let headers = PluginPhases {
+            request: false,
+            response: false,
+            trailers: false,
+            request_limit: 1,
+            response_limit: 1,
+        };
+        let cases = [
+            (headers, "headers"),
+            (
+                PluginPhases {
+                    response: true,
+                    ..headers
+                },
+                "headers, response bodies",
+            ),
+            (
+                PluginPhases {
+                    request: true,
+                    response: true,
+                    trailers: true,
+                    ..headers
+                },
+                "headers, request bodies, response bodies, response trailers",
+            ),
+        ];
+
+        for (phases, expected) in cases {
+            assert_eq!(phases.list(), expected);
+        }
+    }
 
     #[test]
     fn a_plugin_runs_a_body_phase_that_is_on_and_exported() {
