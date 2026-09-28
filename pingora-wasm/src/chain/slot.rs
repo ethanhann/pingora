@@ -21,23 +21,23 @@ use pingora_error::{Error, Result};
 use proxy_wasm_host::abi::v0_2_1::GuestError;
 
 /// A locked slot of a plugin.
-pub(super) struct Locked<'a> {
+pub(super) struct LockedSlot<'a> {
     pub(super) pool: &'a GuestPool,
     pub(super) slot: usize,
     guard: SlotGuard<'a>,
 }
 
-impl<'a> Locked<'a> {
+impl<'a> LockedSlot<'a> {
     /// Lock a slot for a new request.
-    pub(super) fn pick(pool: &'a GuestPool) -> Result<Self> {
+    pub(super) fn for_new_request(pool: &'a GuestPool) -> Result<Self> {
         let (slot, guard) = pool.pick()?;
-        Ok(Locked { pool, slot, guard })
+        Ok(LockedSlot { pool, slot, guard })
     }
 
     /// Lock the slot that holds the context of a request.
-    pub(super) fn of(pool: &'a GuestPool, record: &PluginRecord) -> Result<Self> {
+    pub(super) fn of_request(pool: &'a GuestPool, record: &PluginRecord) -> Result<Self> {
         match pool.lock(record.slot, record.guest) {
-            Some(guard) => Ok(Locked {
+            Some(guard) => Ok(LockedSlot {
                 pool,
                 slot: record.slot,
                 guard,
@@ -59,7 +59,7 @@ impl<'a> Locked<'a> {
     /// Return the error for a guest failure.
     ///
     /// A failure that leaves the guest unusable also replaces the guest.
-    pub(super) fn failed(self, what: &str, cause: GuestError) -> Box<Error> {
+    pub(super) fn guest_failure(self, what: &str, cause: GuestError) -> Box<Error> {
         self.pool.check(self.slot, self.guard, &cause);
         plugin_failure(&self.pool.name, what, cause)
     }

@@ -16,7 +16,7 @@ mod utils;
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use utils::raw::{post_on_one_connection, send_chunks, unchunk};
+use utils::raw::{decode_chunked_body, post_on_one_connection, send_chunked_request};
 use utils::{client, closing_peer, echo_origin, eventually, guest_lines, init, runtime, url};
 
 fn header(response: &reqwest::Response, name: &str) -> Option<String> {
@@ -236,11 +236,11 @@ async fn a_plugin_replaces_a_response_body_and_the_connection_stays_open() {
     assert!(secret.head.contains("\r\ntransfer-encoding: chunked"));
     assert!(!secret.head.contains("\r\ncontent-length:"));
     assert_eq!(
-        unchunk(&secret.body),
+        decode_chunked_body(&secret.body),
         "Original message body (8 bytes) redacted.\n"
     );
     assert_eq!(public.status, 200);
-    assert_eq!(unchunk(&public.body), "public");
+    assert_eq!(decode_chunked_body(&public.body), "public");
 }
 
 #[tokio::test]
@@ -249,7 +249,7 @@ async fn a_plugin_holds_a_request_body_until_its_end() {
     let (origin, _) = echo_origin().await;
     let chunks = ["one ", "two ", "three"];
 
-    let res = send_chunks(6392, origin.addr().port(), "POST", &[], &chunks).await;
+    let res = send_chunked_request(6392, origin.addr().port(), "POST", &[], &chunks).await;
 
     assert_eq!(res.status, 200);
     assert_eq!(res.body, "aone two three");
@@ -261,7 +261,7 @@ async fn a_held_request_body_over_its_limit_responds_with_413() {
     let (origin, count) = echo_origin().await;
     let chunks = ["twenty bytes of body"];
 
-    let res = send_chunks(6393, origin.addr().port(), "POST", &[], &chunks).await;
+    let res = send_chunked_request(6393, origin.addr().port(), "POST", &[], &chunks).await;
 
     assert_eq!(res.status, 413);
     assert_eq!(count.load(Ordering::SeqCst), 0);
@@ -284,7 +284,7 @@ async fn a_plugin_responds_to_a_request_body() {
     init().await;
     let (origin, _) = echo_origin().await;
 
-    let res = send_chunks(6395, origin.addr().port(), "POST", &[], &["attack"]).await;
+    let res = send_chunked_request(6395, origin.addr().port(), "POST", &[], &["attack"]).await;
 
     assert_eq!(res.status, 418);
     assert_eq!(res.body, "teapot");
@@ -299,7 +299,7 @@ async fn a_retry_sends_the_output_of_the_plugins() {
     let first = first.to_string();
     let headers = [("x-test-first-origin", first.as_str())];
 
-    let res = send_chunks(6396, origin.addr().port(), "PUT", &headers, &["x", "y"]).await;
+    let res = send_chunked_request(6396, origin.addr().port(), "PUT", &headers, &["x", "y"]).await;
 
     // The plugin marks the two chunks and the empty call that ends the body. If it ran on the
     // bytes of the retry, it would mark them once.

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::pool::PhaseConf;
+use super::pool::PluginPhases;
 use pingora_error::{Error, ErrorType, Result};
 use proxy_wasm_host::abi::v0_2_1::types::LogLevel;
 use proxy_wasm_host::abi::v0_2_1::{LogSink, PluginConfig, SharedServices, VmServices};
@@ -120,8 +120,8 @@ impl WasmPluginConf {
         Ok(())
     }
 
-    pub(crate) fn phase_conf(&self) -> PhaseConf {
-        PhaseConf {
+    pub(crate) fn phase_conf(&self) -> PluginPhases {
+        PluginPhases {
             request: self.request_body,
             response: self.response_body,
             trailers: self.response_trailers,

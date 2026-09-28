@@ -14,8 +14,8 @@
 
 //! The responses that plugins send after the request headers.
 
-use super::response::Origin;
-use super::{Exchange, WasmCtx};
+use super::response::ResponseSource;
+use super::{ResponseProgress, WasmCtx};
 use crate::plugin_unavailable;
 use crate::stream::{write_plugin_response, PluginResponse};
 use http::Method;
@@ -35,7 +35,7 @@ impl WasmCtx {
     /// This is also `true` after [WasmCtx::request_filter] returned
     /// [RequestOutcome::Respond](crate::RequestOutcome::Respond).
     pub fn plugin_responded(&self) -> bool {
-        self.exchange == Exchange::Responded
+        self.response_progress == ResponseProgress::FromPlugin
     }
 
     /// Run `proxy_on_response_headers` on the response that the plugin at `position` sent.
@@ -50,7 +50,13 @@ impl WasmCtx {
     ) -> Result<()> {
         let end_of_stream = no_body || session.req_header().method == Method::HEAD;
         let positions = (0..=position).rev();
-        self.response_pass(session, header, positions, end_of_stream, Origin::Plugin)?;
+        self.response_pass(
+            session,
+            header,
+            positions,
+            end_of_stream,
+            ResponseSource::Plugin,
+        )?;
         Ok(())
     }
 
@@ -58,14 +64,14 @@ impl WasmCtx {
     /// request.
     ///
     /// Return a failure and write nothing when the plugins already ran on the upstream response.
-    pub(super) async fn respond_to_request<DS: DownstreamSession>(
+    pub(super) async fn respond_to_request_body<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
         position: usize,
         response: PluginResponse,
     ) -> Box<Error> {
-        if self.exchange != Exchange::Request {
-            return self.late_response(position);
+        if self.response_progress != ResponseProgress::NotStarted {
+            return self.late_response_error(position);
         }
         let mut header = response.header;
         let no_body = response.body.is_empty();
@@ -81,7 +87,7 @@ impl WasmCtx {
 
     /// Write the response that a plugin sent in place of the upstream response, and return the
     /// error that stops the request.
-    pub(super) async fn respond_to_response<DS: DownstreamSession>(
+    pub(super) async fn respond_in_place_of_upstream<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
         position: usize,
@@ -103,7 +109,7 @@ impl WasmCtx {
         if let Err(e) = write_plugin_response(session, header, response.body).await {
             return e;
         }
-        self.exchange = Exchange::Responded;
+        self.response_progress = ResponseProgress::FromPlugin;
         let pool = &self.chain.runtime.pools[self.chain.plugins[position]];
         Error::explain(
             ErrorType::HTTPStatus(status),
@@ -112,7 +118,7 @@ impl WasmCtx {
     }
 
     /// Return the error for a plugin response that came after the response header.
-    pub(super) fn late_response(&self, position: usize) -> Box<Error> {
+    pub(super) fn late_response_error(&self, position: usize) -> Box<Error> {
         let pool = &self.chain.runtime.pools[self.chain.plugins[position]];
         plugin_unavailable(&pool.name, "sent a response after the response header")
     }

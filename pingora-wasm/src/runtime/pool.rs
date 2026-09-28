@@ -31,7 +31,7 @@ const REBUILD_BACKOFF: Duration = Duration::from_secs(1);
 
 /// The body and trailer settings of a plugin.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct PhaseConf {
+pub(crate) struct PluginPhases {
     pub(crate) request: bool,
     pub(crate) response: bool,
     pub(crate) trailers: bool,
@@ -57,7 +57,7 @@ struct Slot {
 
 pub(crate) struct GuestPool {
     pub(crate) name: String,
-    pub(crate) phases: PhaseConf,
+    pub(crate) phases: PluginPhases,
     spec: GuestSpec,
     plugin: PluginConfig,
     next: AtomicUsize,
@@ -70,7 +70,7 @@ impl GuestPool {
         spec: GuestSpec,
         plugin: PluginConfig,
         slots: usize,
-        mut phases: PhaseConf,
+        mut phases: PluginPhases,
     ) -> Result<Self> {
         let mut pool = GuestPool {
             name,

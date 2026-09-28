@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::ctx::PluginRecord;
-use super::failure::Locked;
-use super::{Exchange, RequestOutcome, WasmCtx};
+use super::slot::LockedSlot;
+use super::{RequestOutcome, ResponseProgress, WasmCtx};
 use crate::plugin_unavailable;
 use http::uri::Scheme;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
@@ -49,13 +49,13 @@ impl WasmCtx {
         runtime.start_ticker()?;
         let end_of_stream = session.is_body_empty();
         if !end_of_stream {
-            self.request_body.expect();
+            self.request_body.expect_body();
         }
         self.scheme = scheme_of(session);
         let plugins = self.chain.plugins.clone();
         for (position, &plugin) in plugins.iter().enumerate() {
             let pool = &runtime.pools[plugin];
-            let mut locked = Locked::pick(pool)?;
+            let mut locked = LockedSlot::for_new_request(pool)?;
             let slot = locked.slot;
             let loaded = locked.loaded()?;
             let root = loaded.root;
@@ -65,7 +65,7 @@ impl WasmCtx {
             });
             let context = match created {
                 Ok(context) => context,
-                Err(e) => return Err(locked.failed("could not create a context", e)),
+                Err(e) => return Err(locked.guest_failure("could not create a context", e)),
             };
             pool.opened(slot);
             self.records[position] = Some(PluginRecord {
@@ -82,14 +82,14 @@ impl WasmCtx {
             self.request_out(session.req_header_mut());
             let action = match action {
                 Ok(action) => action,
-                Err(e) => return Err(locked.failed("failed in on_request_headers", e)),
+                Err(e) => return Err(locked.guest_failure("failed in on_request_headers", e)),
             };
             drop(locked);
             if let Some(response) = self.stream().plugin_response.take() {
                 let mut header = response.header;
                 let empty = response.body.is_empty();
                 self.pass_plugin_response(session, position, &mut header, empty)?;
-                self.exchange = Exchange::Responded;
+                self.response_progress = ResponseProgress::FromPlugin;
                 return Ok(RequestOutcome::Respond(Box::new(header), response.body));
             }
             if action == Action::Pause {

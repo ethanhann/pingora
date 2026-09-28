@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::failure::Locked;
-use super::{Exchange, WasmCtx};
+use super::slot::LockedSlot;
+use super::{ResponseProgress, WasmCtx};
 use crate::plugin_unavailable;
 use crate::stream::PluginResponse;
 use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
@@ -29,7 +29,7 @@ const CHUNKED: &str = "chunked";
 
 /// The source of the response header in a response pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Origin {
+pub(super) enum ResponseSource {
     Upstream,
     /// A plugin. A response that another plugin sends in its place is dropped.
     Plugin,
@@ -64,18 +64,24 @@ impl WasmCtx {
     ) -> Result<()> {
         if session.subrequest_ctx.is_some()
             || skips_response(resp.status)
-            || self.exchange == Exchange::Responded
+            || self.response_progress == ResponseProgress::FromPlugin
         {
             return Ok(());
         }
         self.chain.runtime.start_ticker()?;
-        self.exchange = Exchange::Response;
+        self.response_progress = ResponseProgress::FromUpstream;
         let end_of_stream = response_ends(&session.req_header().method, resp);
         let positions = (0..self.records.len()).rev();
-        match self.response_pass(session, resp, positions, end_of_stream, Origin::Upstream)? {
-            Some((position, response)) => {
-                Err(self.respond_to_response(session, position, response).await)
-            }
+        match self.response_pass(
+            session,
+            resp,
+            positions,
+            end_of_stream,
+            ResponseSource::Upstream,
+        )? {
+            Some((position, response)) => Err(self
+                .respond_in_place_of_upstream(session, position, response)
+                .await),
             None => Ok(()),
         }
     }
@@ -90,7 +96,7 @@ impl WasmCtx {
         resp: &mut ResponseHeader,
         positions: impl Iterator<Item = usize>,
         end_of_stream: bool,
-        origin: Origin,
+        origin: ResponseSource,
     ) -> Result<Option<(usize, PluginResponse)>> {
         let runtime = self.chain.runtime.clone();
         let had_length = resp.headers.contains_key(CONTENT_LENGTH);
@@ -99,7 +105,7 @@ impl WasmCtx {
                 continue;
             };
             let pool = &runtime.pools[self.chain.plugins[position]];
-            let mut locked = Locked::of(pool, &record)?;
+            let mut locked = LockedSlot::of_request(pool, &record)?;
             let guest = &mut locked.loaded()?.guest;
             self.request_in(session.req_header_mut());
             self.response_in(resp);
@@ -112,11 +118,13 @@ impl WasmCtx {
             let sent = self.stream().plugin_response.take();
             let action = match action {
                 Ok(action) => action,
-                Err(e) => return Err(locked.failed("failed in on_response_headers", e)),
+                Err(e) => return Err(locked.guest_failure("failed in on_response_headers", e)),
             };
             match (sent, origin) {
-                (Some(response), Origin::Upstream) => return Ok(Some((position, response))),
-                (Some(_), Origin::Plugin) => warn!(
+                (Some(response), ResponseSource::Upstream) => {
+                    return Ok(Some((position, response)))
+                }
+                (Some(_), ResponseSource::Plugin) => warn!(
                     "wasm plugin {} sent a response in place of a plugin response",
                     pool.name
                 ),
@@ -165,8 +173,8 @@ fn response_ends(method: &Method, resp: &ResponseHeader) -> bool {
 mod tests {
     use super::*;
     use crate::test_support::{
-        add_request_header, body_plugin, chunk, one_plugin, received, session, started, Wat, GET,
-        HEAD, POST, REMOVE_LENGTH, TEAPOT, TRAP,
+        add_request_header, body_chunk, body_plugin, one_plugin, read_downstream, session,
+        start_request, Wat, GET, HEAD, POST, REMOVE_LENGTH, TEAPOT, TRAP,
     };
     use crate::ERR_PLUGIN_FAILED;
     use pingora_error::ErrorType;
@@ -202,7 +210,7 @@ mod tests {
             body_plugin("first", Wat::response_headers(TRAP)),
             body_plugin("last", Wat::response_headers(TEAPOT)),
         ];
-        let (_runtime, mut ctx, mut session, mut client) = started(plugins, GET).await;
+        let (_runtime, mut ctx, mut session, mut client) = start_request(plugins, GET).await;
         let mut upstream = response(200, Some("6"));
 
         let err = ctx
@@ -212,7 +220,7 @@ mod tests {
 
         assert_eq!(err.etype(), &ErrorType::HTTPStatus(418));
         assert!(ctx.plugin_responded());
-        let written = received(&mut client).await;
+        let written = read_downstream(&mut client).await;
         assert!(written.starts_with("HTTP/1.1 418"), "{written}");
         assert!(written.ends_with("\r\n\r\nteapot"), "{written}");
         assert!(written.contains("\r\nConnection: close\r\n"), "{written}");
@@ -221,7 +229,7 @@ mod tests {
     #[tokio::test]
     async fn a_plugin_response_that_is_not_written_is_a_failure() {
         let plugins = vec![body_plugin("a", Wat::response_headers(TEAPOT))];
-        let (_runtime, mut ctx, mut session, client) = started(plugins, GET).await;
+        let (_runtime, mut ctx, mut session, client) = start_request(plugins, GET).await;
         drop(client);
         let mut upstream = response(200, Some("6"));
 
@@ -237,7 +245,7 @@ mod tests {
     #[tokio::test]
     async fn a_plugin_response_to_a_head_request_has_no_body() {
         let plugins = vec![body_plugin("a", Wat::response_headers(TEAPOT))];
-        let (_runtime, mut ctx, mut session, mut client) = started(plugins, HEAD).await;
+        let (_runtime, mut ctx, mut session, mut client) = start_request(plugins, HEAD).await;
         let mut upstream = response(200, Some("6"));
 
         let err = ctx
@@ -246,7 +254,7 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.etype(), &ErrorType::HTTPStatus(418));
-        let written = received(&mut client).await;
+        let written = read_downstream(&mut client).await;
         assert!(written.starts_with("HTTP/1.1 418"), "{written}");
         assert!(written.contains("\r\nContent-Length: 6\r\n"), "{written}");
         assert!(written.ends_with("\r\n\r\n"), "{written}");
@@ -258,13 +266,13 @@ mod tests {
             body_plugin("first", Wat::response_headers(REMOVE_LENGTH)),
             body_plugin("last", Wat::request_body(TEAPOT)),
         ];
-        let (_runtime, mut ctx, mut session, mut client) = started(plugins, POST).await;
+        let (_runtime, mut ctx, mut session, mut client) = start_request(plugins, POST).await;
 
-        ctx.request_body_filter(&mut session, &mut chunk("attack"), false)
+        ctx.request_body_filter(&mut session, &mut body_chunk("attack"), false)
             .await
             .unwrap_err();
 
-        let written = received(&mut client).await;
+        let written = read_downstream(&mut client).await;
         assert!(
             written.contains("\r\nTransfer-Encoding: chunked\r\n"),
             "{written}"
@@ -283,7 +291,7 @@ mod tests {
 
         for (request, status, encoding) in cases {
             let plugins = vec![body_plugin("a", Wat::response_headers(REMOVE_LENGTH))];
-            let (_runtime, mut ctx, mut session, _client) = started(plugins, request).await;
+            let (_runtime, mut ctx, mut session, _client) = start_request(plugins, request).await;
             let mut upstream = response(status, Some("6"));
 
             ctx.response_filter(&mut session, &mut upstream)

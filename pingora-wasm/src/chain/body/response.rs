@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::body::{released, BodyOutcome, Direction};
-use super::WasmCtx;
+use super::{filter_output, BodyDirection, BodyOutcome};
+use crate::chain::WasmCtx;
 use bytes::Bytes;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_error::Result;
@@ -27,7 +27,7 @@ impl WasmCtx {
     /// turned on run. Plugins can read and replace the body, and can read the request headers.
     ///
     /// A plugin can pause to wait for more of the body. This phase then holds the bytes for the
-    /// plugin and leaves an empty chunk for the downstream. On the next chunk, the plugin reads the
+    /// plugin and leaves an empty chunk for the downstream. On the next body_chunk, the plugin reads the
     /// bytes it paused on and the new bytes together. A plugin can hold up to
     /// [response_body_limit](crate::WasmPluginConf::response_body_limit) bytes.
     ///
@@ -54,7 +54,7 @@ impl WasmCtx {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<()> {
-        if self.skips_body(session, Direction::Response) {
+        if self.skips_body(session, BodyDirection::Response) {
             return Ok(());
         }
         if !end_of_stream && body.as_ref().is_none_or(Bytes::is_empty) {
@@ -62,12 +62,12 @@ impl WasmCtx {
         }
         self.chain.runtime.start_ticker()?;
         let chunk = body.take().unwrap_or_default();
-        match self.body_pass(session, Direction::Response, chunk, end_of_stream)? {
+        match self.body_pass(session, BodyDirection::Response, chunk, end_of_stream)? {
             BodyOutcome::Released(output) => {
-                *body = released(output, end_of_stream);
+                *body = filter_output(output, end_of_stream);
                 Ok(())
             }
-            BodyOutcome::Respond(position, _) => Err(self.late_response(position)),
+            BodyOutcome::Respond(position, _) => Err(self.late_response_error(position)),
         }
     }
 }
@@ -75,16 +75,16 @@ impl WasmCtx {
 #[cfg(test)]
 mod tests {
     use crate::test_support::{
-        body_plugin, chunk, received_after_a_marker, started, Wat, HOLD_THEN_REPLACE, MARKER, POST,
-        TEAPOT,
+        body_chunk, body_plugin, read_downstream_after_marker, start_request, Wat,
+        HOLD_THEN_REPLACE, MARKER_RESPONSE, POST, TEAPOT,
     };
     use crate::ERR_PLUGIN_FAILED;
 
     #[tokio::test]
     async fn a_plugin_reads_the_chunks_it_held_as_one_body() {
         let plugins = vec![body_plugin("a", Wat::response_body(HOLD_THEN_REPLACE))];
-        let (_runtime, mut ctx, mut session, _client) = started(plugins, POST).await;
-        let mut chunks = [chunk("aaa"), chunk("bbb"), chunk("cc")];
+        let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
+        let mut chunks = [body_chunk("aaa"), body_chunk("bbb"), body_chunk("cc")];
 
         for (index, body) in chunks.iter_mut().enumerate() {
             ctx.response_body_filter(&mut session, body, index == 2)
@@ -92,16 +92,19 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(chunks, [chunk(""), chunk(""), chunk("replaced")]);
+        assert_eq!(
+            chunks,
+            [body_chunk(""), body_chunk(""), body_chunk("replaced")]
+        );
     }
 
     #[tokio::test]
     async fn a_plugin_response_from_the_response_body_fails() {
         let plugins = vec![body_plugin("a", Wat::response_body(TEAPOT))];
-        let (_runtime, mut ctx, mut session, mut client) = started(plugins, POST).await;
+        let (_runtime, mut ctx, mut session, mut client) = start_request(plugins, POST).await;
 
         let err = ctx
-            .response_body_filter(&mut session, &mut chunk("origin"), false)
+            .response_body_filter(&mut session, &mut body_chunk("origin"), false)
             .await
             .unwrap_err();
 
@@ -110,7 +113,7 @@ mod tests {
             .to_string()
             .contains("sent a response after the response header"));
         assert!(!ctx.plugin_responded());
-        let written = received_after_a_marker(&mut session, &mut client).await;
-        assert!(written.starts_with(MARKER), "{written}");
+        let written = read_downstream_after_marker(&mut session, &mut client).await;
+        assert!(written.starts_with(MARKER_RESPONSE), "{written}");
     }
 }

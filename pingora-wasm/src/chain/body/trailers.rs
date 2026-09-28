@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::failure::Locked;
-use super::{Exchange, WasmCtx};
+use crate::chain::slot::LockedSlot;
+use crate::chain::{ResponseProgress, WasmCtx};
 use crate::plugin_unavailable;
 use crate::stream::ResponseTrailers;
 use bytes::{Bytes, BytesMut};
@@ -33,7 +33,7 @@ impl WasmCtx {
     /// turned on run. Plugins can read and change the trailers, and can read the request headers.
     ///
     /// Call it when you run plugins on response bodies, too. A response with trailers ends with the
-    /// trailers and not with a last body chunk, so a plugin that paused the body still holds bytes
+    /// trailers and not with a last body body_chunk, so a plugin that paused the body still holds bytes
     /// here. This phase returns those bytes, and Pingora writes them to the downstream in place of
     /// the trailers.
     ///
@@ -50,7 +50,9 @@ impl WasmCtx {
         session: &mut Session<DS>,
         trailers: &mut http::HeaderMap,
     ) -> Result<Option<Bytes>> {
-        if session.subrequest_ctx.is_some() || self.exchange == Exchange::Responded {
+        if session.subrequest_ctx.is_some()
+            || self.response_progress == ResponseProgress::FromPlugin
+        {
             return Ok(None);
         }
         let mut passed = Ok(());
@@ -82,7 +84,7 @@ impl WasmCtx {
             if !pool.phases.trailers {
                 continue;
             }
-            let mut locked = Locked::of(pool, &record)?;
+            let mut locked = LockedSlot::of_request(pool, &record)?;
             let guest = &mut locked.loaded()?.guest;
             let map = ResponseTrailers::new(mem::take(trailers));
             let count = u32::try_from(map.len()).unwrap_or(u32::MAX);
@@ -97,8 +99,8 @@ impl WasmCtx {
             }
             let sent = self.stream().plugin_response.take();
             match action {
-                Err(e) => return Err(locked.failed("failed in on_response_trailers", e)),
-                Ok(_) if sent.is_some() => return Err(self.late_response(position)),
+                Err(e) => return Err(locked.guest_failure("failed in on_response_trailers", e)),
+                Ok(_) if sent.is_some() => return Err(self.late_response_error(position)),
                 Ok(Action::Pause) => {
                     return Err(plugin_unavailable(&pool.name, "paused the trailers"))
                 }
@@ -137,9 +139,9 @@ impl WasmCtx {
 
 #[cfg(test)]
 mod tests {
-    use crate::chain::body::Direction;
+    use crate::chain::body::BodyDirection;
     use crate::test_support::{
-        body_plugin, chunk, started, Wat, HOLD, PAUSE, POST, SET_TRAILER, TEAPOT, TRAP,
+        body_chunk, body_plugin, start_request, Wat, HOLD, PAUSE, POST, SET_TRAILER, TEAPOT, TRAP,
     };
     use crate::ERR_PLUGIN_FAILED;
 
@@ -152,7 +154,7 @@ mod tests {
     #[tokio::test]
     async fn a_plugin_changes_a_trailer() {
         let plugins = vec![body_plugin("a", Wat::response_trailers(SET_TRAILER))];
-        let (_runtime, mut ctx, mut session, _client) = started(plugins, POST).await;
+        let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
         let mut trailers = trailers();
 
         let body = ctx
@@ -175,7 +177,7 @@ mod tests {
 
         for (body, message) in cases {
             let plugins = vec![body_plugin("a", Wat::response_trailers(body))];
-            let (_runtime, mut ctx, mut session, _client) = started(plugins, POST).await;
+            let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
             let mut trailers = trailers();
 
             let err = ctx
@@ -192,8 +194,8 @@ mod tests {
     #[tokio::test]
     async fn held_bytes_are_released_once_in_place_of_the_trailers() {
         let plugins = vec![body_plugin("a", Wat::response_body(HOLD))];
-        let (_runtime, mut ctx, mut session, _client) = started(plugins, POST).await;
-        ctx.response_body_filter(&mut session, &mut chunk("held"), false)
+        let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
+        ctx.response_body_filter(&mut session, &mut body_chunk("held"), false)
             .await
             .unwrap();
 
@@ -206,7 +208,7 @@ mod tests {
             .response_trailer_filter(&mut session, &mut trailers())
             .await
             .unwrap();
-        assert_eq!(first, chunk("held"));
+        assert_eq!(first, body_chunk("held"));
         assert_eq!(second, None);
     }
 
@@ -216,16 +218,16 @@ mod tests {
             body_plugin("a", Wat::default()),
             body_plugin("b", Wat::default()),
         ];
-        let (_runtime, mut ctx, mut session, _client) = started(plugins, POST).await;
-        ctx.held.put(Direction::Response, 1, b"late".to_vec());
-        ctx.held.put(Direction::Response, 0, b"early ".to_vec());
+        let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
+        ctx.held.put(BodyDirection::Response, 1, b"late".to_vec());
+        ctx.held.put(BodyDirection::Response, 0, b"early ".to_vec());
 
         let body = ctx
             .response_trailer_filter(&mut session, &mut trailers())
             .await
             .unwrap();
 
-        assert_eq!(body, chunk("early late"));
+        assert_eq!(body, body_chunk("early late"));
     }
 
     #[tokio::test]
@@ -234,8 +236,8 @@ mod tests {
             body_plugin("hold", Wat::response_body(HOLD)),
             body_plugin("trap", Wat::response_trailers(TRAP)),
         ];
-        let (_runtime, mut ctx, mut session, _client) = started(plugins, POST).await;
-        ctx.response_body_filter(&mut session, &mut chunk("held"), false)
+        let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
+        ctx.response_body_filter(&mut session, &mut body_chunk("held"), false)
             .await
             .unwrap();
 
@@ -243,6 +245,6 @@ mod tests {
             .response_trailer_filter(&mut session, &mut trailers())
             .await;
 
-        assert_eq!(released.unwrap(), chunk("held"));
+        assert_eq!(released.unwrap(), body_chunk("held"));
     }
 }

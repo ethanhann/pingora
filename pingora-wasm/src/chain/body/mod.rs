@@ -12,12 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The pass over the plugins that both body phases use, and the body bytes that plugins hold.
+//! The body phases and the trailer phase, and the pass over the plugins that the body phases use.
 
-use super::failure::Locked;
-use super::{Exchange, WasmCtx};
+mod held;
+mod request;
+mod response;
+mod retry;
+mod trailers;
+
+pub(crate) use held::HeldBodies;
+pub(crate) use retry::RequestBodyState;
+
+use super::slot::LockedSlot;
+use super::{ResponseProgress, WasmCtx};
 use crate::plugin_unavailable;
-use crate::runtime::pool::PhaseConf;
+use crate::runtime::pool::PluginPhases;
 use crate::stream::{BodyBuffer, PluginResponse};
 use crate::{ERR_REQUEST_BODY_TOO_LARGE, ERR_RESPONSE_BODY_TOO_LARGE};
 use bytes::Bytes;
@@ -29,87 +38,38 @@ use proxy_wasm_host::Buffer;
 use std::mem;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Direction {
+pub(crate) enum BodyDirection {
     Request,
     Response,
 }
 
-impl Direction {
-    fn runs(self, conf: &PhaseConf) -> bool {
+impl BodyDirection {
+    fn runs(self, conf: &PluginPhases) -> bool {
         match self {
-            Direction::Request => conf.request,
-            Direction::Response => conf.response,
+            BodyDirection::Request => conf.request,
+            BodyDirection::Response => conf.response,
         }
     }
 
-    fn limit(self, conf: &PhaseConf) -> usize {
+    fn limit(self, conf: &PluginPhases) -> usize {
         match self {
-            Direction::Request => conf.request_limit,
-            Direction::Response => conf.response_limit,
+            BodyDirection::Request => conf.request_limit,
+            BodyDirection::Response => conf.response_limit,
         }
     }
 
     fn too_large(self) -> ErrorType {
         match self {
-            Direction::Request => ERR_REQUEST_BODY_TOO_LARGE,
-            Direction::Response => ERR_RESPONSE_BODY_TOO_LARGE,
+            BodyDirection::Request => ERR_REQUEST_BODY_TOO_LARGE,
+            BodyDirection::Response => ERR_RESPONSE_BODY_TOO_LARGE,
         }
     }
 
     fn failure(self) -> &'static str {
         match self {
-            Direction::Request => "failed in on_request_body",
-            Direction::Response => "failed in on_response_body",
+            BodyDirection::Request => "failed in on_request_body",
+            BodyDirection::Response => "failed in on_response_body",
         }
-    }
-}
-
-/// The body bytes that the plugins hold, by position in the chain.
-///
-/// A list stays empty until a plugin holds bytes.
-#[derive(Debug, Default)]
-pub(super) struct Held {
-    request: Vec<Vec<u8>>,
-    response: Vec<Vec<u8>>,
-}
-
-impl Held {
-    fn list(&mut self, direction: Direction) -> &mut Vec<Vec<u8>> {
-        match direction {
-            Direction::Request => &mut self.request,
-            Direction::Response => &mut self.response,
-        }
-    }
-
-    pub(super) fn take(&mut self, direction: Direction, position: usize) -> Vec<u8> {
-        match self.list(direction).get_mut(position) {
-            Some(bytes) => mem::take(bytes),
-            None => Vec::new(),
-        }
-    }
-
-    pub(super) fn put(&mut self, direction: Direction, position: usize, bytes: Vec<u8>) {
-        let list = self.list(direction);
-        if list.len() <= position {
-            if bytes.is_empty() {
-                return;
-            }
-            list.resize_with(position + 1, Vec::new);
-        }
-        list[position] = bytes;
-    }
-
-    /// Take the response bytes that the plugins hold, in chain order.
-    pub(super) fn take_response(&mut self) -> Vec<Vec<u8>> {
-        mem::take(&mut self.response)
-    }
-
-    pub(super) fn request_len(&self) -> usize {
-        self.request.iter().map(Vec::len).sum()
-    }
-
-    pub(super) fn response_len(&self) -> usize {
-        self.response.iter().map(Vec::len).sum()
     }
 }
 
@@ -124,7 +84,7 @@ pub(super) enum BodyOutcome {
 /// Return what a body filter leaves in `body` for Pingora.
 ///
 /// Pingora ends the body on `None`, so an empty chunk stays `Some` until the end of the stream.
-pub(super) fn released(output: Bytes, end_of_stream: bool) -> Option<Bytes> {
+pub(super) fn filter_output(output: Bytes, end_of_stream: bool) -> Option<Bytes> {
     if output.is_empty() && end_of_stream {
         None
     } else {
@@ -137,14 +97,14 @@ impl WasmCtx {
     pub(super) fn skips_body<DS: DownstreamSession>(
         &self,
         session: &Session<DS>,
-        direction: Direction,
+        direction: BodyDirection,
     ) -> bool {
         let runs = match direction {
-            Direction::Request => self.chain.phases.request_body,
-            Direction::Response => self.chain.phases.response_body,
+            BodyDirection::Request => self.chain.phases.request_body,
+            BodyDirection::Response => self.chain.phases.response_body,
         };
         !runs
-            || self.exchange == Exchange::Responded
+            || self.response_progress == ResponseProgress::FromPlugin
             || session.subrequest_ctx.is_some()
             || session.was_upgraded()
     }
@@ -156,7 +116,7 @@ impl WasmCtx {
     pub(super) fn body_pass<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
-        direction: Direction,
+        direction: BodyDirection,
         chunk: Bytes,
         end_of_stream: bool,
     ) -> Result<BodyOutcome> {
@@ -165,8 +125,8 @@ impl WasmCtx {
         let mut current = chunk;
         for step in 0..count {
             let position = match direction {
-                Direction::Request => step,
-                Direction::Response => count - 1 - step,
+                BodyDirection::Request => step,
+                BodyDirection::Response => count - 1 - step,
             };
             let Some(record) = self.records[position] else {
                 continue;
@@ -178,7 +138,7 @@ impl WasmCtx {
             if current.is_empty() && !end_of_stream {
                 break;
             }
-            let mut locked = Locked::of(pool, &record)?;
+            let mut locked = LockedSlot::of_request(pool, &record)?;
             let guest = &mut locked.loaded()?.guest;
             let held = self.held.take(direction, position);
             let buffer = BodyBuffer::new(held, mem::take(&mut current));
@@ -186,8 +146,12 @@ impl WasmCtx {
             self.stream().body_buffer = buffer;
             self.request_in(session.req_header_mut());
             let action = self.run(guest, |scope| match direction {
-                Direction::Request => scope.on_request_body(record.context, size, end_of_stream),
-                Direction::Response => scope.on_response_body(record.context, size, end_of_stream),
+                BodyDirection::Request => {
+                    scope.on_request_body(record.context, size, end_of_stream)
+                }
+                BodyDirection::Response => {
+                    scope.on_response_body(record.context, size, end_of_stream)
+                }
             });
             self.request_out(session.req_header_mut());
             let buffer = mem::take(&mut self.stream().body_buffer);
@@ -196,7 +160,7 @@ impl WasmCtx {
                 Ok(action) => action,
                 Err(e) => {
                     self.held.put(direction, position, buffer.into_vec());
-                    return Err(locked.failed(direction.failure(), e));
+                    return Err(locked.guest_failure(direction.failure(), e));
                 }
             };
             if let Some(response) = sent {
@@ -232,8 +196,8 @@ impl WasmCtx {
 mod tests {
     use super::*;
     use crate::test_support::{
-        body_plugin, chunk, started, Wat, GET, HOLD, HOLD_THEN_TRAP, MARK_AND_HOLD, MARK_A_REQUEST,
-        MARK_A_RESPONSE, MARK_B_REQUEST, MARK_B_RESPONSE, PAUSE, POST, UPGRADE,
+        body_chunk, body_plugin, start_request, Wat, GET, HOLD, HOLD_THEN_TRAP, MARK_AND_HOLD,
+        MARK_A_REQUEST, MARK_A_RESPONSE, MARK_B_REQUEST, MARK_B_RESPONSE, PAUSE, POST, UPGRADE,
     };
     use crate::{WasmPluginConf, ERR_PLUGIN_FAILED};
     use pingora_http::ResponseHeader;
@@ -256,8 +220,8 @@ mod tests {
     #[tokio::test]
     async fn a_held_chunk_leaves_empty_bytes() {
         let plugins = vec![body_plugin("a", Wat::request_body(HOLD))];
-        let (_runtime, mut ctx, mut session, _client) = started(plugins, POST).await;
-        let mut body = chunk("abc");
+        let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
+        let mut body = body_chunk("abc");
 
         let result = ctx
             .request_body_filter(&mut session, &mut body, false)
@@ -273,14 +237,14 @@ mod tests {
             body_plugin("a", Wat::request_body(MARK_A_REQUEST)),
             body_plugin("b", Wat::request_body(MARK_B_REQUEST)),
         ];
-        let (_runtime, mut ctx, mut session, _client) = started(plugins, POST).await;
-        let mut body = chunk("x");
+        let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
+        let mut body = body_chunk("x");
 
         ctx.request_body_filter(&mut session, &mut body, false)
             .await
             .unwrap();
 
-        assert_eq!(body, chunk("bax"));
+        assert_eq!(body, body_chunk("bax"));
     }
 
     #[tokio::test]
@@ -289,14 +253,14 @@ mod tests {
             body_plugin("a", Wat::response_body(MARK_A_RESPONSE)),
             body_plugin("b", Wat::response_body(MARK_B_RESPONSE)),
         ];
-        let (_runtime, mut ctx, mut session, _client) = started(plugins, POST).await;
-        let mut body = chunk("x");
+        let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
+        let mut body = body_chunk("x");
 
         ctx.response_body_filter(&mut session, &mut body, false)
             .await
             .unwrap();
 
-        assert_eq!(body, chunk("abx"));
+        assert_eq!(body, body_chunk("abx"));
     }
 
     #[tokio::test]
@@ -305,9 +269,9 @@ mod tests {
             body_plugin("hold", Wat::request_body(HOLD)),
             body_plugin("mark", Wat::request_body(MARK_B_REQUEST)),
         ];
-        let (_runtime, mut ctx, mut session, _client) = started(plugins, POST).await;
-        let mut first = chunk("x");
-        let mut last = chunk("y");
+        let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
+        let mut first = body_chunk("x");
+        let mut last = body_chunk("y");
         ctx.request_body_filter(&mut session, &mut first, false)
             .await
             .unwrap();
@@ -317,14 +281,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(first, Some(Bytes::new()));
-        assert_eq!(last, chunk("bxy"));
+        assert_eq!(last, body_chunk("bxy"));
     }
 
     #[tokio::test]
     async fn a_chunk_of_zero_bytes_runs_no_plugin() {
         let plugins = vec![body_plugin("a", Wat::request_body(MARK_AND_HOLD))];
-        let (_runtime, mut ctx, mut session, _client) = started(plugins, POST).await;
-        let mut chunks = [chunk("x"), chunk(""), chunk("y")];
+        let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
+        let mut chunks = [body_chunk("x"), body_chunk(""), body_chunk("y")];
 
         for (index, body) in chunks.iter_mut().enumerate() {
             ctx.request_body_filter(&mut session, body, index == 2)
@@ -332,21 +296,21 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(chunks, [chunk(""), chunk(""), chunk("aaxy")]);
+        assert_eq!(chunks, [body_chunk(""), body_chunk(""), body_chunk("aaxy")]);
     }
 
     #[tokio::test]
     async fn a_plugin_with_its_body_setting_off_does_not_run() {
         let mut conf = body_plugin("a", Wat::request_body(MARK_A_REQUEST));
         conf.request_body = false;
-        let (_runtime, mut ctx, mut session, _client) = started(vec![conf], POST).await;
-        let mut body = chunk("x");
+        let (_runtime, mut ctx, mut session, _client) = start_request(vec![conf], POST).await;
+        let mut body = body_chunk("x");
 
         ctx.request_body_filter(&mut session, &mut body, true)
             .await
             .unwrap();
 
-        assert_eq!(body, chunk("x"));
+        assert_eq!(body, body_chunk("x"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -354,7 +318,7 @@ mod tests {
         let mut conf = body_plugin("a", both(MARK_A_REQUEST, MARK_A_RESPONSE));
         conf.request_body = false;
         conf.response_body = false;
-        let (runtime, mut ctx, mut session, _client) = started(vec![conf], POST).await;
+        let (runtime, mut ctx, mut session, _client) = start_request(vec![conf], POST).await;
         let (lock, unlock) = std::sync::mpsc::channel::<()>();
         let (locked, is_locked) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
@@ -363,8 +327,8 @@ mod tests {
             let _ = unlock.recv();
         });
         is_locked.recv().unwrap();
-        let mut sent = chunk("x");
-        let mut returned = chunk("y");
+        let mut sent = body_chunk("x");
+        let mut returned = body_chunk("y");
 
         ctx.request_body_filter(&mut session, &mut sent, true)
             .await
@@ -375,16 +339,16 @@ mod tests {
 
         drop(lock);
         holder.join().unwrap();
-        assert_eq!([sent, returned], [chunk("x"), chunk("y")]);
+        assert_eq!([sent, returned], [body_chunk("x"), body_chunk("y")]);
     }
 
     #[tokio::test]
     async fn a_pause_at_the_end_of_the_stream_fails() {
         let plugins = vec![body_plugin("a", Wat::response_body(PAUSE))];
-        let (_runtime, mut ctx, mut session, _client) = started(plugins, POST).await;
+        let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
 
         let err = ctx
-            .response_body_filter(&mut session, &mut chunk("x"), true)
+            .response_body_filter(&mut session, &mut body_chunk("x"), true)
             .await
             .unwrap_err();
 
@@ -395,10 +359,10 @@ mod tests {
     #[tokio::test]
     async fn a_held_request_body_over_its_limit_fails() {
         let (_runtime, mut ctx, mut session, _client) =
-            started(hold_with_a_limit_of_4(), POST).await;
+            start_request(hold_with_a_limit_of_4(), POST).await;
 
         let err = ctx
-            .request_body_filter(&mut session, &mut chunk("abcdef"), false)
+            .request_body_filter(&mut session, &mut body_chunk("abcdef"), false)
             .await
             .unwrap_err();
 
@@ -408,10 +372,10 @@ mod tests {
     #[tokio::test]
     async fn a_held_response_body_over_its_limit_fails() {
         let (_runtime, mut ctx, mut session, _client) =
-            started(hold_with_a_limit_of_4(), POST).await;
+            start_request(hold_with_a_limit_of_4(), POST).await;
 
         let err = ctx
-            .response_body_filter(&mut session, &mut chunk("abcdef"), false)
+            .response_body_filter(&mut session, &mut body_chunk("abcdef"), false)
             .await
             .unwrap_err();
 
@@ -421,9 +385,9 @@ mod tests {
     #[tokio::test]
     async fn a_plugin_releases_a_body_over_its_limit() {
         let (_runtime, mut ctx, mut session, _client) =
-            started(hold_with_a_limit_of_4(), POST).await;
-        let mut last = chunk("cdef");
-        ctx.request_body_filter(&mut session, &mut chunk("ab"), false)
+            start_request(hold_with_a_limit_of_4(), POST).await;
+        let mut last = body_chunk("cdef");
+        ctx.request_body_filter(&mut session, &mut body_chunk("ab"), false)
             .await
             .unwrap();
 
@@ -431,14 +395,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(last, chunk("abcdef"));
+        assert_eq!(last, body_chunk("abcdef"));
     }
 
     #[tokio::test]
     async fn none_ends_a_request_body() {
         let plugins = vec![body_plugin("a", Wat::request_body(HOLD))];
-        let (_runtime, mut ctx, mut session, _client) = started(plugins, POST).await;
-        ctx.request_body_filter(&mut session, &mut chunk("held"), false)
+        let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
+        ctx.request_body_filter(&mut session, &mut body_chunk("held"), false)
             .await
             .unwrap();
         let mut body = None;
@@ -447,14 +411,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(body, chunk("held"));
+        assert_eq!(body, body_chunk("held"));
     }
 
     #[tokio::test]
     async fn none_does_not_end_a_response_body() {
         let plugins = vec![body_plugin("a", Wat::response_body(HOLD))];
-        let (_runtime, mut ctx, mut session, _client) = started(plugins, POST).await;
-        ctx.response_body_filter(&mut session, &mut chunk("held"), false)
+        let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
+        ctx.response_body_filter(&mut session, &mut body_chunk("held"), false)
             .await
             .unwrap();
         let mut body = None;
@@ -464,13 +428,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(body, None);
-        assert_eq!(ctx.held.take(Direction::Response, 0), b"held");
+        assert_eq!(ctx.held.take(BodyDirection::Response, 0), b"held");
     }
 
     #[tokio::test]
     async fn a_request_with_no_body_runs_no_plugin() {
         let plugins = vec![body_plugin("a", Wat::request_body(MARK_A_REQUEST))];
-        let (_runtime, mut ctx, mut session, _client) = started(plugins, GET).await;
+        let (_runtime, mut ctx, mut session, _client) = start_request(plugins, GET).await;
         let mut body = None;
 
         ctx.request_body_filter(&mut session, &mut body, true)
@@ -483,8 +447,8 @@ mod tests {
     #[tokio::test]
     async fn an_upgraded_connection_runs_no_plugin() {
         let plugins = vec![body_plugin("a", both(MARK_A_REQUEST, MARK_A_RESPONSE))];
-        let (_runtime, mut ctx, mut session, _client) = started(plugins, UPGRADE).await;
-        ctx.request_body.expect();
+        let (_runtime, mut ctx, mut session, _client) = start_request(plugins, UPGRADE).await;
+        ctx.request_body.expect_body();
         let mut switching = ResponseHeader::build(101, None).unwrap();
         switching.insert_header("connection", "upgrade").unwrap();
         switching.insert_header("upgrade", "websocket").unwrap();
@@ -492,8 +456,8 @@ mod tests {
             .write_response_header(Box::new(switching), false)
             .await
             .unwrap();
-        let mut sent = chunk("frame");
-        let mut returned = chunk("frame");
+        let mut sent = body_chunk("frame");
+        let mut returned = body_chunk("frame");
 
         ctx.request_body_filter(&mut session, &mut sent, false)
             .await
@@ -503,25 +467,25 @@ mod tests {
             .unwrap();
 
         assert!(session.was_upgraded());
-        assert_eq!([sent, returned], [chunk("frame"), chunk("frame")]);
+        assert_eq!([sent, returned], [body_chunk("frame"), body_chunk("frame")]);
     }
 
     #[tokio::test]
     async fn a_trap_rebuilds_the_guest_and_keeps_the_held_bytes() {
         let plugins = vec![body_plugin("a", Wat::request_body(HOLD_THEN_TRAP))];
-        let (runtime, mut ctx, mut session, _client) = started(plugins, POST).await;
-        ctx.request_body_filter(&mut session, &mut chunk("ab"), false)
+        let (runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
+        ctx.request_body_filter(&mut session, &mut body_chunk("ab"), false)
             .await
             .unwrap();
 
         let err = ctx
-            .request_body_filter(&mut session, &mut chunk("cd"), true)
+            .request_body_filter(&mut session, &mut body_chunk("cd"), true)
             .await
             .unwrap_err();
 
         assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
         assert!(err.to_string().contains("failed in on_request_body"));
-        assert_eq!(ctx.held.take(Direction::Request, 0), b"abcd");
+        assert_eq!(ctx.held.take(BodyDirection::Request, 0), b"abcd");
         assert_eq!(session.req_header().raw_path(), b"/original");
         let slot = runtime.inner.pools[0].lock_slot(0);
         assert!(slot.as_ref().unwrap().guest.is_serving());
@@ -530,11 +494,11 @@ mod tests {
     #[tokio::test]
     async fn a_body_on_a_replaced_guest_fails() {
         let plugins = vec![body_plugin("a", Wat::request_body(HOLD))];
-        let (runtime, mut ctx, mut session, _client) = started(plugins, POST).await;
+        let (runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
         runtime.inner.pools[0].replace_slot(0);
 
         let err = ctx
-            .request_body_filter(&mut session, &mut chunk("ab"), false)
+            .request_body_filter(&mut session, &mut body_chunk("ab"), false)
             .await
             .unwrap_err();
 

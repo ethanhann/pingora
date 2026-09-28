@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::body::Held;
-use super::failure::Locked;
+use super::body::{HeldBodies, RequestBodyState};
 use super::logging::{finish, finished};
-use super::request_body::RequestBody;
+use super::slot::LockedSlot;
 use super::WasmChain;
 use crate::stream::{PingoraStream, RequestHeaders, ResponseHeaders};
 use http::uri::Scheme;
@@ -35,15 +34,15 @@ pub(crate) struct PluginRecord {
     pub(crate) context: ContextId,
 }
 
-/// The progress of one request through the plugins.
+/// The progress of the response of one request, and where the response comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Exchange {
+pub(super) enum ResponseProgress {
     /// The plugins did not run on a response header.
-    Request,
+    NotStarted,
     /// The plugins ran on the upstream response header.
-    Response,
+    FromUpstream,
     /// A plugin sent its own response.
-    Responded,
+    FromPlugin,
 }
 
 /// The state of one request in the plugins of one chain.
@@ -58,9 +57,9 @@ pub struct WasmCtx {
     pub(crate) chain: WasmChain,
     pub(crate) records: Vec<Option<PluginRecord>>,
     pub(crate) scheme: Scheme,
-    pub(super) exchange: Exchange,
-    pub(super) request_body: RequestBody,
-    pub(super) held: Held,
+    pub(super) response_progress: ResponseProgress,
+    pub(super) request_body: RequestBodyState,
+    pub(super) held: HeldBodies,
     stream: PingoraStream,
     spare_request: Option<RequestHeader>,
     spare_response: Option<ResponseHeader>,
@@ -80,9 +79,9 @@ impl WasmCtx {
     pub(crate) fn new(chain: WasmChain) -> Self {
         let records = vec![None; chain.plugins.len()];
         WasmCtx {
-            exchange: Exchange::Request,
-            request_body: RequestBody::new(),
-            held: Held::default(),
+            response_progress: ResponseProgress::NotStarted,
+            request_body: RequestBodyState::new(),
+            held: HeldBodies::default(),
             chain,
             records,
             scheme: Scheme::HTTP,
@@ -159,7 +158,7 @@ impl Drop for WasmCtx {
                 continue;
             };
             let pool = &runtime.pools[self.chain.plugins[position]];
-            let Ok(mut locked) = Locked::of(pool, &record) else {
+            let Ok(mut locked) = LockedSlot::of_request(pool, &record) else {
                 continue;
             };
             let Ok(loaded) = locked.loaded() else {

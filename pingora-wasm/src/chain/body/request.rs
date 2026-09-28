@@ -12,68 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::body::{released, BodyOutcome, Direction};
-use super::WasmCtx;
+use super::retry::RequestBodyProgress;
+use super::{filter_output, BodyDirection, BodyOutcome};
+use crate::chain::WasmCtx;
 use crate::ERR_PLUGIN_FAILED;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_error::{Error, Result};
 use pingora_proxy::Session;
 use std::mem;
 
-/// The progress of a request body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Progress {
-    /// The request has no body, or the request headers did not run.
-    Absent,
-    /// The plugins did not run on a chunk.
-    Waiting,
-    Streaming,
-    Ended,
-}
-
-/// The state of the request body phase.
-#[derive(Debug)]
-pub(super) struct RequestBody {
-    progress: Progress,
-    attempts: usize,
-    /// Set when a retry starts, because its first body call can repeat earlier bytes.
-    replay_due: bool,
-    /// The output of the plugins, which a retry sends again.
-    kept: Option<BytesMut>,
-}
-
-impl RequestBody {
-    pub(super) fn new() -> Self {
-        RequestBody {
-            progress: Progress::Absent,
-            attempts: 0,
-            replay_due: false,
-            kept: Some(BytesMut::new()),
-        }
-    }
-
-    /// Record that the request has a body.
-    pub(super) fn expect(&mut self) {
-        self.progress = Progress::Waiting;
-    }
-}
-
 impl WasmCtx {
-    /// Record the start of an upstream attempt.
-    ///
-    /// Call it from `upstream_peer`, which Pingora runs once for each attempt.
-    ///
-    /// When Pingora retries a request, it sends the request body that it kept through
-    /// `request_body_filter` again. The plugins already ran on those bytes, so
-    /// [WasmCtx::request_body_filter] sends the upstream what they returned the first time. It
-    /// needs this call to know that a retry started, and it returns an error for a request body
-    /// when the call is missing.
-    pub fn upstream_attempt(&mut self) {
-        self.request_body.attempts += 1;
-        self.request_body.replay_due = self.request_body.attempts > 1;
-    }
-
     /// Run `proxy_on_request_body` of each plugin, in chain order.
     ///
     /// Call it from `request_body_filter` with the arguments of that filter. Only plugins with
@@ -81,7 +30,7 @@ impl WasmCtx {
     /// replace the body, and can read the request headers.
     ///
     /// A plugin can pause to wait for more of the body. This phase then holds the bytes for the
-    /// plugin and leaves an empty chunk for the upstream. On the next chunk, the plugin reads the
+    /// plugin and leaves an empty chunk for the upstream. On the next body_chunk, the plugin reads the
     /// bytes it paused on and the new bytes together. A plugin can hold up to
     /// [request_body_limit](crate::WasmPluginConf::request_body_limit) bytes.
     ///
@@ -108,8 +57,8 @@ impl WasmCtx {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<()> {
-        if self.skips_body(session, Direction::Request)
-            || self.request_body.progress == Progress::Absent
+        if self.skips_body(session, BodyDirection::Request)
+            || self.request_body.progress == RequestBodyProgress::Absent
         {
             return Ok(());
         }
@@ -122,13 +71,13 @@ impl WasmCtx {
         // With request trailers, an H2 downstream ends its body with `None` and no end flag
         let end_of_stream = end_of_stream || body.is_none();
         let replay = mem::take(&mut self.request_body.replay_due)
-            && self.request_body.progress != Progress::Waiting;
+            && self.request_body.progress != RequestBodyProgress::Waiting;
         if let (true, Some(kept)) = (replay, self.request_body.kept.as_ref()) {
-            *body = released(Bytes::copy_from_slice(kept), end_of_stream);
+            *body = filter_output(Bytes::copy_from_slice(kept), end_of_stream);
             return Ok(());
         }
         let empty = body.as_ref().is_none_or(Bytes::is_empty);
-        if self.request_body.progress == Progress::Ended {
+        if self.request_body.progress == RequestBodyProgress::Ended {
             if empty {
                 return Ok(());
             }
@@ -140,30 +89,21 @@ impl WasmCtx {
         if empty && !end_of_stream {
             return Ok(());
         }
-        self.request_body.progress = Progress::Streaming;
+        self.request_body.progress = RequestBodyProgress::Streaming;
         self.chain.runtime.start_ticker()?;
         let chunk = body.take().unwrap_or_default();
-        match self.body_pass(session, Direction::Request, chunk, end_of_stream)? {
+        match self.body_pass(session, BodyDirection::Request, chunk, end_of_stream)? {
             BodyOutcome::Released(output) => {
                 if end_of_stream {
-                    self.request_body.progress = Progress::Ended;
+                    self.request_body.progress = RequestBodyProgress::Ended;
                 }
-                self.keep(session, &output);
-                *body = released(output, end_of_stream);
+                self.keep_for_retry(session, &output);
+                *body = filter_output(output, end_of_stream);
                 Ok(())
             }
-            BodyOutcome::Respond(position, response) => {
-                Err(self.respond_to_request(session, position, *response).await)
-            }
-        }
-    }
-
-    /// Keep `output` for a retry, while Pingora keeps the request body for one.
-    fn keep<DS: DownstreamSession>(&mut self, session: &Session<DS>, output: &Bytes) {
-        if session.as_downstream().retry_buffer_truncated() {
-            self.request_body.kept = None;
-        } else if let Some(kept) = self.request_body.kept.as_mut() {
-            kept.extend_from_slice(output);
+            BodyOutcome::Respond(position, response) => Err(self
+                .respond_to_request_body(session, position, *response)
+                .await),
         }
     }
 }
@@ -172,8 +112,8 @@ impl WasmCtx {
 mod tests {
     use super::*;
     use crate::test_support::{
-        body_plugin, chunk, received, received_after_a_marker, session, started, Wat, FORBIDDEN,
-        MARKER, MARK_A_REQUEST, POST, TEAPOT, TRAP,
+        body_chunk, body_plugin, read_downstream, read_downstream_after_marker, session,
+        start_request, Wat, FORBIDDEN, MARKER_RESPONSE, MARK_A_REQUEST, POST, TEAPOT, TRAP,
     };
     use crate::{WasmPluginConf, WasmRuntime};
     use pingora_error::ErrorType;
@@ -187,7 +127,7 @@ mod tests {
         vec![body_plugin("a", Wat::request_body(TEAPOT))]
     }
 
-    /// Run the request body phase on each chunk, and return what it leaves for Pingora.
+    /// Run the request body phase on each body_chunk, and return what it leaves for Pingora.
     async fn filter(
         ctx: &mut WasmCtx,
         session: &mut Session,
@@ -195,7 +135,7 @@ mod tests {
     ) -> Vec<Option<Bytes>> {
         let mut outputs = Vec::new();
         for (bytes, end_of_stream) in chunks {
-            let mut body = chunk(bytes);
+            let mut body = body_chunk(bytes);
             ctx.request_body_filter(session, &mut body, *end_of_stream)
                 .await
                 .unwrap();
@@ -210,7 +150,7 @@ mod tests {
         let mut ctx = runtime.chain(&["a"]).unwrap().new_ctx();
         let (mut session, _client) = session(POST).await;
         ctx.request_filter(&mut session).await.unwrap();
-        let mut body = chunk("x");
+        let mut body = body_chunk("x");
 
         let err = ctx
             .request_body_filter(&mut session, &mut body, true)
@@ -219,48 +159,48 @@ mod tests {
 
         assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
         assert!(err.to_string().contains("upstream_attempt"), "{err}");
-        assert_eq!(body, chunk("x"));
+        assert_eq!(body, body_chunk("x"));
     }
 
     #[tokio::test]
     async fn a_replay_receives_the_output_of_the_first_attempt() {
-        let (_runtime, mut ctx, mut session, _client) = started(mark(), POST).await;
+        let (_runtime, mut ctx, mut session, _client) = start_request(mark(), POST).await;
         filter(&mut ctx, &mut session, &[("x", false), ("y", true)]).await;
         ctx.upstream_attempt();
 
         let replay = filter(&mut ctx, &mut session, &[("xy", true)]).await;
 
-        assert_eq!(replay, [chunk("axay")]);
+        assert_eq!(replay, [body_chunk("axay")]);
     }
 
     #[tokio::test]
     async fn live_chunks_follow_a_replay_in_the_middle_of_a_body() {
-        let (_runtime, mut ctx, mut session, _client) = started(mark(), POST).await;
+        let (_runtime, mut ctx, mut session, _client) = start_request(mark(), POST).await;
         filter(&mut ctx, &mut session, &[("x", false)]).await;
         ctx.upstream_attempt();
 
         let outputs = filter(&mut ctx, &mut session, &[("x", false), ("y", true)]).await;
 
-        assert_eq!(outputs, [chunk("ax"), chunk("ay")]);
+        assert_eq!(outputs, [body_chunk("ax"), body_chunk("ay")]);
     }
 
     #[tokio::test]
     async fn a_second_attempt_with_no_bytes_before_it_runs_the_plugins() {
-        let (_runtime, mut ctx, mut session, _client) = started(mark(), POST).await;
+        let (_runtime, mut ctx, mut session, _client) = start_request(mark(), POST).await;
         ctx.upstream_attempt();
 
         let outputs = filter(&mut ctx, &mut session, &[("x", true)]).await;
 
-        assert_eq!(outputs, [chunk("ax")]);
+        assert_eq!(outputs, [body_chunk("ax")]);
     }
 
     #[tokio::test]
     async fn bytes_after_the_end_of_the_body_fail() {
-        let (_runtime, mut ctx, mut session, _client) = started(mark(), POST).await;
+        let (_runtime, mut ctx, mut session, _client) = start_request(mark(), POST).await;
         filter(&mut ctx, &mut session, &[("x", true)]).await;
 
         let err = ctx
-            .request_body_filter(&mut session, &mut chunk("x"), true)
+            .request_body_filter(&mut session, &mut body_chunk("x"), true)
             .await
             .unwrap_err();
 
@@ -270,16 +210,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_plugin_sends_its_own_response() {
-        let (_runtime, mut ctx, mut session, mut client) = started(teapot(), POST).await;
+        let (_runtime, mut ctx, mut session, mut client) = start_request(teapot(), POST).await;
 
         let err = ctx
-            .request_body_filter(&mut session, &mut chunk("attack"), false)
+            .request_body_filter(&mut session, &mut body_chunk("attack"), false)
             .await
             .unwrap_err();
 
         assert_eq!(err.etype(), &ErrorType::HTTPStatus(418));
         assert!(ctx.plugin_responded());
-        let response = received(&mut client).await;
+        let response = read_downstream(&mut client).await;
         assert!(response.starts_with("HTTP/1.1 418"), "{response}");
         assert!(response.ends_with("\r\n\r\nteapot"), "{response}");
         assert!(response.contains("\r\nConnection: close\r\n"), "{response}");
@@ -293,10 +233,10 @@ mod tests {
             body_plugin("sender", Wat::request_body(TEAPOT)),
             body_plugin("last", Wat::response_headers(TRAP)),
         ];
-        let (runtime, mut ctx, mut session, mut client) = started(plugins, POST).await;
+        let (runtime, mut ctx, mut session, mut client) = start_request(plugins, POST).await;
 
         let err = ctx
-            .request_body_filter(&mut session, &mut chunk("attack"), false)
+            .request_body_filter(&mut session, &mut body_chunk("attack"), false)
             .await
             .unwrap_err();
 
@@ -309,7 +249,7 @@ mod tests {
             err.to_string().contains("wasm plugin first failed"),
             "{err}"
         );
-        assert_eq!(received(&mut client).await, "");
+        assert_eq!(read_downstream(&mut client).await, "");
         let last = runtime.inner.pools[3].lock_slot(0);
         assert!(last.as_ref().unwrap().guest.is_serving());
     }
@@ -320,35 +260,35 @@ mod tests {
             body_plugin("second", Wat::response_headers(FORBIDDEN)),
             body_plugin("sender", Wat::request_body(TEAPOT)),
         ];
-        let (_runtime, mut ctx, mut session, mut client) = started(plugins, POST).await;
+        let (_runtime, mut ctx, mut session, mut client) = start_request(plugins, POST).await;
 
         let err = ctx
-            .request_body_filter(&mut session, &mut chunk("attack"), false)
+            .request_body_filter(&mut session, &mut body_chunk("attack"), false)
             .await
             .unwrap_err();
 
         assert_eq!(err.etype(), &ErrorType::HTTPStatus(418));
-        let response = received(&mut client).await;
+        let response = read_downstream(&mut client).await;
         assert!(response.starts_with("HTTP/1.1 418"), "{response}");
         assert!(!response.contains("403"), "{response}");
     }
 
     #[tokio::test]
     async fn a_plugin_response_after_the_upstream_response_fails() {
-        let (_runtime, mut ctx, mut session, mut client) = started(teapot(), POST).await;
+        let (_runtime, mut ctx, mut session, mut client) = start_request(teapot(), POST).await;
         let mut upstream = ResponseHeader::build(200, None).unwrap();
         ctx.response_filter(&mut session, &mut upstream)
             .await
             .unwrap();
 
         let err = ctx
-            .request_body_filter(&mut session, &mut chunk("attack"), false)
+            .request_body_filter(&mut session, &mut body_chunk("attack"), false)
             .await
             .unwrap_err();
 
         assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
         assert!(!ctx.plugin_responded());
-        let written = received_after_a_marker(&mut session, &mut client).await;
-        assert!(written.starts_with(MARKER), "{written}");
+        let written = read_downstream_after_marker(&mut session, &mut client).await;
+        assert!(written.starts_with(MARKER_RESPONSE), "{written}");
     }
 }

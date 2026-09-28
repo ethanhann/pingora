@@ -139,7 +139,7 @@ fn main() {
     if args.is_empty() {
         args.push(DEFAULT_PLUGIN.into());
     }
-    // A body phase runs a plugin on every chunk, so turn it on only for a plugin that reads bodies
+    // A body phase runs a plugin on every body_chunk, so turn it on only for a plugin that reads bodies
     let mut body = false;
     let mut plugins = Vec::new();
     for arg in &args {

@@ -66,9 +66,9 @@ fn chunked_body_ended(response: &[u8]) -> bool {
 
 /// Send a request with a chunked body through the proxy on `port`, and return the response.
 ///
-/// The client waits after each chunk, so that the proxy runs the body filter once for each chunk.
+/// The client waits after each body_chunk, so that the proxy runs the body filter once for each chunk.
 /// It stops sending when a response arrives.
-pub async fn send_chunks(
+pub async fn send_chunked_request(
     port: u16,
     origin: u16,
     method: &str,
@@ -121,7 +121,7 @@ pub async fn post_on_one_connection(port: u16, origin: u16, bodies: &[&str]) -> 
 }
 
 /// Return the bytes of a chunked body.
-pub fn unchunk(body: &str) -> String {
+pub fn decode_chunked_body(body: &str) -> String {
     let mut all = String::new();
     let mut rest = body;
     while let Some((size, after)) = rest.split_once("\r\n") {

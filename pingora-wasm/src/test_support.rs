@@ -195,13 +195,13 @@ pub(crate) fn body_plugin(name: &str, wat: Wat) -> WasmPluginConf {
     conf
 }
 
-pub(crate) fn chunk(bytes: &'static str) -> Option<Bytes> {
+pub(crate) fn body_chunk(bytes: &'static str) -> Option<Bytes> {
     Some(Bytes::from_static(bytes.as_bytes()))
 }
 
 /// Build a runtime with `plugins`, and a request context from a chain of them in that order.
 /// The context has run the request headers of `request` and started its first upstream attempt.
-pub(crate) async fn started(
+pub(crate) async fn start_request(
     plugins: Vec<WasmPluginConf>,
     request: &[u8],
 ) -> (WasmRuntime, WasmCtx, Session, DuplexStream) {
@@ -217,8 +217,8 @@ pub(crate) async fn started(
 
 /// Write a response with the status 204 to the session, and return what the downstream received.
 ///
-/// When the text starts with [MARKER], nothing was written before the 204.
-pub(crate) async fn received_after_a_marker(
+/// When the text starts with [MARKER_RESPONSE], nothing was written before the 204.
+pub(crate) async fn read_downstream_after_marker(
     session: &mut Session,
     client: &mut DuplexStream,
 ) -> String {
@@ -227,13 +227,13 @@ pub(crate) async fn received_after_a_marker(
         .write_response_header(Box::new(marker), true)
         .await
         .unwrap();
-    received(client).await
+    read_downstream(client).await
 }
 
-pub(crate) const MARKER: &str = "HTTP/1.1 204";
+pub(crate) const MARKER_RESPONSE: &str = "HTTP/1.1 204";
 
 /// Return what the downstream received so far, as text.
-pub(crate) async fn received(client: &mut DuplexStream) -> String {
+pub(crate) async fn read_downstream(client: &mut DuplexStream) -> String {
     let mut all = Vec::new();
     let mut part = [0u8; 1024];
     while let Ok(Ok(n)) =

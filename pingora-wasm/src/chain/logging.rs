@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::failure::Locked;
+use super::slot::LockedSlot;
 use super::WasmCtx;
 use log::{debug, error, warn};
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
@@ -42,7 +42,7 @@ impl WasmCtx {
                 continue;
             };
             let pool = &runtime.pools[self.chain.plugins[position]];
-            let Ok(mut locked) = Locked::of(pool, &record) else {
+            let Ok(mut locked) = LockedSlot::of_request(pool, &record) else {
                 continue;
             };
             let Ok(loaded) = locked.loaded() else {
@@ -82,7 +82,7 @@ pub(super) fn finish<H: StreamState>(
     Ok(true)
 }
 
-pub(super) fn finished(locked: Locked<'_>, result: Result<bool, GuestError>) {
+pub(super) fn finished(locked: LockedSlot<'_>, result: Result<bool, GuestError>) {
     match result {
         Ok(true) => locked.pool.deleted(locked.slot),
         Ok(false) => {
@@ -92,7 +92,7 @@ pub(super) fn finished(locked: Locked<'_>, result: Result<bool, GuestError>) {
             );
             locked.pool.held(locked.slot);
         }
-        Err(e) => error!("{}", locked.failed("failed to end a context", e)),
+        Err(e) => error!("{}", locked.guest_failure("failed to end a context", e)),
     }
 }
 

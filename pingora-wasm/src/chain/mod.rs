@@ -16,20 +16,17 @@
 
 mod body;
 mod ctx;
-mod failure;
 mod logging;
 mod request;
-mod request_body;
 mod respond;
 mod response;
-mod response_body;
-mod response_trailers;
+mod slot;
 
 pub use ctx::WasmCtx;
 
-use ctx::Exchange;
+use ctx::ResponseProgress;
 
-use crate::runtime::pool::PhaseConf;
+use crate::runtime::pool::PluginPhases;
 use crate::runtime::RuntimeInner;
 use bytes::Bytes;
 use pingora_http::ResponseHeader;
@@ -44,12 +41,12 @@ use std::sync::Arc;
 pub struct WasmChain {
     pub(crate) runtime: Arc<RuntimeInner>,
     pub(crate) plugins: Arc<[usize]>,
-    phases: Phases,
+    phases: ChainPhases,
 }
 
 /// The body and trailer phases that the plugins of a chain run.
 #[derive(Debug, Clone, Copy)]
-struct Phases {
+struct ChainPhases {
     request_body: bool,
     response_body: bool,
     response_trailers: bool,
@@ -69,12 +66,12 @@ pub enum RequestOutcome {
 
 impl WasmChain {
     pub(crate) fn new(runtime: Arc<RuntimeInner>, plugins: Vec<usize>) -> Self {
-        let any = |phase: fn(&PhaseConf) -> bool| {
+        let any = |phase: fn(&PluginPhases) -> bool| {
             plugins
                 .iter()
                 .any(|index| phase(&runtime.pools[*index].phases))
         };
-        let phases = Phases {
+        let phases = ChainPhases {
             request_body: any(|conf| conf.request),
             response_body: any(|conf| conf.response),
             response_trailers: any(|conf| conf.trailers),
