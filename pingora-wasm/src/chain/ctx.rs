@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::body::Held;
+use super::failure::Locked;
 use super::logging::{finish, finished};
+use super::request_body::RequestBody;
 use super::WasmChain;
 use crate::stream::{PingoraStream, RequestHeaders, ResponseHeaders};
 use http::uri::Scheme;
@@ -32,6 +35,17 @@ pub(crate) struct PluginRecord {
     pub(crate) context: ContextId,
 }
 
+/// The progress of one request through the plugins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Exchange {
+    /// The plugins did not run on a response header.
+    Request,
+    /// The plugins ran on the upstream response header.
+    Response,
+    /// A plugin sent its own response.
+    Responded,
+}
+
 /// The state of one request in the plugins of one chain.
 ///
 /// Create it with [WasmChain::new_ctx] and keep it in the `CTX` of your proxy. It holds a
@@ -44,6 +58,9 @@ pub struct WasmCtx {
     pub(crate) chain: WasmChain,
     pub(crate) records: Vec<Option<PluginRecord>>,
     pub(crate) scheme: Scheme,
+    pub(super) exchange: Exchange,
+    pub(super) request_body: RequestBody,
+    pub(super) held: Held,
     stream: PingoraStream,
     spare_request: Option<RequestHeader>,
     spare_response: Option<ResponseHeader>,
@@ -63,6 +80,9 @@ impl WasmCtx {
     pub(crate) fn new(chain: WasmChain) -> Self {
         let records = vec![None; chain.plugins.len()];
         WasmCtx {
+            exchange: Exchange::Request,
+            request_body: RequestBody::new(),
+            held: Held::default(),
             chain,
             records,
             scheme: Scheme::HTTP,
@@ -139,16 +159,16 @@ impl Drop for WasmCtx {
                 continue;
             };
             let pool = &runtime.pools[self.chain.plugins[position]];
-            let Some(mut guard) = pool.lock(record.slot, record.guest) else {
+            let Ok(mut locked) = Locked::of(pool, &record) else {
                 continue;
             };
-            let Some(loaded) = guard.as_mut() else {
+            let Ok(loaded) = locked.loaded() else {
                 continue;
             };
             let result = self.run(&mut loaded.guest, |scope| {
                 finish(scope, record.context, false)
             });
-            finished(pool, record.slot, guard, result);
+            finished(locked, result);
         }
     }
 }

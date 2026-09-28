@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::failure::Locked;
 use super::WasmCtx;
-use crate::runtime::pool::{GuestPool, SlotGuard};
-use log::{error, warn};
+use log::{debug, error, warn};
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_proxy::Session;
 use proxy_wasm_host::abi::v0_2_1::{CallScope, ContextId, GuestError, StreamState};
@@ -29,15 +29,23 @@ impl WasmCtx {
     pub async fn logging<DS: DownstreamSession>(&mut self, session: &mut Session<DS>) {
         let runtime = self.chain.runtime.clone();
         let mut response = session.response_written().cloned();
+        let held = self.held.request_len();
+        if held > 0 {
+            debug!("the request ended while wasm plugins held {held} request body bytes");
+        }
+        let held = self.held.response_len();
+        if held > 0 {
+            warn!("the request ended while wasm plugins held {held} response body bytes");
+        }
         for position in (0..self.records.len()).rev() {
             let Some(record) = self.records[position].take() else {
                 continue;
             };
             let pool = &runtime.pools[self.chain.plugins[position]];
-            let Some(mut guard) = pool.lock(record.slot, record.guest) else {
+            let Ok(mut locked) = Locked::of(pool, &record) else {
                 continue;
             };
-            let Some(loaded) = guard.as_mut() else {
+            let Ok(loaded) = locked.loaded() else {
                 continue;
             };
             self.request_in(session.req_header_mut());
@@ -51,7 +59,7 @@ impl WasmCtx {
                 self.response_out(header);
             }
             self.request_out(session.req_header_mut());
-            finished(pool, record.slot, guard, result);
+            finished(locked, result);
         }
     }
 }
@@ -74,25 +82,17 @@ pub(super) fn finish<H: StreamState>(
     Ok(true)
 }
 
-pub(super) fn finished(
-    pool: &GuestPool,
-    slot: usize,
-    guard: SlotGuard<'_>,
-    result: Result<bool, GuestError>,
-) {
+pub(super) fn finished(locked: Locked<'_>, result: Result<bool, GuestError>) {
     match result {
-        Ok(true) => pool.deleted(slot),
+        Ok(true) => locked.pool.deleted(locked.slot),
         Ok(false) => {
             warn!(
                 "wasm plugin {} holds a context after the request ended",
-                pool.name
+                locked.pool.name
             );
-            pool.held(slot);
+            locked.pool.held(locked.slot);
         }
-        Err(e) => {
-            error!("wasm plugin {} failed to end a context: {e}", pool.name);
-            pool.check(slot, guard, &e);
-        }
+        Err(e) => error!("{}", locked.failed("failed to end a context", e)),
     }
 }
 

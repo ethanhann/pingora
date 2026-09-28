@@ -15,7 +15,9 @@
 mod utils;
 
 use std::sync::atomic::Ordering;
-use utils::{client, echo_origin, eventually, guest_lines, init, runtime, url};
+use std::time::Duration;
+use utils::raw::{post_on_one_connection, send_chunks, unchunk};
+use utils::{client, closing_peer, echo_origin, eventually, guest_lines, init, runtime, url};
 
 fn header(response: &reqwest::Response, name: &str) -> Option<String> {
     response
@@ -217,4 +219,115 @@ async fn request_bodies_survive_on_a_keep_alive_connection() {
     assert_eq!(header(&first, "x-echo-body-len").as_deref(), Some("11"));
     assert_eq!(header(&second, "x-echo-body-len").as_deref(), Some("13"));
     assert_eq!(count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_plugin_replaces_a_response_body_and_the_connection_stays_open() {
+    init().await;
+    let (origin, _) = echo_origin().await;
+    let bodies = ["a secret", "public"];
+
+    let responses = post_on_one_connection(6391, origin.addr().port(), &bodies).await;
+
+    let [secret, public] = &responses[..] else {
+        panic!("{} responses", responses.len());
+    };
+    assert_eq!(secret.status, 200);
+    assert!(secret.head.contains("\r\ntransfer-encoding: chunked"));
+    assert!(!secret.head.contains("\r\ncontent-length:"));
+    assert_eq!(
+        unchunk(&secret.body),
+        "Original message body (8 bytes) redacted.\n"
+    );
+    assert_eq!(public.status, 200);
+    assert_eq!(unchunk(&public.body), "public");
+}
+
+#[tokio::test]
+async fn a_plugin_holds_a_request_body_until_its_end() {
+    init().await;
+    let (origin, _) = echo_origin().await;
+    let chunks = ["one ", "two ", "three"];
+
+    let res = send_chunks(6392, origin.addr().port(), "POST", &[], &chunks).await;
+
+    assert_eq!(res.status, 200);
+    assert_eq!(res.body, "aone two three");
+}
+
+#[tokio::test]
+async fn a_held_request_body_over_its_limit_responds_with_413() {
+    init().await;
+    let (origin, count) = echo_origin().await;
+    let chunks = ["twenty bytes of body"];
+
+    let res = send_chunks(6393, origin.addr().port(), "POST", &[], &chunks).await;
+
+    assert_eq!(res.status, 413);
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_plugin_responds_in_place_of_the_upstream_response() {
+    init().await;
+    let (origin, count) = echo_origin().await;
+
+    let res = get(6394, "/", origin.addr().port(), &[]).await;
+
+    assert_eq!(res.status(), 418);
+    assert_eq!(res.text().await.unwrap(), "teapot");
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_plugin_responds_to_a_request_body() {
+    init().await;
+    let (origin, _) = echo_origin().await;
+
+    let res = send_chunks(6395, origin.addr().port(), "POST", &[], &["attack"]).await;
+
+    assert_eq!(res.status, 418);
+    assert_eq!(res.body, "teapot");
+    assert!(eventually(|| runtime(6395).open_contexts() == 0).await);
+}
+
+#[tokio::test]
+async fn a_retry_sends_the_output_of_the_plugins() {
+    init().await;
+    let (origin, count) = echo_origin().await;
+    let (first, peer) = closing_peer().await;
+    let first = first.to_string();
+    let headers = [("x-test-first-origin", first.as_str())];
+
+    let res = send_chunks(6396, origin.addr().port(), "PUT", &headers, &["x", "y"]).await;
+
+    // The plugin marks the two chunks and the empty call that ends the body. If it ran on the
+    // bytes of the retry, it would mark them once.
+    peer.await.unwrap();
+    assert_eq!(res.status, 200);
+    assert_eq!(res.body, "axaya");
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_plugin_response_with_no_body_ends_an_h2_stream() {
+    init().await;
+    let (origin, _) = echo_origin().await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .http2_prior_knowledge()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let res = client
+        .head(url(6394, "/"))
+        .header("x-test-origin", origin.addr().port().to_string())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 418);
+    assert_eq!(res.version(), reqwest::Version::HTTP_2);
+    assert_eq!(res.bytes().await.unwrap().len(), 0);
 }

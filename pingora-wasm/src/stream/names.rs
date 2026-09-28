@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Header names and values, shared by the request map and the response map.
+//! Header names and values, shared by the header maps and the trailer map.
 
 use http::header::{HeaderName, HeaderValue, HOST};
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -55,10 +55,14 @@ pub(super) fn classify(key: &[u8]) -> Option<Name<'_>> {
     std::str::from_utf8(key).ok().map(Name::Regular)
 }
 
+pub(super) fn header_name(key: &[u8]) -> Result<HeaderName, NotAllowed> {
+    HeaderName::from_bytes(key).map_err(|_| NotAllowed)
+}
+
+/// Return `key` as a header name, with the case that the guest used.
 fn name_of(key: &[u8]) -> Result<String, NotAllowed> {
-    let name = std::str::from_utf8(key).map_err(|_| NotAllowed)?;
-    HeaderName::from_bytes(name.as_bytes()).map_err(|_| NotAllowed)?;
-    Ok(name.to_string())
+    header_name(key)?;
+    String::from_utf8(key.to_vec()).map_err(|_| NotAllowed)
 }
 
 pub(super) fn value_of(value: &[u8]) -> Result<HeaderValue, NotAllowed> {

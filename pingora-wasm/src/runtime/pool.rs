@@ -22,12 +22,22 @@ use log::{error, warn};
 use parking_lot::{Mutex, MutexGuard};
 use pingora_error::Result;
 use proxy_wasm_host::abi::v0_2_1::{
-    ContextId, Guest, GuestError, GuestId, GuestSpec, PluginConfig, Started,
+    Callback, ContextId, Guest, GuestError, GuestId, GuestSpec, PluginConfig, Started,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const REBUILD_BACKOFF: Duration = Duration::from_secs(1);
+
+/// The body and trailer settings of a plugin.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PhaseConf {
+    pub(crate) request: bool,
+    pub(crate) response: bool,
+    pub(crate) trailers: bool,
+    pub(crate) request_limit: usize,
+    pub(crate) response_limit: usize,
+}
 
 /// A started guest and the root context of its plugin.
 pub(crate) struct Loaded {
@@ -47,6 +57,7 @@ struct Slot {
 
 pub(crate) struct GuestPool {
     pub(crate) name: String,
+    pub(crate) phases: PhaseConf,
     spec: GuestSpec,
     plugin: PluginConfig,
     next: AtomicUsize,
@@ -59,9 +70,11 @@ impl GuestPool {
         spec: GuestSpec,
         plugin: PluginConfig,
         slots: usize,
+        mut phases: PhaseConf,
     ) -> Result<Self> {
-        let pool = GuestPool {
+        let mut pool = GuestPool {
             name,
+            phases,
             spec,
             plugin,
             next: AtomicUsize::new(0),
@@ -70,6 +83,14 @@ impl GuestPool {
         for slot in &pool.slots {
             *slot.guest.lock() = Some(pool.start()?);
         }
+        // A guest that does not export the callback of a phase has nothing to run in it
+        if let Some(loaded) = pool.slots[0].guest.lock().as_ref() {
+            let exports = |callback| loaded.guest.exports_callback(callback);
+            phases.request &= exports(Callback::RequestBody);
+            phases.response &= exports(Callback::ResponseBody);
+            phases.trailers &= exports(Callback::ResponseTrailers);
+        }
+        pool.phases = phases;
         Ok(pool)
     }
 
@@ -241,9 +262,27 @@ impl GuestPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{fixture, plugin};
+    use crate::test_support::{body_plugin, fixture, plugin, Wat, CONTINUE, HOLD};
     use crate::WasmRuntime;
     use std::thread;
+
+    #[test]
+    fn a_plugin_runs_a_body_phase_that_is_on_and_exported() {
+        let exported = Wat {
+            request_body: Some(HOLD),
+            response_trailers: Some(CONTINUE),
+            ..Wat::default()
+        };
+        let mut conf = body_plugin("a", exported);
+        conf.response_trailers = false;
+
+        let runtime = WasmRuntime::new(vec![conf]).unwrap();
+
+        let phases = runtime.inner.pools[0].phases;
+        assert!(phases.request, "on and exported");
+        assert!(!phases.response, "on and not exported");
+        assert!(!phases.trailers, "off and exported");
+    }
 
     #[test]
     fn pick_skips_a_locked_slot_and_a_slot_with_no_guest() {

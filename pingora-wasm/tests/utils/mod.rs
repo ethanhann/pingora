@@ -12,19 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use async_trait::async_trait;
+pub mod guests;
+mod proxy;
+pub mod raw;
+
 use bytes::Bytes;
 use http::{Request, Response};
 use once_cell::sync::{Lazy, OnceCell};
+use pingora_core::apps::HttpServerOptions;
 use pingora_core::server::Server;
-use pingora_core::upstreams::peer::HttpPeer;
-use pingora_core::{Error, ErrorType, Result};
-use pingora_http::ResponseHeader;
-use pingora_proxy::{ProxyHttp, Session};
 use pingora_test_utils::http_origin::HttpOrigin;
-use pingora_wasm::{
-    write_plugin_response, RequestOutcome, WasmChain, WasmCtx, WasmPluginConf, WasmRuntime,
-};
+use pingora_wasm::{WasmPluginConf, WasmRuntime};
+use proxy::TestProxy;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -33,7 +32,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const FIRST_PORT: u16 = 6380;
-pub const LAST_PORT: u16 = 6390;
+pub const LAST_PORT: u16 = 6396;
 
 pub fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -69,64 +68,6 @@ impl log::Log for Capture {
 /// Return every guest log line so far.
 pub fn guest_lines() -> Vec<String> {
     GUEST_LINES.lock().unwrap().clone()
-}
-
-pub struct TestProxy {
-    chain: WasmChain,
-}
-
-#[async_trait]
-impl ProxyHttp for TestProxy {
-    type CTX = Option<WasmCtx>;
-
-    fn new_ctx(&self) -> Self::CTX {
-        None
-    }
-
-    async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-        let wasm = ctx.insert(self.chain.new_ctx());
-        match wasm.request_filter(session).await? {
-            RequestOutcome::Respond(header, body) => {
-                write_plugin_response(session, header, body).await?;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    async fn upstream_peer(
-        &self,
-        session: &mut Session,
-        _ctx: &mut Self::CTX,
-    ) -> Result<Box<HttpPeer>> {
-        let port: u16 = session
-            .req_header()
-            .headers
-            .get("x-test-origin")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse().ok())
-            .ok_or_else(|| Error::explain(ErrorType::HTTPStatus(400), "no x-test-origin"))?;
-        let peer = HttpPeer::new(("127.0.0.1", port), false, String::new());
-        Ok(Box::new(peer))
-    }
-
-    async fn response_filter(
-        &self,
-        session: &mut Session,
-        upstream_response: &mut ResponseHeader,
-        ctx: &mut Self::CTX,
-    ) -> Result<()> {
-        match ctx {
-            Some(wasm) => wasm.response_filter(session, upstream_response).await,
-            None => Ok(()),
-        }
-    }
-
-    async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut Self::CTX) {
-        if let Some(wasm) = ctx {
-            wasm.logging(session).await;
-        }
-    }
 }
 
 static RUNTIMES: OnceCell<HashMap<u16, WasmRuntime>> = OnceCell::new();
@@ -192,6 +133,22 @@ fn services() -> Vec<(u16, WasmRuntime, Vec<&'static str>, Option<usize>)> {
     push(6388, single("example", example(2)), None);
     push(6389, (shared.clone(), vec!["add"]), None);
     push(6390, (shared, vec!["add", "config"]), None);
+    let mut body = plugin("body", fixture("sdk-http-body"), 2, "");
+    body.response_body = true;
+    push(6391, single("body", body), None);
+    push(6392, single("hold", guests::hold("hold", 1024)), None);
+    push(6393, single("hold", guests::hold("hold-limit", 16)), None);
+    push(
+        6394,
+        single("teapot", guests::teapot_for_a_response()),
+        None,
+    );
+    push(
+        6395,
+        single("teapot", guests::teapot_for_a_request_body()),
+        None,
+    );
+    push(6396, single("mark", guests::mark()), None);
     services
 }
 
@@ -218,6 +175,9 @@ impl TestServer {
                 let chain = runtime.chain(&chain).unwrap();
                 let mut service =
                     pingora_proxy::http_proxy_service(&server.configuration, TestProxy { chain });
+                let mut options = HttpServerOptions::default();
+                options.h2c = true;
+                service.app_logic_mut().unwrap().server_options = Some(options);
                 service.threads = threads;
                 service.add_tcp(&format!("127.0.0.1:{port}"));
                 server.add_service(service);
@@ -246,8 +206,26 @@ pub async fn init() {
     .unwrap();
 }
 
-/// Start an origin that echoes each request header as `x-echo-<name>` and the body length as
-/// `x-echo-body-len`, and counts its requests.
+/// Start a peer that reads one request with a chunked body, and closes the connection with no
+/// response.
+pub async fn closing_peer() -> (u16, tokio::task::JoinHandle<()>) {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut part = [0u8; 4096];
+        while !request.ends_with(b"0\r\n\r\n") {
+            match stream.read(&mut part).await {
+                Ok(n) if n > 0 => request.extend_from_slice(&part[..n]),
+                _ => break,
+            }
+        }
+    });
+    (port, peer)
+}
+
 pub async fn echo_origin() -> (HttpOrigin, Arc<AtomicUsize>) {
     let count = Arc::new(AtomicUsize::new(0));
     let seen = count.clone();
@@ -257,9 +235,14 @@ pub async fn echo_origin() -> (HttpOrigin, Arc<AtomicUsize>) {
         for (name, value) in request.headers() {
             response = response.header(format!("x-echo-{name}"), value);
         }
+        let body = if request.headers().contains_key("x-return-body") {
+            request.body().clone()
+        } else {
+            Bytes::from_static(b"origin")
+        };
         let response = response
             .header("x-echo-body-len", request.body().len())
-            .body(Bytes::from_static(b"origin"))
+            .body(body)
             .unwrap();
         async move { response }
     })

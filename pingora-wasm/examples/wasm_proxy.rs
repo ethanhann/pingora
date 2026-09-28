@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use pingora_core::server::Server;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{Error, Result};
@@ -22,11 +23,14 @@ use pingora_wasm::{
     write_plugin_response, RequestOutcome, WasmChain, WasmCtx, WasmPluginConf, WasmRuntime,
 };
 use std::path::PathBuf;
+use std::time::Duration;
 
 const DEFAULT_PLUGIN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/add-request-header.wasm"
 );
+
+const BODY_FLAG: &str = "--body";
 
 pub struct PluginProxy {
     chain: WasmChain,
@@ -53,8 +57,9 @@ impl ProxyHttp for PluginProxy {
     async fn upstream_peer(
         &self,
         _session: &mut Session,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
+        ctx.upstream_attempt();
         let peer = HttpPeer::new(("httpbin.org", 80), false, "httpbin.org".into());
         Ok(Box::new(peer))
     }
@@ -68,6 +73,16 @@ impl ProxyHttp for PluginProxy {
         upstream_request.insert_header("Host", "httpbin.org")
     }
 
+    async fn request_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        ctx.request_body_filter(session, body, end_of_stream).await
+    }
+
     async fn response_filter(
         &self,
         session: &mut Session,
@@ -77,6 +92,32 @@ impl ProxyHttp for PluginProxy {
         ctx.response_filter(session, upstream_response).await
     }
 
+    async fn response_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        ctx.response_body_filter(session, body, end_of_stream)
+            .await?;
+        Ok(None)
+    }
+
+    async fn response_trailer_filter(
+        &self,
+        session: &mut Session,
+        upstream_trailers: &mut http::HeaderMap,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Bytes>> {
+        ctx.response_trailer_filter(session, upstream_trailers)
+            .await
+    }
+
+    fn suppress_error_log(&self, _session: &Session, ctx: &Self::CTX, _e: &Error) -> bool {
+        ctx.plugin_responded()
+    }
+
     async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut Self::CTX) {
         ctx.logging(session).await
     }
@@ -84,25 +125,37 @@ impl ProxyHttp for PluginProxy {
 
 // RUST_LOG=INFO cargo run --example wasm_proxy -- tests/fixtures/add-request-header.wasm
 // curl 127.0.0.1:6190/headers
+//
+// Plugins after --body also run on bodies and trailers
+// RUST_LOG=INFO cargo run --example wasm_proxy -- --body tests/fixtures/sdk-http-body.wasm
+// curl -d 'a secret' 127.0.0.1:6190/anything
 fn main() {
     env_logger::init();
 
     let mut my_server = Server::new(None).unwrap();
     my_server.bootstrap();
 
-    let mut paths: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
-    if paths.is_empty() {
-        paths.push(DEFAULT_PLUGIN.into());
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        args.push(DEFAULT_PLUGIN.into());
     }
-    let plugins: Vec<WasmPluginConf> = paths
-        .iter()
-        .map(|path| {
-            let name = path.file_stem().unwrap().to_string_lossy();
-            let mut plugin = WasmPluginConf::new(name, path);
-            plugin.slots = my_server.configuration.threads;
-            plugin
-        })
-        .collect();
+    // A body phase runs a plugin on every chunk, so turn it on only for a plugin that reads bodies
+    let mut body = false;
+    let mut plugins = Vec::new();
+    for arg in &args {
+        if arg == BODY_FLAG {
+            body = true;
+            continue;
+        }
+        let path = PathBuf::from(arg);
+        let name = path.file_stem().unwrap().to_string_lossy();
+        let mut plugin = WasmPluginConf::new(name, &path);
+        plugin.slots = my_server.configuration.threads;
+        plugin.request_body = body;
+        plugin.response_body = body;
+        plugin.response_trailers = body;
+        plugins.push(plugin);
+    }
     let names: Vec<String> = plugins.iter().map(|p| p.name.clone()).collect();
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let runtime = WasmRuntime::new(plugins).unwrap();

@@ -14,13 +14,22 @@
 
 //! A chain of plugins and the phases that run them on each request.
 
+mod body;
 mod ctx;
+mod failure;
 mod logging;
 mod request;
+mod request_body;
+mod respond;
 mod response;
+mod response_body;
+mod response_trailers;
 
 pub use ctx::WasmCtx;
 
+use ctx::Exchange;
+
+use crate::runtime::pool::PhaseConf;
 use crate::runtime::RuntimeInner;
 use bytes::Bytes;
 use pingora_http::ResponseHeader;
@@ -35,6 +44,15 @@ use std::sync::Arc;
 pub struct WasmChain {
     pub(crate) runtime: Arc<RuntimeInner>,
     pub(crate) plugins: Arc<[usize]>,
+    phases: Phases,
+}
+
+/// The body and trailer phases that the plugins of a chain run.
+#[derive(Debug, Clone, Copy)]
+struct Phases {
+    request_body: bool,
+    response_body: bool,
+    response_trailers: bool,
 }
 
 /// The result of [WasmCtx::request_filter].
@@ -51,9 +69,20 @@ pub enum RequestOutcome {
 
 impl WasmChain {
     pub(crate) fn new(runtime: Arc<RuntimeInner>, plugins: Vec<usize>) -> Self {
+        let any = |phase: fn(&PhaseConf) -> bool| {
+            plugins
+                .iter()
+                .any(|index| phase(&runtime.pools[*index].phases))
+        };
+        let phases = Phases {
+            request_body: any(|conf| conf.request),
+            response_body: any(|conf| conf.response),
+            response_trailers: any(|conf| conf.trailers),
+        };
         WasmChain {
             runtime,
             plugins: plugins.into(),
+            phases,
         }
     }
 

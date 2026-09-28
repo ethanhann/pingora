@@ -35,7 +35,7 @@ pingora-test-utils = { version = "0.9.0", path = "../pingora-test-utils" }
 tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "time"] }
 once_cell = { workspace = true }
 futures = { workspace = true }
-reqwest = { version = "0.13", default-features = false }
+reqwest = { version = "0.13", default-features = false, features = ["http2"] }
 wat = "1"
 env_logger = "0.11"
 

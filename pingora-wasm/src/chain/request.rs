@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use super::ctx::PluginRecord;
-use super::{RequestOutcome, WasmCtx};
-use crate::{plugin_failure, plugin_unavailable};
+use super::failure::Locked;
+use super::{Exchange, RequestOutcome, WasmCtx};
+use crate::plugin_unavailable;
 use http::uri::Scheme;
-use http::Method;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_error::Result;
 use pingora_proxy::Session;
@@ -48,14 +48,16 @@ impl WasmCtx {
         let runtime = self.chain.runtime.clone();
         runtime.start_ticker()?;
         let end_of_stream = session.is_body_empty();
+        if !end_of_stream {
+            self.request_body.expect();
+        }
         self.scheme = scheme_of(session);
         let plugins = self.chain.plugins.clone();
         for (position, &plugin) in plugins.iter().enumerate() {
             let pool = &runtime.pools[plugin];
-            let (slot, mut guard) = pool.pick()?;
-            let Some(loaded) = guard.as_mut() else {
-                return Err(plugin_unavailable(&pool.name, "has no guest"));
-            };
+            let mut locked = Locked::pick(pool)?;
+            let slot = locked.slot;
+            let loaded = locked.loaded()?;
             let root = loaded.root;
             let guest = loaded.guest.id();
             let created = self.run(&mut loaded.guest, |scope| {
@@ -63,10 +65,7 @@ impl WasmCtx {
             });
             let context = match created {
                 Ok(context) => context,
-                Err(e) => {
-                    pool.check(slot, guard, &e);
-                    return Err(plugin_failure(&pool.name, "could not create a context", e));
-                }
+                Err(e) => return Err(locked.failed("could not create a context", e)),
             };
             pool.opened(slot);
             self.records[position] = Some(PluginRecord {
@@ -83,21 +82,14 @@ impl WasmCtx {
             self.request_out(session.req_header_mut());
             let action = match action {
                 Ok(action) => action,
-                Err(e) => {
-                    pool.check(slot, guard, &e);
-                    return Err(plugin_failure(
-                        &pool.name,
-                        "failed in on_request_headers",
-                        e,
-                    ));
-                }
+                Err(e) => return Err(locked.failed("failed in on_request_headers", e)),
             };
-            drop(guard);
+            drop(locked);
             if let Some(response) = self.stream().plugin_response.take() {
                 let mut header = response.header;
-                let end_of_stream =
-                    response.body.is_empty() || session.req_header().method == Method::HEAD;
-                self.response_pass(session, &mut header, (0..=position).rev(), end_of_stream)?;
+                let empty = response.body.is_empty();
+                self.pass_plugin_response(session, position, &mut header, empty)?;
+                self.exchange = Exchange::Responded;
                 return Ok(RequestOutcome::Respond(Box::new(header), response.body));
             }
             if action == Action::Pause {
@@ -118,8 +110,23 @@ fn scheme_of<DS: DownstreamSession>(session: &Session<DS>) -> Scheme {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support::{one_plugin, session, wat_plugin, GET};
-    use crate::ERR_PLUGIN_FAILED;
+    use crate::test_support::{one_plugin, session, wat_plugin, GET, TEAPOT};
+    use crate::{RequestOutcome, ERR_PLUGIN_FAILED};
+
+    #[tokio::test]
+    async fn a_plugin_response_is_returned_to_the_caller() {
+        let (_runtime, mut ctx) = one_plugin(wat_plugin("respond-unit", TEAPOT));
+        let (mut session, _client) = session(GET).await;
+
+        let outcome = ctx.request_filter(&mut session).await.unwrap();
+
+        let RequestOutcome::Respond(header, body) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(header.status, 418);
+        assert_eq!(&body[..], b"teapot");
+        assert!(ctx.plugin_responded());
+    }
 
     #[tokio::test]
     async fn a_guest_error_restores_the_session_header() {

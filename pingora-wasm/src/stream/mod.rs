@@ -12,31 +12,38 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! What a plugin can read and write during a callback: the request and response headers, and
-//! the response it can send in place of the upstream response.
+//! What a plugin can read and write during a callback: the headers, the body, the response
+//! trailers, and the response it can send in place of the upstream response.
 
+mod body;
 mod names;
 mod plugin_response;
 mod request_headers;
 mod response_headers;
+mod response_trailers;
 
+pub(crate) use body::BodyBuffer;
 pub use plugin_response::write_plugin_response;
 pub(crate) use plugin_response::PluginResponse;
 pub(crate) use request_headers::RequestHeaders;
 pub(crate) use response_headers::ResponseHeaders;
+pub(crate) use response_trailers::ResponseTrailers;
 
 use log::{debug, warn};
-use proxy_wasm_host::abi::v0_2_1::types::{MapType, Status};
+use proxy_wasm_host::abi::v0_2_1::types::{BufferType, MapType, Status};
 use proxy_wasm_host::abi::v0_2_1::{Access, Callback, Invocation, LocalResponse, StreamState};
-use proxy_wasm_host::{HeaderMap, VecHeaderMap};
+use proxy_wasm_host::{Buffer, HeaderMap, VecHeaderMap};
 
 /// The state that a guest can read and write during one callback.
 ///
-/// The phases move the Pingora headers into it before each callback, and back after it.
+/// The phases move the Pingora headers, the body bytes, and the trailers into it before each
+/// callback, and back after it.
 #[derive(Default)]
 pub(crate) struct PingoraStream {
     pub(crate) request: Option<RequestHeaders>,
     pub(crate) response: Option<ResponseHeaders>,
+    pub(crate) trailers: Option<ResponseTrailers>,
+    pub(crate) body_buffer: BodyBuffer,
     pub(crate) plugin_response: Option<PluginResponse>,
     empty: VecHeaderMap,
 }
@@ -62,8 +69,29 @@ impl StreamState for PingoraStream {
             (MapType::HttpRequestHeaders, Some(Callback::RequestHeaders)) => self.request_map(),
             (
                 MapType::HttpRequestHeaders,
-                Some(Callback::ResponseHeaders | Callback::Done | Callback::Log),
+                Some(
+                    Callback::ResponseHeaders
+                    | Callback::Done
+                    | Callback::Log
+                    | Callback::RequestBody
+                    | Callback::ResponseBody
+                    | Callback::ResponseTrailers,
+                ),
             ) if read => self.request_map(),
+            (MapType::HttpResponseTrailers, Some(Callback::ResponseTrailers)) => {
+                match self.trailers.as_mut() {
+                    Some(map) => Ok(map),
+                    None => Err(Status::BadArgument),
+                }
+            }
+            // A guest built with the Rust SDK panics on an error status, and reads an empty map
+            // as a missing value
+            (
+                MapType::HttpResponseHeaders
+                | MapType::HttpRequestTrailers
+                | MapType::HttpResponseTrailers,
+                Some(Callback::RequestBody | Callback::ResponseBody | Callback::ResponseTrailers),
+            ) if read => Ok(&mut self.empty),
             (MapType::HttpResponseHeaders, Some(Callback::ResponseHeaders)) => {
                 match self.response.as_mut() {
                     Some(map) => Ok(map),
@@ -80,12 +108,36 @@ impl StreamState for PingoraStream {
         }
     }
 
+    fn buffer(
+        &mut self,
+        call: Invocation,
+        _access: Access,
+        buffer: BufferType,
+    ) -> Result<&mut dyn Buffer, Status> {
+        match (buffer, call.callback) {
+            (BufferType::HttpRequestBody, Some(Callback::RequestBody))
+            | (BufferType::HttpResponseBody, Some(Callback::ResponseBody)) => {
+                Ok(&mut self.body_buffer)
+            }
+            _ => Err(Status::NotFound),
+        }
+    }
+
     fn send_local_response(
         &mut self,
         call: Invocation,
         response: LocalResponse<'_>,
     ) -> Result<(), Status> {
-        if call.callback != Some(Callback::RequestHeaders) {
+        if !matches!(
+            call.callback,
+            Some(
+                Callback::RequestHeaders
+                    | Callback::RequestBody
+                    | Callback::ResponseHeaders
+                    | Callback::ResponseBody
+                    | Callback::ResponseTrailers
+            )
+        ) {
             return Err(Status::Unimplemented);
         }
         let plugin_response = PluginResponse::build(&response).ok_or(Status::BadArgument)?;
@@ -118,6 +170,7 @@ mod tests {
 
     fn stream(with_response: bool) -> PingoraStream {
         PingoraStream {
+            trailers: Some(ResponseTrailers::default()),
             request: Some(RequestHeaders::new(
                 RequestHeader::build("GET", b"/", None).unwrap(),
                 Scheme::HTTP,
@@ -141,9 +194,31 @@ mod tests {
     fn header_map_follows_the_table() {
         use Access::{Read, Write};
         use Callback::*;
-        use MapType::{HttpRequestHeaders as Req, HttpResponseHeaders as Resp};
+        use MapType::{
+            HttpRequestHeaders as Req, HttpRequestTrailers as ReqTrailers,
+            HttpResponseHeaders as Resp, HttpResponseTrailers as RespTrailers,
+        };
         let mut s = stream(true);
         let cases = [
+            (RequestBody, Read, Req, true),
+            (RequestBody, Write, Req, false),
+            (RequestBody, Read, Resp, true),
+            (RequestBody, Write, Resp, false),
+            (RequestBody, Read, ReqTrailers, true),
+            (RequestBody, Write, RespTrailers, false),
+            (ResponseBody, Read, Req, true),
+            (ResponseBody, Read, Resp, true),
+            (ResponseBody, Write, Resp, false),
+            (ResponseBody, Read, RespTrailers, true),
+            (ResponseBody, Write, RespTrailers, false),
+            (ResponseTrailers, Read, Req, true),
+            (ResponseTrailers, Read, Resp, true),
+            (ResponseTrailers, Write, Resp, false),
+            (ResponseTrailers, Read, ReqTrailers, true),
+            (ResponseTrailers, Write, ReqTrailers, false),
+            (ResponseTrailers, Read, RespTrailers, true),
+            (ResponseTrailers, Write, RespTrailers, true),
+            (ResponseHeaders, Read, RespTrailers, false),
             (ContextCreate, Read, Req, false),
             (ContextCreate, Read, Resp, false),
             (RequestHeaders, Read, Req, true),
@@ -189,18 +264,47 @@ mod tests {
     }
 
     #[test]
-    fn log_without_a_response_reads_an_empty_map() {
-        let mut s = stream(false);
+    fn a_map_that_is_not_available_reads_as_an_empty_map() {
+        let cases = [
+            (Callback::RequestBody, MapType::HttpResponseHeaders),
+            (Callback::ResponseBody, MapType::HttpResponseHeaders),
+            (Callback::ResponseBody, MapType::HttpResponseTrailers),
+            (Callback::ResponseTrailers, MapType::HttpRequestTrailers),
+        ];
 
-        let map = s
-            .header_map(
-                call(Callback::Log),
-                Access::Read,
-                MapType::HttpResponseHeaders,
-            )
-            .unwrap();
+        for (callback, map) in cases {
+            let mut s = stream(true);
 
-        assert!(map.is_empty());
+            let map = s.header_map(call(callback), Access::Read, map).unwrap();
+
+            assert!(map.is_empty(), "{callback:?}");
+        }
+    }
+
+    #[test]
+    fn buffer_follows_the_table() {
+        use BufferType::{HttpRequestBody as Req, HttpResponseBody as Resp};
+        let cases = [
+            (Callback::RequestBody, Req, true),
+            (Callback::RequestBody, Resp, false),
+            (Callback::ResponseBody, Resp, true),
+            (Callback::ResponseBody, Req, false),
+            (Callback::RequestHeaders, Req, false),
+            (Callback::ResponseTrailers, Resp, false),
+            (Callback::Log, Resp, false),
+            (Callback::RequestBody, BufferType::DownstreamData, false),
+        ];
+        for (callback, buffer, served) in cases {
+            let mut s = stream(true);
+
+            let status = s
+                .buffer(call(callback), Access::Write, buffer)
+                .map(|_| ())
+                .err();
+
+            let expected = (!served).then_some(Status::NotFound);
+            assert_eq!(status, expected, "{callback:?}");
+        }
     }
 
     fn local(status: u32) -> LocalResponse<'static> {
@@ -232,20 +336,27 @@ mod tests {
     }
 
     #[test]
-    fn send_local_response_refuses_a_bad_status_and_other_callbacks() {
+    fn send_local_response_follows_the_table() {
         let cases = [
-            (Callback::RequestHeaders, 99, Status::BadArgument),
-            (Callback::ResponseHeaders, 403, Status::Unimplemented),
-            (Callback::Log, 403, Status::Unimplemented),
+            (Callback::RequestHeaders, 403, Ok(())),
+            (Callback::RequestBody, 403, Ok(())),
+            (Callback::ResponseHeaders, 403, Ok(())),
+            (Callback::ResponseBody, 403, Ok(())),
+            (Callback::ResponseTrailers, 403, Ok(())),
+            (Callback::RequestHeaders, 99, Err(Status::BadArgument)),
+            (Callback::ResponseBody, 99, Err(Status::BadArgument)),
+            (Callback::Done, 403, Err(Status::Unimplemented)),
+            (Callback::Log, 403, Err(Status::Unimplemented)),
+            (Callback::ContextCreate, 403, Err(Status::Unimplemented)),
         ];
 
-        for (callback, status, refusal) in cases {
+        for (callback, status, expected) in cases {
             let mut s = stream(true);
 
             let result = s.send_local_response(call(callback), local(status));
 
-            assert_eq!(result, Err(refusal));
-            assert!(s.plugin_response.is_none());
+            assert_eq!(result, expected, "{callback:?}");
+            assert_eq!(s.plugin_response.is_some(), expected.is_ok());
         }
     }
 }

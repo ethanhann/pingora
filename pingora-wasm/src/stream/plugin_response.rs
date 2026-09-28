@@ -71,13 +71,15 @@ pub async fn write_plugin_response<DS: DownstreamSession>(
     body: Bytes,
 ) -> Result<()> {
     if session.req_header().method == Method::HEAD || body.is_empty() {
-        return session.write_response_header(header, true).await;
+        session.write_response_header(header, true).await?;
+        // An HTTP/2 stream needs an end of stream after the header
+        return session.write_response_body(None, true).await;
     }
     session.write_response_header(header, false).await?;
     session.write_response_body(Some(body), true).await
 }
 
-/// Whether `status` ends a response, which is true from 200 to 599.
+/// Return `true` when `status` ends a response, which is true from 200 to 599.
 fn is_final(status: &StatusCode) -> bool {
     status.is_success()
         || status.is_redirection()

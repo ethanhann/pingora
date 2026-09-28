@@ -118,6 +118,7 @@ impl WasmRuntime {
                         spec,
                         plugin.plugin_config(),
                         plugin.slots,
+                        plugin.phase_conf(),
                     )
                 })
                 .collect::<Result<Vec<_>>>()

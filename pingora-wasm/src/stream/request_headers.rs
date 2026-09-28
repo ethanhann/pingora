@@ -108,7 +108,7 @@ fn set_request_pseudo(
     }
 }
 
-/// Whether a guest can write `value` as `:path`. It must be in origin form, or `*`, as an
+/// Return `true` when a guest can write `value` as `:path`. It must be in origin form, or `*`, as an
 /// HTTP/2 `:path` must be.
 fn is_origin_path(value: &[u8]) -> bool {
     (value.first() == Some(&b'/') || value == b"*")

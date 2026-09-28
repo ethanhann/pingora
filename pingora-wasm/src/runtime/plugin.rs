@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::pool::PhaseConf;
 use pingora_error::{Error, ErrorType, Result};
 use proxy_wasm_host::abi::v0_2_1::types::LogLevel;
 use proxy_wasm_host::abi::v0_2_1::{LogSink, PluginConfig, SharedServices, VmServices};
 use proxy_wasm_host::Limits;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+const BODY_LIMIT: usize = 1024 * 1024;
 
 /// The configuration of one Proxy-Wasm plugin.
 ///
@@ -47,13 +50,34 @@ pub struct WasmPluginConf {
     /// The number of guests. A guest runs one callback at a time, so set this to the thread
     /// count of the service that uses the plugin.
     pub slots: usize,
+    /// Whether to run the plugin on request bodies. Default `false`.
+    ///
+    /// The plugin runs `proxy_on_request_body` once for each chunk of a request body. A guest runs
+    /// one callback at a time, so a chunk waits while another request runs a callback in the same
+    /// guest. The wait can be as long as the CPU time in [limits](Self::limits). Turn this on only
+    /// for a plugin that reads request bodies, and set [slots](Self::slots) to the thread count of
+    /// the service.
+    pub request_body: bool,
+    /// Whether to run the plugin on response bodies. Default `false`.
+    ///
+    /// The plugin runs `proxy_on_response_body` once for each chunk of a response body, with the
+    /// same wait as [request_body](Self::request_body).
+    pub response_body: bool,
+    /// Whether to run the plugin on response trailers. Default `false`.
+    pub response_trailers: bool,
+    /// The most request body bytes that the plugin can hold while it pauses the body. Default 1
+    /// MiB.
+    pub request_body_limit: usize,
+    /// The most response body bytes that the plugin can hold while it pauses the body. Default 1
+    /// MiB.
+    pub response_body_limit: usize,
 }
 
 impl WasmPluginConf {
     /// Create the configuration of the plugin at `path`.
     ///
     /// The plugin has one slot, its name as the VM id, no configuration, the log level `Info`,
-    /// and the default limits.
+    /// and the default limits. It runs on headers and not on bodies.
     pub fn new(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
         let name = name.into();
         WasmPluginConf {
@@ -66,6 +90,11 @@ impl WasmPluginConf {
             log_level: LogLevel::Info,
             limits: Limits::default(),
             slots: 1,
+            request_body: false,
+            response_body: false,
+            response_trailers: false,
+            request_body_limit: BODY_LIMIT,
+            response_body_limit: BODY_LIMIT,
         }
     }
 
@@ -82,7 +111,23 @@ impl WasmPluginConf {
                 format!("wasm plugin {} sets a fuel limit", self.name),
             );
         }
+        if self.request_body_limit == 0 || self.response_body_limit == 0 {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                format!("wasm plugin {} has a body limit of zero", self.name),
+            );
+        }
         Ok(())
+    }
+
+    pub(crate) fn phase_conf(&self) -> PhaseConf {
+        PhaseConf {
+            request: self.request_body,
+            response: self.response_body,
+            trailers: self.response_trailers,
+            request_limit: self.request_body_limit,
+            response_limit: self.response_body_limit,
+        }
     }
 
     pub(crate) fn plugin_config(&self) -> PluginConfig {
@@ -121,19 +166,34 @@ mod tests {
         assert_eq!(conf.log_level, LogLevel::Info);
         assert_eq!(conf.slots, 1);
         assert_eq!(conf.limits.fuel(), None);
+        assert!(!conf.request_body && !conf.response_body && !conf.response_trailers);
+        assert_eq!(conf.request_body_limit, BODY_LIMIT);
+        assert_eq!(conf.response_body_limit, BODY_LIMIT);
     }
 
     #[test]
-    fn check_refuses_zero_slots_and_a_fuel_limit() {
+    fn check_refuses_zero_slots_a_fuel_limit_and_a_zero_body_limit() {
         let mut zero = WasmPluginConf::new("zero", "zero.wasm");
         zero.slots = 0;
         let mut fuel = WasmPluginConf::new("fuel", "fuel.wasm");
         fuel.limits = Limits::default().with_fuel(1000);
+        let mut request = WasmPluginConf::new("request", "request.wasm");
+        request.request_body_limit = 0;
+        let mut response = WasmPluginConf::new("response", "response.wasm");
+        response.response_body_limit = 0;
 
-        let errors = [zero.check(), fuel.check()].map(|r| r.unwrap_err().to_string());
+        let errors = [
+            zero.check(),
+            fuel.check(),
+            request.check(),
+            response.check(),
+        ]
+        .map(|r| r.unwrap_err().to_string());
 
         assert!(errors[0].contains("wasm plugin zero has zero slots"));
         assert!(errors[1].contains("wasm plugin fuel sets a fuel limit"));
+        assert!(errors[2].contains("wasm plugin request has a body limit of zero"));
+        assert!(errors[3].contains("wasm plugin response has a body limit of zero"));
     }
 
     #[test]

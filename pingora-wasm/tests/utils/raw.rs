@@ -1,0 +1,136 @@
+// Copyright 2026 Cloudflare, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! A client that writes a request in parts, so that a test controls each body chunk.
+
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+const CHUNK_PAUSE: Duration = Duration::from_millis(50);
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const END_OF_CHUNKS: &str = "0\r\n\r\n";
+
+/// A response as the client read it.
+pub struct RawResponse {
+    pub status: u16,
+    pub head: String,
+    pub body: String,
+}
+
+fn parse(response: &[u8]) -> RawResponse {
+    let text = String::from_utf8_lossy(response);
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let status = head.split(' ').nth(1).and_then(|code| code.parse().ok());
+    RawResponse {
+        status: status.unwrap_or_else(|| panic!("no status in the response {text:?}")),
+        head: head.to_ascii_lowercase(),
+        body: body.to_string(),
+    }
+}
+
+/// Read until `done` accepts what arrived, the peer closes, or the timeout passes.
+async fn read_until(stream: &mut TcpStream, timeout: Duration, done: fn(&[u8]) -> bool) -> Vec<u8> {
+    let mut response = Vec::new();
+    let mut part = [0u8; 4096];
+    let read = async {
+        while !done(&response) {
+            match stream.read(&mut part).await {
+                Ok(n) if n > 0 => response.extend_from_slice(&part[..n]),
+                _ => break,
+            }
+        }
+    };
+    let _ = tokio::time::timeout(timeout, read).await;
+    response
+}
+
+fn never(_: &[u8]) -> bool {
+    false
+}
+
+fn chunked_body_ended(response: &[u8]) -> bool {
+    response.ends_with(END_OF_CHUNKS.as_bytes())
+}
+
+/// Send a request with a chunked body through the proxy on `port`, and return the response.
+///
+/// The client waits after each chunk, so that the proxy runs the body filter once for each chunk.
+/// It stops sending when a response arrives.
+pub async fn send_chunks(
+    port: u16,
+    origin: u16,
+    method: &str,
+    headers: &[(&str, &str)],
+    chunks: &[&str],
+) -> RawResponse {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut head = format!(
+        "{method} / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\
+         Transfer-Encoding: chunked\r\nx-return-body: 1\r\nx-test-origin: {origin}\r\n"
+    );
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    for chunk in chunks.iter().chain(&[""]) {
+        let framed = format!("{:x}\r\n{chunk}\r\n", chunk.len());
+        if stream.write_all(framed.as_bytes()).await.is_err() {
+            break;
+        }
+        let _ = stream.flush().await;
+        response = read_until(&mut stream, CHUNK_PAUSE, never).await;
+        if !response.is_empty() {
+            break;
+        }
+    }
+    response.extend(read_until(&mut stream, RESPONSE_TIMEOUT, never).await);
+    parse(&response)
+}
+
+/// Send one POST for each body on one connection, and return the responses.
+///
+/// The proxy must send each response with a chunked body.
+pub async fn post_on_one_connection(port: u16, origin: u16, bodies: &[&str]) -> Vec<RawResponse> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut responses = Vec::new();
+    for body in bodies {
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: example.test\r\nContent-Length: {}\r\n\
+             x-return-body: 1\r\nx-test-origin: {origin}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let response = read_until(&mut stream, RESPONSE_TIMEOUT, chunked_body_ended).await;
+        responses.push(parse(&response));
+    }
+    responses
+}
+
+/// Return the bytes of a chunked body.
+pub fn unchunk(body: &str) -> String {
+    let mut all = String::new();
+    let mut rest = body;
+    while let Some((size, after)) = rest.split_once("\r\n") {
+        let size = usize::from_str_radix(size, 16).unwrap_or(0);
+        if size == 0 || after.len() < size {
+            break;
+        }
+        all.push_str(&after[..size]);
+        rest = after[size..].trim_start_matches("\r\n");
+    }
+    all
+}
