@@ -30,9 +30,12 @@ impl WasmCtx {
     /// replace the body, and can read the request headers.
     ///
     /// A plugin can pause to wait for more of the body. This phase then holds the bytes for the
-    /// plugin and leaves an empty chunk for the upstream. On the next body_chunk, the plugin reads the
+    /// plugin and leaves an empty chunk for the upstream. On the next chunk, the plugin reads the
     /// bytes it paused on and the new bytes together. A plugin can hold up to
     /// [request_body_limit](crate::WasmPluginConf::request_body_limit) bytes.
+    ///
+    /// A plugin can also pause a chunk while it waits for a callout, and this phase waits with
+    /// it. When the plugin continues, the bytes that it holds go to the next plugin.
     ///
     /// Pingora sends the request header to the upstream before it reads the body. A plugin that
     /// changes the length of the body must remove `content-length` in `proxy_on_request_headers`.
@@ -48,9 +51,9 @@ impl WasmCtx {
     /// # Errors
     ///
     /// An error of type [ERR_PLUGIN_FAILED] when a plugin traps or fails, when a plugin pauses the
-    /// last chunk of a body, or when [WasmCtx::upstream_attempt] did not run. An error of type
-    /// [ERR_REQUEST_BODY_TOO_LARGE](crate::ERR_REQUEST_BODY_TOO_LARGE) when a plugin holds more
-    /// bytes than its limit.
+    /// last chunk of a body and does not continue, or when [WasmCtx::upstream_attempt] did not
+    /// run. An error of type [ERR_REQUEST_BODY_TOO_LARGE](crate::ERR_REQUEST_BODY_TOO_LARGE) when
+    /// a plugin holds more bytes than its limit.
     pub async fn request_body_filter<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -62,6 +65,7 @@ impl WasmCtx {
         {
             return Ok(());
         }
+        self.refuse_after_cancelled_wait()?;
         if self.request_body.attempts == 0 {
             return Error::e_explain(
                 ERR_PLUGIN_FAILED,
@@ -92,7 +96,10 @@ impl WasmCtx {
         self.request_body.progress = RequestBodyProgress::Streaming;
         self.chain.runtime.start_ticker()?;
         let chunk = body.take().unwrap_or_default();
-        match self.body_pass(session, BodyDirection::Request, chunk, end_of_stream)? {
+        let ran = self
+            .run_body_callbacks(session, BodyDirection::Request, chunk, end_of_stream)
+            .await?;
+        match ran {
             BodyOutcome::Released(output) => {
                 if end_of_stream {
                     self.request_body.progress = RequestBodyProgress::Ended;
@@ -127,7 +134,7 @@ mod tests {
         vec![body_plugin("a", Wat::request_body(TEAPOT))]
     }
 
-    /// Run the request body phase on each body_chunk, and return what it leaves for Pingora.
+    /// Run the request body phase on each chunk, and return what it leaves for Pingora.
     async fn filter(
         ctx: &mut WasmCtx,
         session: &mut Session,

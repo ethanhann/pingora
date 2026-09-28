@@ -44,12 +44,77 @@
 //! Pingora logs the error of a request unless `suppress_error_log` returns `true`. You can
 //! return [WasmCtx::plugin_responded] from it, as the example below does.
 //!
+//! # When a plugin calls another service
+//!
+//! A plugin can pause a request, send an HTTP request of its own to another service, and use
+//! the response to decide whether the request continues. That HTTP request is a callout. A
+//! typical example is an authorization plugin that asks a policy service about each request.
+//!
+//! The plugin refers to the service by an upstream name, such as `authz`. List the upstreams
+//! that your plugins can call in [WasmServices::callout_upstreams]:
+//!
+//! ```no_run
+//! use pingora_core::upstreams::peer::HttpPeer;
+//! use pingora_wasm::{StaticCalloutUpstreams, WasmPluginConf, WasmRuntime, WasmServices};
+//! use std::sync::Arc;
+//!
+//! # fn main() -> pingora_core::Result<()> {
+//! let mut upstreams = StaticCalloutUpstreams::new();
+//! upstreams.insert("authz", HttpPeer::new("10.0.0.5:8181", false, String::new()));
+//! let mut services = WasmServices::default();
+//! services.callout_upstreams = Arc::new(upstreams);
+//! let plugins = vec![WasmPluginConf::new("auth", "auth.wasm")];
+//! let runtime = WasmRuntime::new_with_services(plugins, services)?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! To select a backend for each callout, for example with a load balancer, implement
+//! [CalloutUpstreams]. To send callouts to a peer over TLS, turn on one of the TLS features of
+//! this crate, such as `openssl` or `rustls`. Without one, a callout to a TLS peer fails at its
+//! timeout.
+//!
+//! While a plugin waits for a callout, the phase that ran the plugin waits with it, and your
+//! filter returns once the plugin continues or sends a response. A callout can take as long as
+//! the timeout that the plugin passes, up to [WasmPluginConf::callout_timeout_limit]. If an
+//! HTTP/2 client resets its stream during the wait, the phase returns an error at once. Pingora
+//! cannot see that an HTTP/1 client disconnected until it writes to it, so the phase waits for
+//! the callout to end, and the write of the response then fails.
+//!
+//! [WasmCtx::request_body_filter], [WasmCtx::response_filter], and
+//! [WasmCtx::response_body_filter] run while Pingora reads from the upstream. Pingora fails the
+//! request when the upstream is silent for the `read_timeout` of its peer. For a plugin that
+//! sends callouts from these phases, keep [WasmPluginConf::callout_timeout_limit] below that
+//! timeout.
+//!
+//! If the future of a phase is dropped while a plugin waits for a callout, the request cannot
+//! continue. Pingora drops the future of a body filter when the upstream fails, and you may drop
+//! one with a timeout of your own. Every later phase of that request except [WasmCtx::logging]
+//! then returns an error of type [ERR_PLUGIN_FAILED], so end the request.
+//!
+//! A plugin can also send a callout and continue, for example to report a request to an audit
+//! service. The callout is sent, but the plugin does not receive its response. It receives a
+//! failed result for the callout when its context ends. A callout from `proxy_on_log` may not
+//! be sent when the server stops.
+//!
+//! A plugin cannot send a callout from its root context, for example from `proxy_on_vm_start`
+//! or `proxy_on_configure`. `proxy_http_call` returns `INTERNAL_FAILURE` for it, and a plugin
+//! that does not handle that status fails to start.
+//!
+//! The runtime sends at most [WasmServices::max_callouts_in_flight] callouts at the same time.
+//! Each guest accepts at most `max_open_callouts` of its [limits](WasmPluginConf::limits) open
+//! callouts, so at most that number of requests can wait in each of the plugin's
+//! [slots](WasmPluginConf::slots). If more requests of a plugin wait at the same time, raise
+//! the number of slots or that limit.
+//!
 //! # When a plugin fails
 //!
 //! A phase returns an error of type [ERR_PLUGIN_FAILED] when a plugin traps or returns an error,
 //! and Pingora responds with 503.
 //!
-//! A plugin that pauses a body holds its bytes, up to a limit. Past
+//! A plugin that pauses and has no callout to wait for cannot continue, so the phase returns
+//! the same error. The body phases are different. A plugin can pause a body to hold its bytes
+//! until the last chunk arrives, up to a limit. Past
 //! [WasmPluginConf::request_body_limit], [WasmCtx::request_body_filter] returns an error of type
 //! [ERR_REQUEST_BODY_TOO_LARGE], and Pingora responds with 413. Past
 //! [WasmPluginConf::response_body_limit], [WasmCtx::response_body_filter] returns an error of
@@ -158,17 +223,19 @@
 //! # }
 //! ```
 
+mod callout;
 mod chain;
 mod runtime;
 mod stream;
 #[cfg(test)]
 mod test_support;
 
+pub use callout::{CalloutTarget, CalloutUpstreams, StaticCalloutUpstreams};
 pub use chain::{RequestOutcome, WasmChain, WasmCtx};
 pub use proxy_wasm_host::abi::v0_2_1::types::LogLevel;
 pub use proxy_wasm_host::abi::v0_2_1::{LogContext, LogSink};
 pub use proxy_wasm_host::Limits;
-pub use runtime::{WasmPluginConf, WasmRuntime};
+pub use runtime::{WasmPluginConf, WasmRuntime, WasmServices};
 pub use stream::write_plugin_response;
 
 use http::StatusCode;

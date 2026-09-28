@@ -13,17 +13,19 @@
 // limitations under the License.
 
 use crate::chain::slot::LockedSlot;
+use crate::chain::wait::{CalloutWaitOutcome, PausedPhase};
 use crate::chain::{ResponseProgress, WasmCtx};
-use crate::plugin_unavailable;
 use crate::stream::ResponseTrailers;
 use bytes::{Bytes, BytesMut};
 use log::{error, warn};
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_error::Result;
 use pingora_proxy::Session;
-use proxy_wasm_host::abi::v0_2_1::types::Action;
+use proxy_wasm_host::abi::v0_2_1::types::StreamType;
 use proxy_wasm_host::HeaderMap;
 use std::mem;
+
+const PAUSED_THE_TRAILERS: &str = "paused the trailers";
 
 impl WasmCtx {
     /// Run `proxy_on_response_trailers` of each plugin, in reverse chain order.
@@ -33,15 +35,19 @@ impl WasmCtx {
     /// turned on run. Plugins can read and change the trailers, and can read the request headers.
     ///
     /// Call it when you run plugins on response bodies, too. A response with trailers ends with the
-    /// trailers and not with a last body body_chunk, so a plugin that paused the body still holds bytes
+    /// trailers and not with a last body chunk, so a plugin that paused the body still holds bytes
     /// here. This phase returns those bytes, and Pingora writes them to the downstream in place of
     /// the trailers.
+    ///
+    /// A plugin can pause the trailers while it waits for a callout, and this phase waits with
+    /// it.
     ///
     /// # Errors
     ///
     /// An error of type [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) when a plugin traps, fails,
-    /// pauses, or sends its own response. Pingora logs an error from `response_trailer_filter` and
-    /// sends the trailers, so end the response in your filter if the trailers must not go out.
+    /// or sends its own response, or when a plugin pauses and has no callout to wait for.
+    /// Pingora logs an error from `response_trailer_filter` and sends the trailers, so end the
+    /// response in your filter if the trailers must not go out.
     ///
     /// When a plugin holds body bytes, this phase logs the failure and returns the bytes, so that
     /// the downstream receives the whole body.
@@ -55,10 +61,10 @@ impl WasmCtx {
         {
             return Ok(None);
         }
-        let mut passed = Ok(());
-        if self.chain.phases.response_trailers {
+        let mut passed = self.refuse_after_cancelled_wait();
+        if passed.is_ok() && self.chain.phases.response_trailers {
             self.chain.runtime.start_ticker()?;
-            passed = self.trailer_pass(session, trailers);
+            passed = self.run_trailer_callbacks(session, trailers).await;
         }
         match (passed, self.release_held()) {
             (Err(e), None) => Err(e),
@@ -70,13 +76,39 @@ impl WasmCtx {
         }
     }
 
-    fn trailer_pass<DS: DownstreamSession>(
+    /// Run the trailer callback of each plugin, in reverse chain order, and wait for the
+    /// callouts of a plugin that pauses to wait for them.
+    async fn run_trailer_callbacks<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
         trailers: &mut http::HeaderMap,
     ) -> Result<()> {
+        let mut remaining = self.records.len();
+        while let Some(position) = self.run_trailer_callbacks_of(session, trailers, remaining)? {
+            let phase = PausedPhase::ResponseTrailers(&mut *trailers);
+            match self.wait_for_callouts(session, position, phase).await? {
+                CalloutWaitOutcome::Continued => remaining = position,
+                CalloutWaitOutcome::StillPaused => {
+                    return Err(self.plugin_error(position, PAUSED_THE_TRAILERS))
+                }
+                CalloutWaitOutcome::Respond(_) => return Err(self.late_response_error(position)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Run the trailer callback of the first `remaining` plugins of the chain, in reverse
+    /// order.
+    ///
+    /// Return the position of a plugin that paused and has a callout to wait for.
+    fn run_trailer_callbacks_of<DS: DownstreamSession>(
+        &mut self,
+        session: &mut Session<DS>,
+        trailers: &mut http::HeaderMap,
+        remaining: usize,
+    ) -> Result<Option<usize>> {
         let runtime = self.chain.runtime.clone();
-        for position in (0..self.records.len()).rev() {
+        for position in (0..remaining).rev() {
             let Some(record) = self.records[position] else {
                 continue;
             };
@@ -85,12 +117,12 @@ impl WasmCtx {
                 continue;
             }
             let mut locked = LockedSlot::of_request(pool, &record)?;
-            let guest = &mut locked.loaded()?.guest;
+            let loaded = locked.loaded()?;
             let map = ResponseTrailers::new(mem::take(trailers));
             let count = u32::try_from(map.len()).unwrap_or(u32::MAX);
             self.stream().trailers = Some(map);
             self.request_in(session.req_header_mut());
-            let action = self.run(guest, |scope| {
+            let action = self.run_for_context(loaded, record.context, |scope| {
                 scope.on_response_trailers(record.context, count)
             });
             self.request_out(session.req_header_mut());
@@ -98,16 +130,26 @@ impl WasmCtx {
                 *trailers = map.trailers;
             }
             let sent = self.stream().plugin_response.take();
-            match action {
+            let action = match action {
+                Ok(action) => action,
                 Err(e) => return Err(locked.guest_failure("failed in on_response_trailers", e)),
-                Ok(_) if sent.is_some() => return Err(self.late_response_error(position)),
-                Ok(Action::Pause) => {
-                    return Err(plugin_unavailable(&pool.name, "paused the trailers"))
-                }
-                Ok(_) => {}
+            };
+            drop(locked);
+            let paused =
+                sent.is_none() && self.plugin_stays_paused(action, StreamType::HttpResponse);
+            self.start_callouts(position, paused);
+            if sent.is_some() {
+                return Err(self.late_response_error(position));
             }
+            if !paused {
+                continue;
+            }
+            if self.waits_for_callout(position) {
+                return Ok(Some(position));
+            }
+            return Err(self.plugin_error(position, PAUSED_THE_TRAILERS));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Take the response body bytes that the plugins hold, in the order of the stream.
@@ -120,7 +162,6 @@ impl WasmCtx {
         if size == 0 {
             return None;
         }
-        let pools = &self.chain.runtime.pools;
         let mut all = BytesMut::with_capacity(size);
         for (position, bytes) in held.iter().enumerate() {
             if bytes.is_empty() {
@@ -128,7 +169,7 @@ impl WasmCtx {
             }
             warn!(
                 "wasm plugin {} held {} body bytes, sent in place of the response trailers",
-                pools[self.chain.plugins[position]].name,
+                self.pool_at(position).name,
                 bytes.len()
             );
             all.extend_from_slice(bytes);

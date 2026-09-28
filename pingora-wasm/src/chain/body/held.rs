@@ -55,6 +55,15 @@ impl HeldBodies {
         mem::take(&mut self.response)
     }
 
+    /// Return the number of bytes that the plugin at `position` holds.
+    pub(crate) fn len(&self, direction: BodyDirection, position: usize) -> usize {
+        let list = match direction {
+            BodyDirection::Request => &self.request,
+            BodyDirection::Response => &self.response,
+        };
+        list.get(position).map_or(0, Vec::len)
+    }
+
     pub(crate) fn request_len(&self) -> usize {
         self.request.iter().map(Vec::len).sum()
     }

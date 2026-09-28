@@ -12,15 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{WasmCtx, WasmPluginConf, WasmRuntime};
+pub(crate) mod callouts;
+mod session;
+
+pub(crate) use session::{
+    read_downstream, read_downstream_after_marker, session, GET, HEAD, MARKER_RESPONSE, POST,
+    UPGRADE,
+};
+
+use crate::{LogContext, LogLevel, LogSink, WasmCtx, WasmPluginConf, WasmRuntime};
 use bytes::Bytes;
+use parking_lot::Mutex;
 use pingora_proxy::Session;
 use proxy_wasm_host::HeaderMap;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::DuplexStream;
 
 pub(crate) fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -37,6 +45,7 @@ pub(crate) fn plugin(name: &str, path: PathBuf, slots: usize) -> WasmPluginConf 
 /// The body of each callback of a small guest, in WAT.
 ///
 /// The guest is the template `tests/fixtures/guest.wat` with these callbacks.
+#[derive(Clone, Copy)]
 pub(crate) struct Wat {
     pub(crate) abi: bool,
     pub(crate) vm_start: &'static str,
@@ -47,6 +56,8 @@ pub(crate) struct Wat {
     pub(crate) response_headers: Option<&'static str>,
     pub(crate) response_body: Option<&'static str>,
     pub(crate) response_trailers: Option<&'static str>,
+    pub(crate) http_call_response: Option<&'static str>,
+    pub(crate) log: Option<&'static str>,
 }
 
 pub(crate) const CONTINUE: &str = "i32.const 0";
@@ -87,6 +98,8 @@ impl Default for Wat {
             response_headers: None,
             response_body: None,
             response_trailers: None,
+            http_call_response: None,
+            log: None,
         }
     }
 }
@@ -121,7 +134,13 @@ impl Wat {
     }
 }
 
-const TEMPLATE: &str = include_str!("../tests/fixtures/guest.wat");
+const TEMPLATE: &str = include_str!("../../tests/fixtures/guest.wat");
+
+/// Return a callback that returns nothing, or the empty callback that the template needs.
+fn export_with_no_result(name: &str, params: &str, body: Option<&str>) -> String {
+    let body = body.unwrap_or_default();
+    format!(r#"(func (export "{name}") (param {params}) {body})"#)
+}
 
 fn export(name: &str, params: &str, body: Option<&str>) -> String {
     match body {
@@ -156,6 +175,12 @@ pub(crate) fn wat_guest(label: &str, guest: Wat) -> PathBuf {
             guest.response_trailers,
         ),
         export("proxy_on_done", "i32", Some(guest.done)),
+        export_with_no_result(
+            "proxy_on_http_call_response",
+            "i32 i32 i32 i32 i32",
+            guest.http_call_response,
+        ),
+        export_with_no_result("proxy_on_log", "i32", guest.log),
     ]
     .join("\n");
     let wat = TEMPLATE.replace("\nCALLBACKS\n", &format!("\n{callbacks}\n"));
@@ -168,23 +193,6 @@ pub(crate) fn wat_guest(label: &str, guest: Wat) -> PathBuf {
     std::fs::write(&path, wat::parse_str(wat).unwrap()).unwrap();
     path
 }
-
-/// Build a session that has read `request`, and return it with the client end of its
-/// connection.
-pub(crate) async fn session(request: &[u8]) -> (Session, DuplexStream) {
-    let (mut client, server) = tokio::io::duplex(4096);
-    client.write_all(request).await.unwrap();
-    let mut session = Session::new_h1(Box::new(server));
-    session.read_request().await.unwrap();
-    (session, client)
-}
-
-pub(crate) const GET: &[u8] = b"GET /original HTTP/1.1\r\nHost: example.test\r\n\r\n";
-pub(crate) const POST: &[u8] =
-    b"POST /original HTTP/1.1\r\nHost: example.test\r\nContent-Length: 100\r\n\r\n";
-pub(crate) const HEAD: &[u8] = b"HEAD /original HTTP/1.1\r\nHost: example.test\r\n\r\n";
-pub(crate) const UPGRADE: &[u8] = b"GET /original HTTP/1.1\r\nHost: example.test\r\n\
-Connection: upgrade\r\nUpgrade: websocket\r\n\r\n";
 
 /// Build the configuration of a WAT plugin that runs every body phase.
 pub(crate) fn body_plugin(name: &str, wat: Wat) -> WasmPluginConf {
@@ -213,38 +221,6 @@ pub(crate) async fn start_request(
     ctx.request_filter(&mut session).await.unwrap();
     ctx.upstream_attempt();
     (runtime, ctx, session, client)
-}
-
-/// Write a response with the status 204 to the session, and return what the downstream received.
-///
-/// When the text starts with [MARKER_RESPONSE], nothing was written before the 204.
-pub(crate) async fn read_downstream_after_marker(
-    session: &mut Session,
-    client: &mut DuplexStream,
-) -> String {
-    let marker = pingora_http::ResponseHeader::build(204, None).unwrap();
-    session
-        .write_response_header(Box::new(marker), true)
-        .await
-        .unwrap();
-    read_downstream(client).await
-}
-
-pub(crate) const MARKER_RESPONSE: &str = "HTTP/1.1 204";
-
-/// Return what the downstream received so far, as text.
-pub(crate) async fn read_downstream(client: &mut DuplexStream) -> String {
-    let mut all = Vec::new();
-    let mut part = [0u8; 1024];
-    while let Ok(Ok(n)) =
-        tokio::time::timeout(Duration::from_millis(50), client.read(&mut part)).await
-    {
-        if n == 0 {
-            break;
-        }
-        all.extend_from_slice(&part[..n]);
-    }
-    String::from_utf8_lossy(&all).into_owned()
 }
 
 /// Build a runtime with one plugin named `a`, and a request context from a chain of it.
@@ -284,4 +260,27 @@ pub(crate) fn pairs(map: &dyn HeaderMap) -> Vec<(String, String)> {
 pub(crate) fn get(map: &dyn HeaderMap, key: &str) -> Option<String> {
     map.get(key.as_bytes())
         .map(|v| String::from_utf8_lossy(&v).into_owned())
+}
+
+/// The lines that guests logged.
+#[derive(Default)]
+pub(crate) struct RecordedGuestLogs(pub(crate) Mutex<Vec<String>>);
+
+impl LogSink for RecordedGuestLogs {
+    fn log(&self, _context: LogContext<'_>, _level: LogLevel, message: &[u8]) {
+        self.0
+            .lock()
+            .push(String::from_utf8_lossy(message).into_owned());
+    }
+}
+
+/// Wait until `check` returns true, for up to five seconds.
+pub(crate) async fn eventually(check: impl Fn() -> bool) -> bool {
+    for _ in 0..500 {
+        if check() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    check()
 }

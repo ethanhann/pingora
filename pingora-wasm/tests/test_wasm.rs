@@ -16,8 +16,12 @@ mod utils;
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use utils::raw::{decode_chunked_body, post_on_one_connection, send_chunked_request};
-use utils::{client, closing_peer, echo_origin, eventually, guest_lines, init, runtime, url};
+use utils::raw::{
+    decode_chunked_body, post_on_one_connection, send_chunked_request, send_get_without_reading,
+};
+use utils::{
+    callout_origin, client, closing_peer, echo_origin, eventually, guest_lines, init, runtime, url,
+};
 
 fn header(response: &reqwest::Response, name: &str) -> Option<String> {
     response
@@ -330,4 +334,101 @@ async fn a_plugin_response_with_no_body_ends_an_h2_stream() {
     assert_eq!(res.status(), 418);
     assert_eq!(res.version(), reqwest::Version::HTTP_2);
     assert_eq!(res.bytes().await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn a_plugin_allows_a_request_after_its_callout() {
+    init().await;
+    let (origin, _) = echo_origin().await;
+
+    let res = get(6397, "/", origin.addr().port(), &[]).await;
+
+    assert_eq!(res.status(), 200);
+    assert_eq!(all(&res, "powered-by"), ["proxy-wasm"]);
+    let callouts = callout_origin("auth-even").requests();
+    assert_eq!(
+        callouts,
+        [("/bytes/1".to_string(), "httpbin.org".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn a_plugin_denies_a_request_after_its_callout() {
+    init().await;
+    let (origin, count) = echo_origin().await;
+
+    let res = get(6398, "/", origin.addr().port(), &[]).await;
+
+    assert_eq!(res.status(), 403);
+    assert_eq!(all(&res, "powered-by"), ["proxy-wasm"]);
+    assert_eq!(res.text().await.unwrap(), "Access forbidden.\n");
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_callout_ends_at_the_timeout_of_its_plugin() {
+    init().await;
+    let (origin, count) = echo_origin().await;
+    // The plugin passes 1 second, and the limit of its callouts is 10 seconds
+    let before_the_limit = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let request = before_the_limit
+        .get(url(6399, "/"))
+        .header("x-test-origin", origin.addr().port().to_string());
+
+    let res = request.send().await.unwrap();
+
+    assert_eq!(res.status(), 403);
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    assert_eq!(callout_origin("auth-no-response").requests().len(), 1);
+}
+
+#[tokio::test]
+async fn a_callout_ends_at_the_limit_with_a_response_for_its_plugin() {
+    init().await;
+    let (origin, _) = echo_origin().await;
+
+    let res = get(6400, "/", origin.addr().port(), &[]).await;
+
+    assert_eq!(res.status(), 418);
+    assert_eq!(res.text().await.unwrap(), "upstream request timeout");
+}
+
+#[tokio::test]
+async fn a_request_whose_h1_client_left_ends_with_its_callout() {
+    init().await;
+    let (origin, _) = echo_origin().await;
+    let connection = send_get_without_reading(6401, origin.addr().port()).await;
+    callout_origin("relay-h1-close").wait_for_a_request().await;
+
+    drop(connection);
+
+    let runtime = runtime(6401);
+    assert!(eventually(|| runtime.open_contexts() == 0).await);
+    assert!(eventually(|| runtime.callouts_in_flight() == 0).await);
+}
+
+#[tokio::test]
+async fn a_request_whose_h2_client_left_ends_before_its_callout() {
+    init().await;
+    let (origin, _) = echo_origin().await;
+    let h2 = reqwest::Client::builder()
+        .no_proxy()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let request = h2
+        .get(url(6402, "/"))
+        .header("x-test-origin", origin.addr().port().to_string())
+        .send();
+    let request = tokio::spawn(request);
+    callout_origin("relay-h2-close").wait_for_a_request().await;
+
+    request.abort();
+
+    // The origin never responds, so the callout is in flight until its limit of 10 seconds
+    assert!(eventually(|| runtime(6402).open_contexts() == 0).await);
 }

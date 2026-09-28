@@ -16,6 +16,7 @@
 
 use pingora_wasm::WasmPluginConf;
 use std::path::PathBuf;
+use std::time::Duration;
 
 const TEMPLATE: &str = include_str!("../fixtures/guest.wat");
 const REQUEST_BODY: &str = "proxy_on_request_body";
@@ -25,13 +26,20 @@ const HOLD_THEN_MARK: &str = "(if (result i32) (local.get 2)
     (then (call $mark_a (i32.const 0))) (else (i32.const 1)))";
 const MARK: &str = "(call $mark_a (i32.const 0))";
 const TEAPOT: &str = "(call $respond (i32.const 418))";
+const REQUEST_HEADERS: &str = "proxy_on_request_headers";
+const NO_DELIVERY: &str = "";
+const CALL_AND_PAUSE: &str = "(call $call_authz_and_pause)";
+const RELAY_CALLOUT_BODY: &str = "(call $relay_callout_body (local.get 2) (local.get 3))";
 
-/// Build a guest whose `callback` has the body `body`, and return its path.
-fn wat_guest(label: &str, callback: &str, body: &str) -> PathBuf {
+/// Build a guest whose `callback` has the body `body` and whose
+/// `proxy_on_http_call_response` has the body `delivery`, and return its path.
+fn wat_guest(label: &str, callback: &str, body: &str, delivery: &str) -> PathBuf {
     let callbacks = format!(
         r#"(func (export "proxy_abi_version_0_2_1"))
   (func (export "proxy_on_vm_start") (param i32 i32) (result i32) i32.const 1)
   (func (export "proxy_on_done") (param i32) (result i32) i32.const 1)
+  (func (export "proxy_on_log") (param i32))
+  (func (export "proxy_on_http_call_response") (param i32 i32 i32 i32 i32) {delivery})
   (func (export "{callback}") (param i32 i32 i32) (result i32) {body})"#
     );
     let wat = TEMPLATE.replace("\nCALLBACKS\n", &format!("\n{callbacks}\n"));
@@ -44,7 +52,7 @@ fn wat_guest(label: &str, callback: &str, body: &str) -> PathBuf {
 }
 
 fn guest(name: &str, label: &str, callback: &str, body: &str) -> WasmPluginConf {
-    let mut conf = WasmPluginConf::new(name, wat_guest(label, callback, body));
+    let mut conf = WasmPluginConf::new(name, wat_guest(label, callback, body, NO_DELIVERY));
     conf.slots = 2;
     conf.request_body = callback == REQUEST_BODY;
     conf
@@ -70,4 +78,17 @@ pub fn teapot_for_a_request_body() -> WasmPluginConf {
 /// Build the configuration of a guest that responds to the response headers with 418.
 pub fn teapot_for_a_response() -> WasmPluginConf {
     guest("teapot", "teapot-response", RESPONSE_HEADERS, TEAPOT)
+}
+
+/// Build the configuration of a guest that makes a callout from the request headers, and
+/// responds with the body of the callout response. `timeout_limit` sets the callout timeout
+/// limit of the plugin.
+pub fn relay_callout_body_plugin(name: &str, timeout_limit: Option<Duration>) -> WasmPluginConf {
+    let path = wat_guest(name, REQUEST_HEADERS, CALL_AND_PAUSE, RELAY_CALLOUT_BODY);
+    let mut conf = WasmPluginConf::new(name, path);
+    conf.slots = 2;
+    if let Some(limit) = timeout_limit {
+        conf.callout_timeout_limit = limit;
+    }
+    conf
 }

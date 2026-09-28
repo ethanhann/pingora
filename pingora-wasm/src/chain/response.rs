@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::slot::LockedSlot;
+use super::wait::{CalloutWaitOutcome, PausedPhase};
 use super::{ResponseProgress, WasmCtx};
-use crate::plugin_unavailable;
 use crate::stream::PluginResponse;
 use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::{Method, StatusCode, Version};
@@ -23,9 +23,10 @@ use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_error::Result;
 use pingora_http::ResponseHeader;
 use pingora_proxy::Session;
-use proxy_wasm_host::abi::v0_2_1::types::Action;
+use proxy_wasm_host::abi::v0_2_1::types::StreamType;
 
 const CHUNKED: &str = "chunked";
+const PAUSED_A_RESPONSE: &str = "paused a response";
 
 /// The source of the response header in a response pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +47,9 @@ impl WasmCtx {
     /// adds `transfer-encoding: chunked`, as Pingora does for a response with no length, so that
     /// the downstream connection stays open after the response.
     ///
+    /// A plugin can pause the response while it waits for a callout, and this phase waits until
+    /// the plugin continues or sends its own response.
+    ///
     /// A plugin can send its own response in place of the upstream response. The plugins that did
     /// not run yet are skipped, and this phase writes the response to the downstream. The phase
     /// then returns an error with the status of the response to stop the request, and
@@ -54,9 +58,9 @@ impl WasmCtx {
     ///
     /// # Errors
     ///
-    /// An error of type [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) when a plugin traps, fails,
-    /// or pauses the response, or when the guest that held this request was replaced after a
-    /// failure.
+    /// An error of type [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) when a plugin traps or
+    /// fails, when a plugin pauses the response and has no callout to wait for, or when the
+    /// guest that held this request was replaced after a failure.
     pub async fn response_filter<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -68,28 +72,46 @@ impl WasmCtx {
         {
             return Ok(());
         }
+        self.refuse_after_cancelled_wait()?;
         self.chain.runtime.start_ticker()?;
         self.response_progress = ResponseProgress::FromUpstream;
         let end_of_stream = response_ends(&session.req_header().method, resp);
-        let positions = (0..self.records.len()).rev();
-        match self.response_pass(
-            session,
-            resp,
-            positions,
-            end_of_stream,
-            ResponseSource::Upstream,
-        )? {
-            Some((position, response)) => Err(self
-                .respond_in_place_of_upstream(session, position, response)
-                .await),
-            None => Ok(()),
+        let had_length = resp.headers.contains_key(CONTENT_LENGTH);
+        let mut remaining = self.records.len();
+        loop {
+            let positions = (0..remaining).rev();
+            let origin = ResponseSource::Upstream;
+            let ran = self.response_pass(session, resp, positions, end_of_stream, origin)?;
+            let position = match ran {
+                ResponsePassOutcome::Finished => break,
+                ResponsePassOutcome::Respond(position, response) => {
+                    return Err(self
+                        .respond_in_place_of_upstream(session, position, *response)
+                        .await)
+                }
+                ResponsePassOutcome::WaitsForCallout(position) => position,
+            };
+            let phase = PausedPhase::ResponseHeaders(&mut *resp);
+            match self.wait_for_callouts(session, position, phase).await? {
+                CalloutWaitOutcome::Continued => remaining = position,
+                CalloutWaitOutcome::StillPaused => {
+                    return Err(self.plugin_error(position, PAUSED_A_RESPONSE))
+                }
+                CalloutWaitOutcome::Respond(response) => {
+                    return Err(self
+                        .respond_in_place_of_upstream(session, position, *response)
+                        .await)
+                }
+            }
         }
+        frame_if_length_removed(resp, had_length, end_of_stream)
     }
 
     /// Run `proxy_on_response_headers` of the plugins at `positions`, in that order, on `resp`.
     ///
-    /// Return the response that a plugin sent in place of the upstream response, with the position
-    /// of that plugin. Add chunked framing to `resp` when a plugin removed its `content-length`.
+    /// Stop at the plugin that sends a response in place of the upstream response, and at the
+    /// plugin that pauses to wait for a callout. A plugin cannot wait for a callout on the
+    /// response of a plugin, so the pass does not send the callouts that it receives there.
     pub(super) fn response_pass<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -97,20 +119,19 @@ impl WasmCtx {
         positions: impl Iterator<Item = usize>,
         end_of_stream: bool,
         origin: ResponseSource,
-    ) -> Result<Option<(usize, PluginResponse)>> {
+    ) -> Result<ResponsePassOutcome> {
         let runtime = self.chain.runtime.clone();
-        let had_length = resp.headers.contains_key(CONTENT_LENGTH);
         for position in positions {
             let Some(record) = self.records[position] else {
                 continue;
             };
             let pool = &runtime.pools[self.chain.plugins[position]];
             let mut locked = LockedSlot::of_request(pool, &record)?;
-            let guest = &mut locked.loaded()?.guest;
+            let loaded = locked.loaded()?;
             self.request_in(session.req_header_mut());
             self.response_in(resp);
             let count = self.response_count();
-            let action = self.run(guest, |scope| {
+            let action = self.run_for_context(loaded, record.context, |scope| {
                 scope.on_response_headers(record.context, count, end_of_stream)
             });
             self.response_out(resp);
@@ -120,25 +141,51 @@ impl WasmCtx {
                 Ok(action) => action,
                 Err(e) => return Err(locked.guest_failure("failed in on_response_headers", e)),
             };
+            drop(locked);
+            let paused =
+                sent.is_none() && self.plugin_stays_paused(action, StreamType::HttpResponse);
+            if origin == ResponseSource::Upstream {
+                self.start_callouts(position, paused);
+            }
             match (sent, origin) {
                 (Some(response), ResponseSource::Upstream) => {
-                    return Ok(Some((position, response)))
+                    return Ok(ResponsePassOutcome::Respond(position, Box::new(response)))
                 }
                 (Some(_), ResponseSource::Plugin) => warn!(
                     "wasm plugin {} sent a response in place of a plugin response",
                     pool.name
                 ),
-                (None, _) if action == Action::Pause => {
-                    return Err(plugin_unavailable(&pool.name, "paused a response"))
+                (None, _) if paused && self.waits_for_callout(position) => {
+                    return Ok(ResponsePassOutcome::WaitsForCallout(position))
                 }
+                (None, _) if paused => return Err(self.plugin_error(position, PAUSED_A_RESPONSE)),
                 (None, _) => {}
             }
         }
-        if had_length && !end_of_stream {
-            frame_as_chunked(resp)?;
-        }
-        Ok(None)
+        Ok(ResponsePassOutcome::Finished)
     }
+}
+
+/// The result of [WasmCtx::response_pass].
+pub(super) enum ResponsePassOutcome {
+    /// Every plugin ran.
+    Finished,
+    /// The plugin at this position sent a response in place of the upstream response.
+    Respond(usize, Box<PluginResponse>),
+    /// The plugin at this position paused and has a callout to wait for.
+    WaitsForCallout(usize),
+}
+
+/// Add chunked framing to a response whose `content-length` a plugin removed.
+pub(super) fn frame_if_length_removed(
+    resp: &mut ResponseHeader,
+    had_length: bool,
+    end_of_stream: bool,
+) -> Result<()> {
+    if had_length && !end_of_stream {
+        frame_as_chunked(resp)?;
+    }
+    Ok(())
 }
 
 /// Add `transfer-encoding: chunked` to a response with no length, as Pingora does before

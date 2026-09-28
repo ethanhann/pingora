@@ -30,7 +30,7 @@ pub(crate) use response_headers::ResponseHeaders;
 pub(crate) use response_trailers::ResponseTrailers;
 
 use log::{debug, warn};
-use proxy_wasm_host::abi::v0_2_1::types::{BufferType, MapType, Status};
+use proxy_wasm_host::abi::v0_2_1::types::{BufferType, MapType, Status, StreamType};
 use proxy_wasm_host::abi::v0_2_1::{Access, Callback, Invocation, LocalResponse, StreamState};
 use proxy_wasm_host::{Buffer, HeaderMap, VecHeaderMap};
 
@@ -45,6 +45,10 @@ pub(crate) struct PingoraStream {
     pub(crate) trailers: Option<ResponseTrailers>,
     pub(crate) body_buffer: BodyBuffer,
     pub(crate) plugin_response: Option<PluginResponse>,
+    request_continue_requested: bool,
+    response_continue_requested: bool,
+    /// The callback whose access applies while the plugin receives the result of a callout.
+    pub(crate) delivery_callback: Option<Callback>,
     empty: VecHeaderMap,
 }
 
@@ -53,6 +57,32 @@ impl PingoraStream {
         match self.request.as_mut() {
             Some(map) => Ok(map),
             None => Err(Status::BadArgument),
+        }
+    }
+
+    /// Forget the directions that the plugin asked to continue in the last guest call.
+    pub(crate) fn clear_continue_requests(&mut self) {
+        self.request_continue_requested = false;
+        self.response_continue_requested = false;
+    }
+
+    /// Return whether the plugin asked to continue `direction` in the last guest call.
+    pub(crate) fn continue_requested(&self, direction: StreamType) -> bool {
+        match direction {
+            StreamType::HttpRequest => self.request_continue_requested,
+            StreamType::HttpResponse => self.response_continue_requested,
+            _ => false,
+        }
+    }
+
+    /// Return the callback whose access applies to a host call of the plugin.
+    ///
+    /// While a plugin receives the result of a callout, it has the access of the callback that
+    /// it waits in.
+    fn access_callback(&self, call: Invocation) -> Option<Callback> {
+        match call.callback {
+            Some(Callback::HttpCallResponse) => self.delivery_callback,
+            callback => callback,
         }
     }
 }
@@ -65,7 +95,7 @@ impl StreamState for PingoraStream {
         map: MapType,
     ) -> Result<&mut dyn HeaderMap, Status> {
         let read = access == Access::Read;
-        match (map, call.callback) {
+        match (map, self.access_callback(call)) {
             (MapType::HttpRequestHeaders, Some(Callback::RequestHeaders)) => self.request_map(),
             (
                 MapType::HttpRequestHeaders,
@@ -114,7 +144,7 @@ impl StreamState for PingoraStream {
         _access: Access,
         buffer: BufferType,
     ) -> Result<&mut dyn Buffer, Status> {
-        match (buffer, call.callback) {
+        match (buffer, self.access_callback(call)) {
             (BufferType::HttpRequestBody, Some(Callback::RequestBody))
             | (BufferType::HttpResponseBody, Some(Callback::ResponseBody)) => {
                 Ok(&mut self.body_buffer)
@@ -129,7 +159,7 @@ impl StreamState for PingoraStream {
         response: LocalResponse<'_>,
     ) -> Result<(), Status> {
         if !matches!(
-            call.callback,
+            self.access_callback(call),
             Some(
                 Callback::RequestHeaders
                     | Callback::RequestBody
@@ -152,6 +182,16 @@ impl StreamState for PingoraStream {
             warn!("plugin response gRPC status {grpc_status} is not sent");
         }
         self.plugin_response = Some(plugin_response);
+        Ok(())
+    }
+
+    fn continue_stream(&mut self, _call: Invocation, stream: StreamType) -> Result<(), Status> {
+        match stream {
+            StreamType::HttpRequest => self.request_continue_requested = true,
+            StreamType::HttpResponse => self.response_continue_requested = true,
+            StreamType::Downstream => {}
+            StreamType::Upstream => return Err(Status::Unimplemented),
+        }
         Ok(())
     }
 }
@@ -247,6 +287,95 @@ mod tests {
 
         let want: Vec<_> = cases.iter().map(|c| c.3).collect();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_delivery_has_the_access_of_the_callback_that_waits() {
+        use Access::{Read, Write};
+        use BufferType::{HttpRequestBody, HttpResponseBody};
+        use MapType::{
+            HttpRequestHeaders as Req, HttpResponseHeaders as Resp,
+            HttpResponseTrailers as RespTrailers,
+        };
+        let cases = [
+            (Some(Callback::RequestHeaders), (Req, Write), None, true),
+            (
+                Some(Callback::RequestBody),
+                (Req, Read),
+                Some(HttpRequestBody),
+                true,
+            ),
+            (Some(Callback::ResponseHeaders), (Resp, Write), None, true),
+            (
+                Some(Callback::ResponseBody),
+                (Req, Read),
+                Some(HttpResponseBody),
+                true,
+            ),
+            (
+                Some(Callback::ResponseTrailers),
+                (RespTrailers, Write),
+                None,
+                true,
+            ),
+            (None, (Req, Read), None, false),
+        ];
+
+        for (waits_in, (map, access), body, has_access) in cases {
+            let mut s = stream(true);
+            s.delivery_callback = waits_in;
+            let call = call(Callback::HttpCallResponse);
+            let buffers = [HttpRequestBody, HttpResponseBody];
+
+            let got_map = s.header_map(call, access, map).is_ok();
+            let got_body = buffers.map(|buffer| s.buffer(call, Read, buffer).is_ok());
+            let can_respond = s.send_local_response(call, LocalResponse::new(403)).is_ok();
+
+            let want_body = buffers.map(|buffer| Some(buffer) == body);
+            assert_eq!(got_map, has_access, "{waits_in:?}");
+            assert_eq!(got_body, want_body, "{waits_in:?}");
+            assert_eq!(can_respond, has_access, "{waits_in:?}");
+        }
+    }
+
+    #[test]
+    fn a_delivery_cannot_write_what_its_callback_cannot_write() {
+        let mut s = stream(true);
+        s.delivery_callback = Some(Callback::RequestBody);
+        let call = call(Callback::HttpCallResponse);
+
+        let written = s.header_map(call, Access::Write, MapType::HttpRequestHeaders);
+
+        assert!(written.is_err());
+    }
+
+    #[test]
+    fn continue_stream_records_a_continue_for_each_http_direction() {
+        use StreamType::{Downstream, HttpRequest, HttpResponse, Upstream};
+        let cases = [
+            (vec![HttpRequest], Ok(()), (true, false)),
+            (vec![HttpResponse], Ok(()), (false, true)),
+            (vec![HttpRequest, HttpResponse], Ok(()), (true, true)),
+            (vec![Downstream], Ok(()), (false, false)),
+            (vec![Upstream], Err(Status::Unimplemented), (false, false)),
+        ];
+
+        for (continues, last_status, recorded) in cases {
+            let mut s = stream(false);
+            let call = call(Callback::HttpCallResponse);
+
+            let statuses: Vec<_> = continues
+                .iter()
+                .map(|direction| s.continue_stream(call, *direction))
+                .collect();
+
+            assert_eq!(statuses.last(), Some(&last_status));
+            let got = (
+                s.continue_requested(HttpRequest),
+                s.continue_requested(HttpResponse),
+            );
+            assert_eq!(got, recorded);
+        }
     }
 
     #[test]

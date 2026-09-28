@@ -22,22 +22,35 @@ pingora-core = { version = "0.9.0", path = "../pingora-core", default-features =
 pingora-proxy = { version = "0.9.0", path = "../pingora-proxy", default-features = false }
 pingora-http = { version = "0.9.0", path = "../pingora-http" }
 pingora-error = { version = "0.9.0", path = "../pingora-error" }
+pingora-timeout = { version = "0.9.0", path = "../pingora-timeout" }
 proxy-wasm-host = "0.1"
+async-trait = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
 parking_lot = "0.12"
+tokio = { workspace = true, features = ["rt", "sync"] }
 tracing = { version = "0.1", features = ["log"] }
 
 [dev-dependencies]
-async-trait = { workspace = true }
+pingora-load-balancing = { version = "0.9.0", path = "../pingora-load-balancing", default-features = false }
 pingora-test-utils = { version = "0.9.0", path = "../pingora-test-utils" }
-tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 once_cell = { workspace = true }
 futures = { workspace = true }
+h2 = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["http2"] }
 wat = "1"
 env_logger = "0.11"
+
+[features]
+default = []
+openssl = ["pingora-core/openssl", "pingora-proxy/openssl", "openssl_derived"]
+boringssl = ["pingora-core/boringssl", "pingora-proxy/boringssl", "openssl_derived"]
+rustls = ["pingora-core/rustls", "pingora-proxy/rustls", "any_tls"]
+s2n = ["pingora-core/s2n", "pingora-proxy/s2n", "any_tls"]
+openssl_derived = ["any_tls"]
+any_tls = []
 
 [package.metadata.cargo-machete]
 ignored = ["tracing"]

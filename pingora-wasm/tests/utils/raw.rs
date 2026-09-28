@@ -66,7 +66,8 @@ fn chunked_body_ended(response: &[u8]) -> bool {
 
 /// Send a request with a chunked body through the proxy on `port`, and return the response.
 ///
-/// The client waits after each body_chunk, so that the proxy runs the body filter once for each chunk.
+/// The client waits after each chunk, so that the proxy runs the body filter once for each
+/// chunk.
 /// It stops sending when a response arrives.
 pub async fn send_chunked_request(
     port: u16,
@@ -99,6 +100,15 @@ pub async fn send_chunked_request(
     }
     response.extend(read_until(&mut stream, RESPONSE_TIMEOUT, never).await);
     parse(&response)
+}
+
+/// Send a GET through the proxy on `port`, and return the connection with no response read.
+pub async fn send_get_without_reading(port: u16, origin: u16) -> TcpStream {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let request =
+        format!("GET / HTTP/1.1\r\nHost: example.test\r\nx-test-origin: {origin}\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream
 }
 
 /// Send one POST for each body on one connection, and return the responses.

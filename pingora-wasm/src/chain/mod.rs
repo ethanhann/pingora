@@ -21,6 +21,7 @@ mod request;
 mod respond;
 mod response;
 mod slot;
+mod wait;
 
 pub use ctx::WasmCtx;
 

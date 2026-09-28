@@ -28,6 +28,7 @@ impl WasmCtx {
     /// response is already sent.
     pub async fn logging<DS: DownstreamSession>(&mut self, session: &mut Session<DS>) {
         let runtime = self.chain.runtime.clone();
+        self.callouts.clear();
         let mut response = session.response_written().cloned();
         let held = self.held.request_len();
         if held > 0 {
@@ -52,7 +53,7 @@ impl WasmCtx {
             if let Some(header) = response.as_mut() {
                 self.response_in(header);
             }
-            let result = self.run(&mut loaded.guest, |scope| {
+            let result = self.run_for_context(loaded, record.context, |scope| {
                 finish(scope, record.context, true)
             });
             if let Some(header) = response.as_mut() {
@@ -60,6 +61,7 @@ impl WasmCtx {
             }
             self.request_out(session.req_header_mut());
             finished(locked, result);
+            self.start_callouts(position, false);
         }
     }
 }

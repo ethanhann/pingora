@@ -13,14 +13,18 @@
 // limitations under the License.
 
 use super::pool::PluginPhases;
+use crate::callout::{CalloutUpstreams, PluginCalloutConf};
 use pingora_error::{Error, ErrorType, Result};
 use proxy_wasm_host::abi::v0_2_1::types::LogLevel;
 use proxy_wasm_host::abi::v0_2_1::{LogSink, PluginConfig, SharedServices, VmServices};
 use proxy_wasm_host::Limits;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 const BODY_LIMIT: usize = 1024 * 1024;
+const CALLOUT_TIMEOUT_LIMIT: Duration = Duration::from_secs(10);
+const CALLOUT_RESPONSE_LIMIT: usize = 1024 * 1024;
 
 /// The configuration of one Proxy-Wasm plugin.
 ///
@@ -73,6 +77,21 @@ pub struct WasmPluginConf {
     /// The most response body bytes that the plugin can hold while it pauses the body. Default 1
     /// MiB.
     pub response_body_limit: usize,
+    /// The longest time that one callout of the plugin can take. Default 10 seconds.
+    ///
+    /// Each callout uses the timeout that the plugin passes to `proxy_http_call`. When that
+    /// timeout is zero, which some hosts read as no timeout, or longer than this limit, the
+    /// callout uses this limit, and the runtime logs a warning the first time. A request whose
+    /// plugin waits for a callout stays open for up to this time.
+    ///
+    /// For a plugin that sends callouts from a body phase or from the response headers phase,
+    /// keep this limit below the `read_timeout` of your upstream peers.
+    pub callout_timeout_limit: Duration,
+    /// The most body bytes that the response to a callout can have. Default 1 MiB.
+    ///
+    /// When a response body is larger, the callout fails, and the plugin receives a result
+    /// with no headers and no body.
+    pub callout_response_limit: usize,
 }
 
 impl WasmPluginConf {
@@ -97,6 +116,8 @@ impl WasmPluginConf {
             response_trailers: false,
             request_body_limit: BODY_LIMIT,
             response_body_limit: BODY_LIMIT,
+            callout_timeout_limit: CALLOUT_TIMEOUT_LIMIT,
+            callout_response_limit: CALLOUT_RESPONSE_LIMIT,
         }
     }
 
@@ -119,7 +140,34 @@ impl WasmPluginConf {
                 format!("wasm plugin {} has a body limit of zero", self.name),
             );
         }
+        if self.callout_timeout_limit.is_zero() {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                format!(
+                    "wasm plugin {} has a callout_timeout_limit of zero",
+                    self.name
+                ),
+            );
+        }
+        if self.callout_response_limit == 0 {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                format!(
+                    "wasm plugin {} has a callout_response_limit of zero",
+                    self.name
+                ),
+            );
+        }
         Ok(())
+    }
+
+    pub(crate) fn callout_conf(&self, upstreams: Arc<dyn CalloutUpstreams>) -> PluginCalloutConf {
+        PluginCalloutConf::new(
+            &self.name,
+            upstreams,
+            self.callout_timeout_limit,
+            self.callout_response_limit,
+        )
     }
 
     pub(crate) fn phase_conf(&self) -> PluginPhases {
@@ -171,10 +219,12 @@ mod tests {
         assert!(!conf.request_body && !conf.response_body && !conf.response_trailers);
         assert_eq!(conf.request_body_limit, BODY_LIMIT);
         assert_eq!(conf.response_body_limit, BODY_LIMIT);
+        assert_eq!(conf.callout_timeout_limit, Duration::from_secs(10));
+        assert_eq!(conf.callout_response_limit, CALLOUT_RESPONSE_LIMIT);
     }
 
     #[test]
-    fn check_refuses_zero_slots_a_fuel_limit_and_a_zero_body_limit() {
+    fn check_refuses_zero_slots_a_fuel_limit_and_zero_limits() {
         let mut zero = WasmPluginConf::new("zero", "zero.wasm");
         zero.slots = 0;
         let mut fuel = WasmPluginConf::new("fuel", "fuel.wasm");
@@ -183,12 +233,18 @@ mod tests {
         request.request_body_limit = 0;
         let mut response = WasmPluginConf::new("response", "response.wasm");
         response.response_body_limit = 0;
+        let mut timeout = WasmPluginConf::new("timeout", "timeout.wasm");
+        timeout.callout_timeout_limit = Duration::ZERO;
+        let mut callout = WasmPluginConf::new("callout", "callout.wasm");
+        callout.callout_response_limit = 0;
 
         let errors = [
             zero.check(),
             fuel.check(),
             request.check(),
             response.check(),
+            timeout.check(),
+            callout.check(),
         ]
         .map(|r| r.unwrap_err().to_string());
 
@@ -196,6 +252,8 @@ mod tests {
         assert!(errors[1].contains("wasm plugin fuel sets a fuel limit"));
         assert!(errors[2].contains("wasm plugin request has a body limit of zero"));
         assert!(errors[3].contains("wasm plugin response has a body limit of zero"));
+        assert!(errors[4].contains("wasm plugin timeout has a callout_timeout_limit of zero"));
+        assert!(errors[5].contains("wasm plugin callout has a callout_response_limit of zero"));
     }
 
     #[test]

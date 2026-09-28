@@ -27,9 +27,12 @@ impl WasmCtx {
     /// turned on run. Plugins can read and replace the body, and can read the request headers.
     ///
     /// A plugin can pause to wait for more of the body. This phase then holds the bytes for the
-    /// plugin and leaves an empty chunk for the downstream. On the next body_chunk, the plugin reads the
+    /// plugin and leaves an empty chunk for the downstream. On the next chunk, the plugin reads the
     /// bytes it paused on and the new bytes together. A plugin can hold up to
     /// [response_body_limit](crate::WasmPluginConf::response_body_limit) bytes.
+    ///
+    /// A plugin can also pause a chunk while it waits for a callout, and this phase waits with
+    /// it. When the plugin continues, the bytes that it holds go to the next plugin.
     ///
     /// A plugin that changes the length of the body must remove `content-length` in
     /// `proxy_on_response_headers`. A plugin that changes the body of a range response leaves a
@@ -44,9 +47,10 @@ impl WasmCtx {
     /// # Errors
     ///
     /// An error of type [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) when a plugin traps or fails,
-    /// when a plugin pauses the last chunk of a body, or when a plugin sends its own response. An
-    /// error of type [ERR_RESPONSE_BODY_TOO_LARGE](crate::ERR_RESPONSE_BODY_TOO_LARGE) when a
-    /// plugin holds more bytes than its limit. Pingora sent the response header before this phase,
+    /// when a plugin pauses the last chunk of a body and does not continue, or when a plugin sends
+    /// its own response. An error of type
+    /// [ERR_RESPONSE_BODY_TOO_LARGE](crate::ERR_RESPONSE_BODY_TOO_LARGE) when a plugin holds more
+    /// bytes than its limit. Pingora sent the response header before this phase,
     /// so after an error the downstream receives a response that ends early.
     pub async fn response_body_filter<DS: DownstreamSession>(
         &mut self,
@@ -57,12 +61,16 @@ impl WasmCtx {
         if self.skips_body(session, BodyDirection::Response) {
             return Ok(());
         }
+        self.refuse_after_cancelled_wait()?;
         if !end_of_stream && body.as_ref().is_none_or(Bytes::is_empty) {
             return Ok(());
         }
         self.chain.runtime.start_ticker()?;
         let chunk = body.take().unwrap_or_default();
-        match self.body_pass(session, BodyDirection::Response, chunk, end_of_stream)? {
+        let ran = self
+            .run_body_callbacks(session, BodyDirection::Response, chunk, end_of_stream)
+            .await?;
+        match ran {
             BodyOutcome::Released(output) => {
                 *body = filter_output(output, end_of_stream);
                 Ok(())

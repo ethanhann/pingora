@@ -16,9 +16,13 @@ use super::body::{HeldBodies, RequestBodyState};
 use super::logging::{finish, finished};
 use super::slot::LockedSlot;
 use super::WasmChain;
+use crate::callout::RequestCallouts;
+use crate::plugin_unavailable;
+use crate::runtime::pool::{GuestPool, Loaded};
 use crate::stream::{PingoraStream, RequestHeaders, ResponseHeaders};
 use http::uri::Scheme;
 use http::{Method, StatusCode};
+use pingora_error::Error;
 use pingora_http::{RequestHeader, ResponseHeader};
 use proxy_wasm_host::abi::v0_2_1::{CallScope, ContextId, Guest, GuestId};
 use proxy_wasm_host::HeaderMap;
@@ -60,6 +64,7 @@ pub struct WasmCtx {
     pub(super) response_progress: ResponseProgress,
     pub(super) request_body: RequestBodyState,
     pub(super) held: HeldBodies,
+    pub(super) callouts: RequestCallouts,
     stream: PingoraStream,
     spare_request: Option<RequestHeader>,
     spare_response: Option<ResponseHeader>,
@@ -82,6 +87,7 @@ impl WasmCtx {
             response_progress: ResponseProgress::NotStarted,
             request_body: RequestBodyState::new(),
             held: HeldBodies::default(),
+            callouts: RequestCallouts::default(),
             chain,
             records,
             scheme: Scheme::HTTP,
@@ -100,6 +106,34 @@ impl WasmCtx {
         let (result, stream) = guest.with(mem::take(&mut self.stream), body);
         self.stream = stream;
         result
+    }
+
+    /// Run `body` on the guest for `context`, the stream context of a plugin of this request.
+    ///
+    /// The guest can send callouts only from `context` during this call. The request holds
+    /// the callouts of the call until the phase starts them, or until the next call.
+    pub(crate) fn run_for_context<R>(
+        &mut self,
+        loaded: &mut Loaded,
+        context: ContextId,
+        body: impl FnOnce(&mut CallScope<'_, PingoraStream>) -> R,
+    ) -> R {
+        self.stream.clear_continue_requests();
+        let service = loaded.callout_service.clone();
+        let guest_call = || self.run(&mut loaded.guest, body);
+        let (result, accepted) = service.record_callouts(context, guest_call);
+        self.callouts.set_accepted(accepted);
+        result
+    }
+
+    /// Return the pool of the plugin at `position` of the chain.
+    pub(crate) fn pool_at(&self, position: usize) -> &GuestPool {
+        &self.chain.runtime.pools[self.chain.plugins[position]]
+    }
+
+    /// Return the error for the plugin at `position`, which cannot go on after `what` it did.
+    pub(crate) fn plugin_error(&self, position: usize, what: &str) -> Box<Error> {
+        plugin_unavailable(&self.pool_at(position).name, what)
     }
 
     /// Move the request header from the session into the stream state for a callback, and put
@@ -153,6 +187,7 @@ impl WasmCtx {
 impl Drop for WasmCtx {
     fn drop(&mut self) {
         let runtime = self.chain.runtime.clone();
+        self.callouts.clear();
         for position in (0..self.records.len()).rev() {
             let Some(record) = self.records[position].take() else {
                 continue;
@@ -164,10 +199,11 @@ impl Drop for WasmCtx {
             let Ok(loaded) = locked.loaded() else {
                 continue;
             };
-            let result = self.run(&mut loaded.guest, |scope| {
+            let result = self.run_for_context(loaded, record.context, |scope| {
                 finish(scope, record.context, false)
             });
             finished(locked, result);
+            self.start_callouts(position, false);
         }
     }
 }

@@ -14,10 +14,10 @@
 
 //! The responses that plugins send after the request headers.
 
-use super::response::ResponseSource;
+use super::response::{frame_if_length_removed, ResponseSource};
 use super::{ResponseProgress, WasmCtx};
-use crate::plugin_unavailable;
 use crate::stream::{write_plugin_response, PluginResponse};
+use http::header::CONTENT_LENGTH;
 use http::Method;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_error::{Error, ErrorType, Result};
@@ -49,6 +49,7 @@ impl WasmCtx {
         no_body: bool,
     ) -> Result<()> {
         let end_of_stream = no_body || session.req_header().method == Method::HEAD;
+        let had_length = header.headers.contains_key(CONTENT_LENGTH);
         let positions = (0..=position).rev();
         self.response_pass(
             session,
@@ -57,7 +58,7 @@ impl WasmCtx {
             end_of_stream,
             ResponseSource::Plugin,
         )?;
-        Ok(())
+        frame_if_length_removed(header, had_length, end_of_stream)
     }
 
     /// Write the response that a plugin sent to a request body, and return the error that stops the
@@ -110,16 +111,15 @@ impl WasmCtx {
             return e;
         }
         self.response_progress = ResponseProgress::FromPlugin;
-        let pool = &self.chain.runtime.pools[self.chain.plugins[position]];
+        let plugin = &self.pool_at(position).name;
         Error::explain(
             ErrorType::HTTPStatus(status),
-            format!("wasm plugin {} sent its own response", pool.name),
+            format!("wasm plugin {plugin} sent its own response"),
         )
     }
 
     /// Return the error for a plugin response that came after the response header.
     pub(super) fn late_response_error(&self, position: usize) -> Box<Error> {
-        let pool = &self.chain.runtime.pools[self.chain.plugins[position]];
-        plugin_unavailable(&pool.name, "sent a response after the response header")
+        self.plugin_error(position, "sent a response after the response header")
     }
 }

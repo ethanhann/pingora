@@ -17,6 +17,7 @@
 //! A guest runs one callback at a time, so a plugin keeps several guests, one in each slot. A
 //! request stays on the slot it started on, because its plugin context is in that guest.
 
+use crate::callout::{GuestCalloutService, PluginCalloutConf};
 use crate::{plugin_failure, plugin_unavailable};
 use log::{error, info, warn};
 use parking_lot::{Mutex, MutexGuard};
@@ -25,6 +26,7 @@ use proxy_wasm_host::abi::v0_2_1::{
     Callback, ContextId, Guest, GuestError, GuestId, GuestSpec, PluginConfig, Started,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const REBUILD_BACKOFF: Duration = Duration::from_secs(1);
@@ -56,10 +58,11 @@ impl PluginPhases {
     }
 }
 
-/// A started guest and the root context of its plugin.
+/// A started guest, the root context of its plugin, and its callout service.
 pub(crate) struct Loaded {
     pub(crate) guest: Guest,
     pub(crate) root: ContextId,
+    pub(crate) callout_service: Arc<GuestCalloutService>,
 }
 
 pub(crate) type SlotGuard<'a> = MutexGuard<'a, Option<Loaded>>;
@@ -75,6 +78,7 @@ struct Slot {
 pub(crate) struct GuestPool {
     pub(crate) name: String,
     pub(crate) phases: PluginPhases,
+    pub(crate) callout_conf: Arc<PluginCalloutConf>,
     spec: GuestSpec,
     plugin: PluginConfig,
     next: AtomicUsize,
@@ -88,10 +92,12 @@ impl GuestPool {
         plugin: PluginConfig,
         slots: usize,
         mut phases: PluginPhases,
+        callout_conf: PluginCalloutConf,
     ) -> Result<Self> {
         let mut pool = GuestPool {
             name,
             phases,
+            callout_conf: Arc::new(callout_conf),
             spec,
             plugin,
             next: AtomicUsize::new(0),
@@ -117,8 +123,19 @@ impl GuestPool {
             .spec
             .build()
             .map_err(|e| plugin_failure(&self.name, "could not be built", e))?;
+        // Callout ids are unique only within one guest, so each guest needs its own service
+        let callout_service = Arc::new(GuestCalloutService::new(self.callout_conf.clone()));
+        let services = guest
+            .services()
+            .clone()
+            .with_callouts(callout_service.clone());
+        *guest.services_mut() = services;
         match guest.start(self.plugin.clone()) {
-            Ok(Started::Serving(root)) => Ok(Loaded { guest, root }),
+            Ok(Started::Serving(root)) => Ok(Loaded {
+                guest,
+                root,
+                callout_service,
+            }),
             Ok(Started::Refused { callback, .. }) => Err(plugin_unavailable(
                 &self.name,
                 &format!("refused its start in {callback}"),
@@ -252,34 +269,38 @@ impl GuestPool {
             .map(|s| s.held.load(Ordering::Relaxed))
             .sum()
     }
-
-    #[cfg(test)]
-    pub(crate) fn slot_count(&self) -> usize {
-        self.slots.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn lock_slot(&self, index: usize) -> SlotGuard<'_> {
-        self.slots[index].guest.lock()
-    }
-
-    /// Replace the guest of a slot, as a trap does.
-    #[cfg(test)]
-    pub(crate) fn replace_slot(&self, index: usize) {
-        self.slots[index].guest.lock().take();
-        self.rebuild(index);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_slot(&self, index: usize) {
-        self.slots[index].guest.lock().take();
-        *self.slots[index].failed_at.lock() = Some(Instant::now());
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl GuestPool {
+        pub(crate) fn slot_count(&self) -> usize {
+            self.slots.len()
+        }
+
+        /// Return `true` when no task holds the lock of the slot.
+        pub(crate) fn is_slot_free(&self, index: usize) -> bool {
+            self.slots[index].guest.try_lock().is_some()
+        }
+
+        pub(crate) fn lock_slot(&self, index: usize) -> SlotGuard<'_> {
+            self.slots[index].guest.lock()
+        }
+
+        /// Replace the guest of a slot, as a trap does.
+        pub(crate) fn replace_slot(&self, index: usize) {
+            self.slots[index].guest.lock().take();
+            self.rebuild(index);
+        }
+
+        pub(crate) fn fail_slot(&self, index: usize) {
+            self.slots[index].guest.lock().take();
+            *self.slots[index].failed_at.lock() = Some(Instant::now());
+        }
+    }
+
     use crate::test_support::{body_plugin, fixture, plugin, Wat, CONTINUE, HOLD};
     use crate::WasmRuntime;
     use std::thread;

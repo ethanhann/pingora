@@ -17,15 +17,19 @@
 mod log_sink;
 mod plugin;
 pub(crate) mod pool;
+mod services;
 mod ticker;
 
 pub use plugin::WasmPluginConf;
+pub(crate) use services::CalloutLauncher;
+pub use services::WasmServices;
 
+use crate::callout::{CalloutSender, ConnectorSender};
 use crate::chain::WasmChain;
-use log_sink::LogCrateSink;
+use pingora_core::connectors::http::Connector;
 use pingora_error::{Error, ErrorType, OrErr, Result};
 use pool::GuestPool;
-use proxy_wasm_host::abi::v0_2_1::{GuestSpec, Host, InMemoryStore, LogSink, SharedServices};
+use proxy_wasm_host::abi::v0_2_1::{GuestSpec, Host, InMemoryStore, SharedServices};
 use proxy_wasm_host::{Engine, EngineConfig, Module};
 use std::collections::HashMap;
 use std::fmt;
@@ -49,6 +53,7 @@ pub(crate) struct RuntimeInner {
     engine: Engine,
     ticker: Ticker,
     pub(crate) pools: Vec<GuestPool>,
+    pub(crate) callout_launcher: CalloutLauncher,
     names: HashMap<String, usize>,
 }
 
@@ -61,17 +66,43 @@ impl WasmRuntime {
     ///
     /// The error message names the plugin. The build fails when a file cannot be read, when a
     /// file is not a Proxy-Wasm module, when a plugin refuses to start or traps while it starts,
-    /// when two plugins have the same name, when a plugin has zero slots, or when its limits set
-    /// fuel.
+    /// when two plugins have the same name, when a plugin has zero slots, when its limits set
+    /// fuel, or when one of its body or callout limits is zero.
     pub fn new(plugins: Vec<WasmPluginConf>) -> Result<Self> {
-        Self::new_with_log_sink(plugins, Arc::new(LogCrateSink))
+        Self::new_with_services(plugins, WasmServices::default())
     }
 
-    /// Compile each plugin and start its guests, with guest log lines sent to `sink`.
+    /// Compile each plugin and start its guests, with the services of your proxy.
     ///
-    /// Use it to send guest log lines to your own logger, for example to keep them in the
-    /// `tracing` span of the request. Otherwise it is the same as [WasmRuntime::new].
-    pub fn new_with_log_sink(plugins: Vec<WasmPluginConf>, sink: Arc<dyn LogSink>) -> Result<Self> {
+    /// Use it when your plugins send callouts, or to send guest log lines to your own logger,
+    /// for example to keep them in the `tracing` span of the request. Otherwise it is the same
+    /// as [WasmRuntime::new].
+    ///
+    /// # Errors
+    ///
+    /// The errors of [WasmRuntime::new], and an error when
+    /// [max_callouts_in_flight](WasmServices::max_callouts_in_flight) is zero or over its
+    /// maximum.
+    pub fn new_with_services(plugins: Vec<WasmPluginConf>, services: WasmServices) -> Result<Self> {
+        let connector = services
+            .callout_connector
+            .clone()
+            .unwrap_or_else(|| Arc::new(Connector::new(None)));
+        let sender = Arc::new(ConnectorSender {
+            connector,
+            upstreams: services.callout_upstreams.clone(),
+        });
+        Self::new_with_callout_sender(plugins, services, sender)
+    }
+
+    pub(crate) fn new_with_callout_sender(
+        plugins: Vec<WasmPluginConf>,
+        services: WasmServices,
+        sender: Arc<dyn CalloutSender>,
+    ) -> Result<Self> {
+        let sink = services.log_sink;
+        let upstreams = services.callout_upstreams;
+        let callout_launcher = CalloutLauncher::new(sender, services.max_callouts_in_flight)?;
         if plugins.is_empty() {
             return Error::e_explain(ErrorType::InternalError, "no wasm plugin to run");
         }
@@ -119,6 +150,7 @@ impl WasmRuntime {
                         plugin.plugin_config(),
                         plugin.slots,
                         plugin.phase_conf(),
+                        plugin.callout_conf(upstreams.clone()),
                     )
                 })
                 .collect::<Result<Vec<_>>>()
@@ -128,6 +160,7 @@ impl WasmRuntime {
                 engine,
                 ticker: Ticker::new(),
                 pools,
+                callout_launcher,
                 names,
             }),
         })
@@ -179,6 +212,14 @@ impl WasmRuntime {
     pub fn held_contexts(&self) -> usize {
         self.inner.pools.iter().map(GuestPool::held_contexts).sum()
     }
+
+    /// Return the number of callouts that the runtime is sending.
+    ///
+    /// A callout counts until it receives its response or reaches its timeout, even when its
+    /// request has already ended.
+    pub fn callouts_in_flight(&self) -> usize {
+        self.inner.callout_launcher.in_flight()
+    }
 }
 
 impl fmt::Debug for WasmRuntime {
@@ -205,8 +246,27 @@ mod tests {
     use super::*;
     use crate::test_support::{fixture, plugin, wat_guest, Wat};
     use proxy_wasm_host::abi::v0_2_1::types::LogLevel;
-    use proxy_wasm_host::abi::v0_2_1::LogContext;
+    use proxy_wasm_host::abi::v0_2_1::{LogContext, LogSink};
     use proxy_wasm_host::Limits;
+
+    #[test]
+    fn new_with_services_refuses_a_limit_that_it_cannot_apply() {
+        let cases = [0, usize::MAX];
+
+        for limit in cases {
+            let services = WasmServices {
+                max_callouts_in_flight: limit,
+                ..WasmServices::default()
+            };
+            let plugins = vec![plugin("a", fixture("add-request-header"), 1)];
+
+            let err = WasmRuntime::new_with_services(plugins, services)
+                .err()
+                .unwrap();
+
+            assert!(err.to_string().contains("max_callouts_in_flight"), "{err}");
+        }
+    }
 
     fn refusal(plugins: Vec<WasmPluginConf>) -> String {
         WasmRuntime::new(plugins).err().unwrap().to_string()
@@ -339,10 +399,15 @@ mod tests {
     }
 
     #[test]
-    fn new_with_log_sink_sends_guest_lines_to_the_sink() {
+    fn new_with_services_sends_guest_lines_to_the_sink() {
         let sink = Arc::new(Recording::default());
 
-        WasmRuntime::new_with_log_sink(vec![plugin("b", fixture("http-example"), 1)], sink.clone())
+        let services = WasmServices {
+            log_sink: sink.clone(),
+            ..WasmServices::default()
+        };
+
+        WasmRuntime::new_with_services(vec![plugin("b", fixture("http-example"), 1)], services)
             .unwrap();
 
         let lines = sink.0.lock();

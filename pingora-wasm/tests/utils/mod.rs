@@ -12,9 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod callout_origins;
 pub mod guests;
 mod proxy;
 pub mod raw;
+mod services;
+
+pub use services::callout_origin;
 
 use bytes::Bytes;
 use http::{Request, Response};
@@ -22,8 +26,9 @@ use once_cell::sync::{Lazy, OnceCell};
 use pingora_core::apps::HttpServerOptions;
 use pingora_core::server::Server;
 use pingora_test_utils::http_origin::HttpOrigin;
-use pingora_wasm::{WasmPluginConf, WasmRuntime};
+use pingora_wasm::WasmRuntime;
 use proxy::TestProxy;
+use services::services;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,19 +37,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const FIRST_PORT: u16 = 6380;
-pub const LAST_PORT: u16 = 6396;
+pub const LAST_PORT: u16 = 6402;
 
 pub fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(format!("{name}.wasm"))
-}
-
-fn plugin(name: &str, path: PathBuf, slots: usize, configuration: &str) -> WasmPluginConf {
-    let mut conf = WasmPluginConf::new(name, path);
-    conf.slots = slots;
-    conf.configuration = configuration.as_bytes().to_vec();
-    conf
 }
 
 static GUEST_LINES: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
@@ -75,81 +73,6 @@ static RUNTIMES: OnceCell<HashMap<u16, WasmRuntime>> = OnceCell::new();
 /// The runtime of the service on `port`.
 pub fn runtime(port: u16) -> &'static WasmRuntime {
     &RUNTIMES.get().expect("the test server is started")[&port]
-}
-
-fn services() -> Vec<(u16, WasmRuntime, Vec<&'static str>, Option<usize>)> {
-    let single = |name: &'static str, conf: WasmPluginConf| {
-        (WasmRuntime::new(vec![conf]).unwrap(), vec![name])
-    };
-    let add = || plugin("add", fixture("add-request-header"), 2, "");
-    let example = |slots| plugin("example", fixture("http-example"), slots, "");
-    let config = |name, value| plugin(name, fixture("sdk-http-config"), 2, value);
-    let shared = WasmRuntime::new(vec![
-        plugin("add", fixture("add-request-header"), 1, ""),
-        plugin("config", fixture("sdk-http-config"), 1, "hello"),
-    ])
-    .unwrap();
-
-    let mut services = Vec::new();
-    let mut push = |port, (runtime, chain): (WasmRuntime, Vec<&'static str>), threads| {
-        services.push((port, runtime, chain, threads));
-    };
-    push(6380, single("add", add()), None);
-    push(
-        6381,
-        (
-            WasmRuntime::new(vec![add(), example(2)]).unwrap(),
-            vec!["add", "example"],
-        ),
-        None,
-    );
-    push(6382, single("hello", config("hello", "hello")), None);
-    push(
-        6383,
-        single(
-            "headers",
-            plugin("headers", fixture("sdk-http-headers"), 2, ""),
-        ),
-        None,
-    );
-    push(6384, single("example", example(1)), None);
-    push(6385, single("example", example(4)), Some(4));
-    push(
-        6386,
-        (
-            WasmRuntime::new(vec![config("a", "a"), config("b", "b")]).unwrap(),
-            vec!["a", "b"],
-        ),
-        None,
-    );
-    push(
-        6387,
-        (
-            WasmRuntime::new(vec![config("hello", "hello"), example(2)]).unwrap(),
-            vec!["hello", "example"],
-        ),
-        None,
-    );
-    push(6388, single("example", example(2)), None);
-    push(6389, (shared.clone(), vec!["add"]), None);
-    push(6390, (shared, vec!["add", "config"]), None);
-    let mut body = plugin("body", fixture("sdk-http-body"), 2, "");
-    body.response_body = true;
-    push(6391, single("body", body), None);
-    push(6392, single("hold", guests::hold("hold", 1024)), None);
-    push(6393, single("hold", guests::hold("hold-limit", 16)), None);
-    push(
-        6394,
-        single("teapot", guests::teapot_for_a_response()),
-        None,
-    );
-    push(
-        6395,
-        single("teapot", guests::teapot_for_a_request_body()),
-        None,
-    );
-    push(6396, single("mark", guests::mark()), None);
-    services
 }
 
 pub struct TestServer;

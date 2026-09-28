@@ -14,71 +14,42 @@
 
 //! The body phases and the trailer phase, and the pass over the plugins that the body phases use.
 
+mod direction;
 mod held;
 mod request;
 mod response;
 mod retry;
 mod trailers;
 
+pub(crate) use direction::BodyDirection;
 pub(crate) use held::HeldBodies;
 pub(crate) use retry::RequestBodyState;
 
 use super::slot::LockedSlot;
+use super::wait::CalloutWaitOutcome;
 use super::{ResponseProgress, WasmCtx};
-use crate::plugin_unavailable;
-use crate::runtime::pool::PluginPhases;
 use crate::stream::{BodyBuffer, PluginResponse};
-use crate::{ERR_REQUEST_BODY_TOO_LARGE, ERR_RESPONSE_BODY_TOO_LARGE};
 use bytes::Bytes;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
-use pingora_error::{Error, ErrorType, Result};
+use pingora_error::{Error, Result};
 use pingora_proxy::Session;
-use proxy_wasm_host::abi::v0_2_1::types::Action;
 use proxy_wasm_host::Buffer;
 use std::mem;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BodyDirection {
-    Request,
-    Response,
-}
-
-impl BodyDirection {
-    fn runs(self, conf: &PluginPhases) -> bool {
-        match self {
-            BodyDirection::Request => conf.request,
-            BodyDirection::Response => conf.response,
-        }
-    }
-
-    fn limit(self, conf: &PluginPhases) -> usize {
-        match self {
-            BodyDirection::Request => conf.request_limit,
-            BodyDirection::Response => conf.response_limit,
-        }
-    }
-
-    fn too_large(self) -> ErrorType {
-        match self {
-            BodyDirection::Request => ERR_REQUEST_BODY_TOO_LARGE,
-            BodyDirection::Response => ERR_RESPONSE_BODY_TOO_LARGE,
-        }
-    }
-
-    fn failure(self) -> &'static str {
-        match self {
-            BodyDirection::Request => "failed in on_request_body",
-            BodyDirection::Response => "failed in on_response_body",
-        }
-    }
-}
-
-/// The result of [WasmCtx::body_pass].
+/// The result of the body callbacks of a chain on one chunk.
 pub(super) enum BodyOutcome {
     /// The bytes that the last plugin returned.
     Released(Bytes),
     /// The plugin at this position sent its own response.
     Respond(usize, Box<PluginResponse>),
+}
+
+/// The result of [WasmCtx::run_body_callbacks_from].
+enum BodyCallbacksOutcome {
+    /// Every plugin ran, or a plugin held its bytes or sent its own response.
+    Finished(BodyOutcome),
+    /// The plugin at this step paused and has a callout to wait for.
+    WaitsForCallout(usize),
 }
 
 /// Return what a body filter leaves in `body` for Pingora.
@@ -109,25 +80,89 @@ impl WasmCtx {
             || session.was_upgraded()
     }
 
-    /// Run the body callback of each plugin on `chunk`, in the order of `direction`.
-    ///
-    /// Each plugin receives what the plugin before it returned. When a plugin pauses, it holds the
-    /// bytes, and the plugins after it do not run.
-    pub(super) fn body_pass<DS: DownstreamSession>(
+    /// Run the body callback of each plugin on `chunk`, in the order of `direction`, and wait
+    /// for the callouts of a plugin that pauses to wait for them.
+    pub(super) async fn run_body_callbacks<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
         direction: BodyDirection,
         chunk: Bytes,
         end_of_stream: bool,
     ) -> Result<BodyOutcome> {
+        let count = self.records.len();
+        let mut first_step = 0;
+        let mut current = chunk;
+        loop {
+            let ran = self.run_body_callbacks_from(
+                session,
+                direction,
+                first_step,
+                current,
+                end_of_stream,
+            )?;
+            let step = match ran {
+                BodyCallbacksOutcome::Finished(outcome) => return Ok(outcome),
+                BodyCallbacksOutcome::WaitsForCallout(step) => step,
+            };
+            let position = direction.position_at_step(step, count);
+            let phase = direction.paused_phase();
+            match self.wait_for_callouts(session, position, phase).await? {
+                CalloutWaitOutcome::Continued => {
+                    current = Bytes::from(self.held.take(direction, position));
+                    first_step = step + 1;
+                }
+                CalloutWaitOutcome::StillPaused => {
+                    self.check_body_can_be_held(direction, position, end_of_stream)?;
+                    return Ok(BodyOutcome::Released(Bytes::new()));
+                }
+                CalloutWaitOutcome::Respond(response) => {
+                    return Ok(BodyOutcome::Respond(position, response))
+                }
+            }
+        }
+    }
+
+    /// Return an error when the plugin at `position` cannot hold the bytes that it paused on.
+    fn check_body_can_be_held(
+        &self,
+        direction: BodyDirection,
+        position: usize,
+        end_of_stream: bool,
+    ) -> Result<()> {
+        if end_of_stream {
+            return Err(self.plugin_error(position, "paused a body at its end"));
+        }
+        let pool = self.pool_at(position);
+        let size = self.held.len(direction, position);
+        if size > direction.limit(&pool.phases) {
+            return Error::e_explain(
+                direction.too_large(),
+                format!(
+                    "wasm plugin {} holds {size} body bytes, more than its limit",
+                    pool.name
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    /// Run the body callback of each plugin on `chunk`, from `first_step` of the pass.
+    ///
+    /// Each plugin receives what the plugin before it returned. When a plugin pauses, it holds the
+    /// bytes, and the plugins after it do not run.
+    fn run_body_callbacks_from<DS: DownstreamSession>(
+        &mut self,
+        session: &mut Session<DS>,
+        direction: BodyDirection,
+        first_step: usize,
+        chunk: Bytes,
+        end_of_stream: bool,
+    ) -> Result<BodyCallbacksOutcome> {
         let runtime = self.chain.runtime.clone();
         let count = self.records.len();
         let mut current = chunk;
-        for step in 0..count {
-            let position = match direction {
-                BodyDirection::Request => step,
-                BodyDirection::Response => count - 1 - step,
-            };
+        for step in first_step..count {
+            let position = direction.position_at_step(step, count);
             let Some(record) = self.records[position] else {
                 continue;
             };
@@ -139,13 +174,13 @@ impl WasmCtx {
                 break;
             }
             let mut locked = LockedSlot::of_request(pool, &record)?;
-            let guest = &mut locked.loaded()?.guest;
+            let loaded = locked.loaded()?;
             let held = self.held.take(direction, position);
             let buffer = BodyBuffer::new(held, mem::take(&mut current));
             let size = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
             self.stream().body_buffer = buffer;
             self.request_in(session.req_header_mut());
-            let action = self.run(guest, |scope| match direction {
+            let action = self.run_for_context(loaded, record.context, |scope| match direction {
                 BodyDirection::Request => {
                     scope.on_request_body(record.context, size, end_of_stream)
                 }
@@ -163,32 +198,28 @@ impl WasmCtx {
                     return Err(locked.guest_failure(direction.failure(), e));
                 }
             };
+            drop(locked);
+            let paused =
+                sent.is_none() && self.plugin_stays_paused(action, direction.stream_type());
+            self.start_callouts(position, paused);
             if let Some(response) = sent {
                 self.held.put(direction, position, buffer.into_vec());
-                return Ok(BodyOutcome::Respond(position, Box::new(response)));
+                let outcome = BodyOutcome::Respond(position, Box::new(response));
+                return Ok(BodyCallbacksOutcome::Finished(outcome));
             }
-            if action == Action::Continue {
+            if !paused {
                 current = buffer.into_bytes();
                 continue;
             }
-            let held = buffer.into_vec();
-            let size = held.len();
-            self.held.put(direction, position, held);
-            if end_of_stream {
-                return Err(plugin_unavailable(&pool.name, "paused a body at its end"));
+            self.held.put(direction, position, buffer.into_vec());
+            if self.waits_for_callout(position) {
+                return Ok(BodyCallbacksOutcome::WaitsForCallout(step));
             }
-            if size > direction.limit(&pool.phases) {
-                return Error::e_explain(
-                    direction.too_large(),
-                    format!(
-                        "wasm plugin {} holds {size} body bytes, more than its limit",
-                        pool.name
-                    ),
-                );
-            }
+            self.check_body_can_be_held(direction, position, end_of_stream)?;
             break;
         }
-        Ok(BodyOutcome::Released(current))
+        let outcome = BodyOutcome::Released(current);
+        Ok(BodyCallbacksOutcome::Finished(outcome))
     }
 }
 
@@ -200,6 +231,7 @@ mod tests {
         MARK_A_REQUEST, MARK_A_RESPONSE, MARK_B_REQUEST, MARK_B_RESPONSE, PAUSE, POST, UPGRADE,
     };
     use crate::{WasmPluginConf, ERR_PLUGIN_FAILED};
+    use crate::{ERR_REQUEST_BODY_TOO_LARGE, ERR_RESPONSE_BODY_TOO_LARGE};
     use pingora_http::ResponseHeader;
 
     fn both(request: &'static str, response: &'static str) -> Wat {
