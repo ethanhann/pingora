@@ -284,3 +284,38 @@ pub(crate) async fn eventually(check: impl Fn() -> bool) -> bool {
     }
     check()
 }
+
+static CRATE_LOG_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+struct CrateLogs;
+
+impl log::Log for CrateLogs {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.target().starts_with("pingora_wasm")
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            CRATE_LOG_LINES.lock().push(record.args().to_string());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+/// Start to record the log lines of the crate. Call it before the code that logs.
+pub(crate) fn record_crate_logs() {
+    if log::set_logger(&CrateLogs).is_ok() {
+        log::set_max_level(log::LevelFilter::Debug);
+    }
+}
+
+/// Return the recorded log lines of the crate that contain `text`.
+pub(crate) fn crate_log_lines_with(text: &str) -> Vec<String> {
+    let lines = CRATE_LOG_LINES.lock();
+    lines
+        .iter()
+        .filter(|line| line.contains(text))
+        .cloned()
+        .collect()
+}
