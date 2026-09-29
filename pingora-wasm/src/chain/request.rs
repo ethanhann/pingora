@@ -157,7 +157,10 @@ fn scheme_of<DS: DownstreamSession>(session: &Session<DS>) -> Scheme {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support::{one_plugin, session, wat_plugin, GET, TEAPOT};
+    use crate::test_support::{
+        crate_log_lines_with, one_plugin, record_crate_logs, session, wat_plugin, GET, TEAPOT,
+    };
+    use crate::WasmRuntime;
     use crate::{RequestOutcome, ERR_PLUGIN_FAILED};
 
     #[tokio::test]
@@ -196,6 +199,25 @@ mod tests {
 
         assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
         assert!(err.to_string().contains("paused a request"));
+    }
+
+    #[tokio::test]
+    async fn a_trap_logs_one_line_for_the_guest_that_was_replaced() {
+        record_crate_logs();
+        let mut conf = wat_plugin("trap-log-unit", "unreachable");
+        conf.name = "replaced-once".to_string();
+        let runtime = WasmRuntime::new(vec![conf]).unwrap();
+        let mut ctx = runtime.chain(&["replaced-once"]).unwrap().new_ctx();
+        let (mut session, _client) = session(GET).await;
+
+        let trapped = ctx.request_filter(&mut session).await;
+
+        assert!(trapped.is_err());
+        let mut lines = crate_log_lines_with("replaced-once");
+        lines.retain(|line| line.contains("guest"));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let want = "wasm plugin replaced-once replaced the guest of slot 0 after a failure: ";
+        assert!(lines[0].starts_with(want), "{lines:?}");
     }
 
     #[tokio::test]
