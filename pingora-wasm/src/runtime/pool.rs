@@ -160,7 +160,7 @@ impl GuestPool {
             }
         }
         if let Some(index) = order().find(|index| self.rebuild_due(*index)) {
-            self.rebuild(index);
+            self.rebuild(index, None);
             if let Some(guard) = self.slots[index].guest.try_lock() {
                 if guard.is_some() {
                     return Ok((index, guard));
@@ -198,12 +198,11 @@ impl GuestPool {
         if !lost {
             return;
         }
-        error!("wasm plugin {} lost its guest: {err}", self.name);
         guard.take();
         self.slots[index].open.store(0, Ordering::Relaxed);
         self.slots[index].held.store(0, Ordering::Relaxed);
         drop(guard);
-        self.rebuild(index);
+        self.rebuild(index, Some(err));
     }
 
     fn rebuild_due(&self, index: usize) -> bool {
@@ -215,8 +214,13 @@ impl GuestPool {
         due && slot.guest.try_lock().is_some_and(|guard| guard.is_none())
     }
 
-    fn rebuild(&self, index: usize) {
+    /// Build a new guest for a slot that has none.
+    ///
+    /// `failure` is the error that made the slot lose its guest, when the rebuild follows it
+    /// directly.
+    fn rebuild(&self, index: usize, failure: Option<&GuestError>) {
         let slot = &self.slots[index];
+        let name = &self.name;
         match self.start() {
             Ok(loaded) => {
                 let mut guard = slot.guest.lock();
@@ -225,18 +229,22 @@ impl GuestPool {
                     slot.open.store(0, Ordering::Relaxed);
                     slot.held.store(0, Ordering::Relaxed);
                     *slot.failed_at.lock() = None;
-                    warn!(
-                        "wasm plugin {} rebuilt the guest of slot {index}",
-                        self.name
-                    );
+                    match failure {
+                        Some(failure) => warn!(
+                            "wasm plugin {name} replaced the guest of slot {index} after a failure: {failure}"
+                        ),
+                        None => warn!("wasm plugin {name} rebuilt the guest of slot {index}"),
+                    }
                 }
             }
             Err(e) => {
                 *slot.failed_at.lock() = Some(Instant::now());
-                error!(
-                    "wasm plugin {} could not rebuild slot {index}: {e}",
-                    self.name
-                );
+                match failure {
+                    Some(failure) => error!(
+                        "wasm plugin {name} lost the guest of slot {index} after a failure: {failure}, and could not rebuild it: {e}"
+                    ),
+                    None => error!("wasm plugin {name} could not rebuild slot {index}: {e}"),
+                }
             }
         }
     }
@@ -292,7 +300,7 @@ mod tests {
         /// Replace the guest of a slot, as a trap does.
         pub(crate) fn replace_slot(&self, index: usize) {
             self.slots[index].guest.lock().take();
-            self.rebuild(index);
+            self.rebuild(index, None);
         }
 
         pub(crate) fn fail_slot(&self, index: usize) {
