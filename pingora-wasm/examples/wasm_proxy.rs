@@ -137,6 +137,9 @@ impl ProxyHttp for PluginProxy {
 // RUST_LOG=INFO cargo run --example wasm_proxy -- --callout-upstream httpbin=127.0.0.1:8080 \
 //     tests/fixtures/sdk-http-auth-random.wasm
 // curl -i 127.0.0.1:6190/headers
+//
+// When a plugin fails, the host crate logs a warning too. To hide it, use
+// RUST_LOG=info,proxy_wasm_host=error
 fn main() {
     env_logger::init();
 
