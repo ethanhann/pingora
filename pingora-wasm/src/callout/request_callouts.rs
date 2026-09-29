@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The callouts that a request waits for.
+//! The callouts of one request.
 
 use super::{AcceptedCallout, CalloutResult};
 use proxy_wasm_host::abi::v0_2_1::CalloutId;
@@ -22,11 +22,12 @@ use std::pin::Pin;
 use std::task::Poll;
 use tokio::task::JoinHandle;
 
-/// The result of a callout, or the task that produces it.
+/// The result of a callout that the plugin did not receive yet.
 #[derive(Debug)]
 pub(crate) enum PendingResult {
-    Running(JoinHandle<CalloutResult>),
-    Ready(CalloutResult),
+    /// The task that sends the callout returns the result.
+    FromTask(JoinHandle<CalloutResult>),
+    Known(CalloutResult),
 }
 
 struct PendingCallout {
@@ -103,8 +104,8 @@ impl RequestCallouts {
                     continue;
                 }
                 let ready = match &mut pending.result {
-                    PendingResult::Ready(result) => Poll::Ready(result.clone()),
-                    PendingResult::Running(task) => Pin::new(task)
+                    PendingResult::Known(result) => Poll::Ready(result.clone()),
+                    PendingResult::FromTask(task) => Pin::new(task)
                         .poll(cx)
                         .map(|joined| joined.unwrap_or(CalloutResult::Failed)),
                 };

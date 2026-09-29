@@ -45,8 +45,8 @@ pub(crate) struct PingoraStream {
     pub(crate) trailers: Option<ResponseTrailers>,
     pub(crate) body_buffer: BodyBuffer,
     pub(crate) plugin_response: Option<PluginResponse>,
-    request_continue_requested: bool,
-    response_continue_requested: bool,
+    asked_to_continue_request: bool,
+    asked_to_continue_response: bool,
     /// The callback whose access applies while the plugin receives the result of a callout.
     pub(crate) delivery_callback: Option<Callback>,
     empty: VecHeaderMap,
@@ -62,15 +62,15 @@ impl PingoraStream {
 
     /// Forget the directions that the plugin asked to continue in the last guest call.
     pub(crate) fn clear_continue_requests(&mut self) {
-        self.request_continue_requested = false;
-        self.response_continue_requested = false;
+        self.asked_to_continue_request = false;
+        self.asked_to_continue_response = false;
     }
 
     /// Return whether the plugin asked to continue `direction` in the last guest call.
     pub(crate) fn continue_requested(&self, direction: StreamType) -> bool {
         match direction {
-            StreamType::HttpRequest => self.request_continue_requested,
-            StreamType::HttpResponse => self.response_continue_requested,
+            StreamType::HttpRequest => self.asked_to_continue_request,
+            StreamType::HttpResponse => self.asked_to_continue_response,
             _ => false,
         }
     }
@@ -187,8 +187,8 @@ impl StreamState for PingoraStream {
 
     fn continue_stream(&mut self, _call: Invocation, stream: StreamType) -> Result<(), Status> {
         match stream {
-            StreamType::HttpRequest => self.request_continue_requested = true,
-            StreamType::HttpResponse => self.response_continue_requested = true,
+            StreamType::HttpRequest => self.asked_to_continue_request = true,
+            StreamType::HttpResponse => self.asked_to_continue_response = true,
             StreamType::Downstream => {}
             StreamType::Upstream => return Err(Status::Unimplemented),
         }

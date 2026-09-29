@@ -61,7 +61,7 @@ impl WasmCtx {
         }
         self.scheme = scheme_of(session);
         for position in 0..self.chain.plugins.len() {
-            let action = self.run_request_headers_of(session, position, end_of_stream)?;
+            let action = self.run_request_headers_at(session, position, end_of_stream)?;
             let sent = self.stream().plugin_response.take();
             let paused =
                 sent.is_none() && self.plugin_stays_paused(action, StreamType::HttpRequest);
@@ -75,10 +75,10 @@ impl WasmCtx {
             if !self.waits_for_callout(position) {
                 return Err(self.plugin_error(position, PAUSED_A_REQUEST));
             }
-            let waited = self
+            let wait_outcome = self
                 .wait_for_callouts(session, position, PausedPhase::RequestHeaders)
                 .await?;
-            match waited {
+            match wait_outcome {
                 CalloutWaitOutcome::Continued => {}
                 CalloutWaitOutcome::StillPaused => {
                     return Err(self.plugin_error(position, PAUSED_A_REQUEST))
@@ -92,7 +92,7 @@ impl WasmCtx {
     }
 
     /// Create the context of the plugin at `position`, and run its `proxy_on_request_headers`.
-    fn run_request_headers_of<DS: DownstreamSession>(
+    fn run_request_headers_at<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
         position: usize,

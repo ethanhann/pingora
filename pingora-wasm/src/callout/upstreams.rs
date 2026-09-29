@@ -45,15 +45,15 @@ use std::collections::HashMap;
 ///
 /// #[async_trait]
 /// impl CalloutUpstreams for Balanced {
-///     fn has_upstream(&self, _plugin: &str, upstream: &str) -> bool {
-///         self.upstreams.contains_key(upstream)
+///     fn has_upstream(&self, _plugin_name: &str, upstream_name: &str) -> bool {
+///         self.upstreams.contains_key(upstream_name)
 ///     }
 ///
 ///     async fn callout_peer(&self, target: &CalloutTarget<'_>) -> Result<Box<HttpPeer>> {
 ///         let host = &target.request.headers["host"];
 ///         let backend = self
 ///             .upstreams
-///             .get(target.upstream)
+///             .get(target.upstream_name)
 ///             .and_then(|balancer| balancer.select(host.as_bytes(), 256))
 ///             .ok_or_else(|| Error::explain(ErrorType::ConnectNoRoute, "no healthy backend"))?;
 ///         Ok(Box::new(HttpPeer::new(backend, false, String::new())))
@@ -62,12 +62,12 @@ use std::collections::HashMap;
 /// ```
 #[async_trait]
 pub trait CalloutUpstreams: Send + Sync {
-    /// Return whether `plugin` can send callouts to `upstream`.
+    /// Return whether the plugin can send callouts to the upstream.
     ///
     /// The runtime calls this method inside the plugin's call to `proxy_http_call`, so it must
     /// not block. When it returns `false`, the plugin receives `BAD_ARGUMENT` and no callout is
     /// sent.
-    fn has_upstream(&self, plugin: &str, upstream: &str) -> bool;
+    fn has_upstream(&self, plugin_name: &str, upstream_name: &str) -> bool;
 
     /// Select the peer for one callout.
     ///
@@ -92,9 +92,9 @@ pub trait CalloutUpstreams: Send + Sync {
 #[derive(Debug, Clone, Copy)]
 pub struct CalloutTarget<'a> {
     /// The name of the plugin that sent the callout.
-    pub plugin: &'a str,
+    pub plugin_name: &'a str,
     /// The upstream name that the plugin passed.
-    pub upstream: &'a str,
+    pub upstream_name: &'a str,
     /// The request header of the callout. Its `host` header has the `:authority` that the
     /// plugin passed, which you can use as a load balancing key.
     pub request: &'a RequestHeader,
@@ -103,11 +103,11 @@ pub struct CalloutTarget<'a> {
 impl<'a> CalloutTarget<'a> {
     /// Create a target, for example to test your own [CalloutUpstreams].
     ///
-    /// A field that a later version adds has a default value here.
-    pub fn new(plugin: &'a str, upstream: &'a str, request: &'a RequestHeader) -> Self {
+    /// Fields that are added later get a default value.
+    pub fn new(plugin_name: &'a str, upstream_name: &'a str, request: &'a RequestHeader) -> Self {
         CalloutTarget {
-            plugin,
-            upstream,
+            plugin_name,
+            upstream_name,
             request,
         }
     }
@@ -127,29 +127,29 @@ impl StaticCalloutUpstreams {
         Self::default()
     }
 
-    /// Add an upstream, and return the peer that it replaced.
-    pub fn insert(&mut self, upstream: impl Into<String>, peer: HttpPeer) -> Option<HttpPeer> {
-        self.peers.insert(upstream.into(), peer)
+    /// Add an upstream. Return the peer that the upstream had before, if any.
+    pub fn insert(&mut self, upstream_name: impl Into<String>, peer: HttpPeer) -> Option<HttpPeer> {
+        self.peers.insert(upstream_name.into(), peer)
     }
 
     /// Return the peer of an upstream.
-    pub fn peer(&self, upstream: &str) -> Option<&HttpPeer> {
-        self.peers.get(upstream)
+    pub fn peer(&self, upstream_name: &str) -> Option<&HttpPeer> {
+        self.peers.get(upstream_name)
     }
 }
 
 #[async_trait]
 impl CalloutUpstreams for StaticCalloutUpstreams {
-    fn has_upstream(&self, _plugin: &str, upstream: &str) -> bool {
-        self.peers.contains_key(upstream)
+    fn has_upstream(&self, _plugin_name: &str, upstream_name: &str) -> bool {
+        self.peers.contains_key(upstream_name)
     }
 
     async fn callout_peer(&self, target: &CalloutTarget<'_>) -> Result<Box<HttpPeer>> {
-        match self.peer(target.upstream) {
+        match self.peer(target.upstream_name) {
             Some(peer) => Ok(Box::new(peer.clone())),
             None => Error::e_explain(
                 ErrorType::ConnectNoRoute,
-                format!("callout upstream {} has no peer", target.upstream),
+                format!("callout upstream {} has no peer", target.upstream_name),
             ),
         }
     }

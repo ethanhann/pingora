@@ -67,10 +67,10 @@ impl WasmCtx {
         }
         self.chain.runtime.start_ticker()?;
         let chunk = body.take().unwrap_or_default();
-        let ran = self
+        let outcome = self
             .run_body_callbacks(session, BodyDirection::Response, chunk, end_of_stream)
             .await?;
-        match ran {
+        match outcome {
             BodyOutcome::Released(output) => {
                 *body = filter_output(output, end_of_stream);
                 Ok(())

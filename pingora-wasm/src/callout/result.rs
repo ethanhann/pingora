@@ -15,24 +15,25 @@
 //! The result of a callout, and the responses that the crate creates for a callout that
 //! received none.
 //!
-//! The status codes and the bodies are those of Envoy, because plugins are written for them.
+//! The status codes and the bodies match those of Envoy, because plugins are written against
+//! them.
 
 use bytes::Bytes;
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::StatusCode;
 use pingora_error::{Error, ErrorType};
 
-const PSEUDO_STATUS: &[u8] = b":status";
+pub(super) const PSEUDO_STATUS: &[u8] = b":status";
 const TEXT_PLAIN: &[u8] = b"text/plain";
 const TIMEOUT_BODY: &str = "upstream request timeout";
 const NO_HEALTHY_UPSTREAM_BODY: &str = "no healthy upstream";
 const RESET_BODY_PREFIX: &str =
     "upstream connect error or disconnect/reset before headers. reset reason: ";
-const RESET_BY_OVERFLOW: &str = "overflow";
-const RESET_BY_CONNECT_TIMEOUT: &str = "connection timeout";
-const RESET_BY_CONNECT_FAILURE: &str = "remote connection failure";
-const RESET_BY_PROTOCOL_ERROR: &str = "protocol error";
-const RESET_BY_TERMINATION: &str = "connection termination";
+const RESET_REASON_OVERFLOW: &str = "overflow";
+const RESET_REASON_CONNECT_TIMEOUT: &str = "connection timeout";
+const RESET_REASON_CONNECT_FAILURE: &str = "remote connection failure";
+const RESET_REASON_PROTOCOL_ERROR: &str = "protocol error";
+const RESET_REASON_TERMINATION: &str = "connection termination";
 
 /// Header pairs that own their bytes.
 pub(crate) type OwnedHeaderPairs = Vec<(Vec<u8>, Vec<u8>)>;
@@ -54,7 +55,7 @@ pub(crate) enum CalloutResult {
 
 impl CalloutResult {
     /// Create the response for a callout that received no response header.
-    fn made_response(status: StatusCode, body: String) -> Self {
+    fn synthetic_response(status: StatusCode, body: String) -> Self {
         let length = body.len().to_string().into_bytes();
         let headers = vec![
             (PSEUDO_STATUS.to_vec(), status.as_str().as_bytes().to_vec()),
@@ -72,32 +73,32 @@ impl CalloutResult {
     }
 
     fn reset_response(status: StatusCode, reason: &str) -> Self {
-        Self::made_response(status, format!("{RESET_BODY_PREFIX}{reason}"))
+        Self::synthetic_response(status, format!("{RESET_BODY_PREFIX}{reason}"))
     }
 
     /// Create the response for a callout that reached its timeout.
     pub(crate) fn timeout_response() -> Self {
-        Self::made_response(StatusCode::GATEWAY_TIMEOUT, TIMEOUT_BODY.to_string())
+        Self::synthetic_response(StatusCode::GATEWAY_TIMEOUT, TIMEOUT_BODY.to_string())
     }
 
     /// Create the response for a callout whose upstream has no peer.
     pub(crate) fn no_healthy_upstream_response() -> Self {
         let body = NO_HEALTHY_UPSTREAM_BODY.to_string();
-        Self::made_response(StatusCode::SERVICE_UNAVAILABLE, body)
+        Self::synthetic_response(StatusCode::SERVICE_UNAVAILABLE, body)
     }
 
     /// Create the response for a callout over the limit of the callouts in flight.
     pub(crate) fn overflow_response() -> Self {
-        Self::reset_response(StatusCode::SERVICE_UNAVAILABLE, RESET_BY_OVERFLOW)
+        Self::reset_response(StatusCode::SERVICE_UNAVAILABLE, RESET_REASON_OVERFLOW)
     }
 
     /// Create the response for a connection that failed with `e`.
     pub(crate) fn connect_failure_response(e: &Error) -> Self {
         let reason = match e.etype() {
             ErrorType::ConnectTimedout | ErrorType::TLSHandshakeTimedout => {
-                RESET_BY_CONNECT_TIMEOUT
+                RESET_REASON_CONNECT_TIMEOUT
             }
-            _ => RESET_BY_CONNECT_FAILURE,
+            _ => RESET_REASON_CONNECT_FAILURE,
         };
         Self::reset_response(StatusCode::SERVICE_UNAVAILABLE, reason)
     }
@@ -111,9 +112,9 @@ impl CalloutResult {
             | ErrorType::H2Error
             | ErrorType::InvalidH2
             | ErrorType::H2Downgrade => {
-                Self::reset_response(StatusCode::BAD_GATEWAY, RESET_BY_PROTOCOL_ERROR)
+                Self::reset_response(StatusCode::BAD_GATEWAY, RESET_REASON_PROTOCOL_ERROR)
             }
-            _ => Self::reset_response(StatusCode::SERVICE_UNAVAILABLE, RESET_BY_TERMINATION),
+            _ => Self::reset_response(StatusCode::SERVICE_UNAVAILABLE, RESET_REASON_TERMINATION),
         }
     }
 }

@@ -44,17 +44,17 @@ pub(crate) fn callout_request_header(
     pairs: &HeaderPairs<'_>,
     body_len: usize,
 ) -> Option<RequestHeader> {
-    let pseudo = |name: &[u8]| {
+    let pseudo_header = |name: &[u8]| {
         pairs
             .iter()
             .find(|(key, _)| key.as_ref() == name)
             .map(|(_, value)| value.as_ref())
     };
-    let method = Method::from_bytes(pseudo(PSEUDO_METHOD)?).ok()?;
-    let path = pseudo(PSEUDO_PATH)?;
+    let method = Method::from_bytes(pseudo_header(PSEUDO_METHOD)?).ok()?;
+    let path = pseudo_header(PSEUDO_PATH)?;
     let mut request = RequestHeader::build(method, path, Some(pairs.len())).ok()?;
     request
-        .insert_header(HOST, pseudo(PSEUDO_AUTHORITY)?)
+        .insert_header(HOST, pseudo_header(PSEUDO_AUTHORITY)?)
         .ok()?;
     for (key, value) in pairs {
         if key.starts_with(PSEUDO_PREFIX) {

@@ -97,7 +97,7 @@ impl CalloutLauncher {
     }
 
     /// Return the number of callouts that are being sent.
-    pub(crate) fn in_flight(&self) -> usize {
+    pub(crate) fn in_flight_count(&self) -> usize {
         self.limit - self.in_flight_permits.available_permits()
     }
 
@@ -107,13 +107,13 @@ impl CalloutLauncher {
     /// tokio runtime is running, so the callout cannot be sent.
     pub(crate) fn spawn(&self, callout: AcceptedCallout) -> Option<PendingResult> {
         let Ok(permit) = self.in_flight_permits.clone().try_acquire_owned() else {
-            callout.conf.warn_of_overflow_once();
-            return Some(PendingResult::Ready(CalloutResult::overflow_response()));
+            callout.plugin_conf.warn_of_overflow_once();
+            return Some(PendingResult::Known(CalloutResult::overflow_response()));
         };
         let Ok(tokio_runtime) = Handle::try_current() else {
             warn!(
                 "wasm plugin {} sent a callout with no tokio runtime running, and the callout is dropped",
-                callout.conf.plugin
+                callout.plugin_conf.plugin_name
             );
             return None;
         };
@@ -123,6 +123,6 @@ impl CalloutLauncher {
             drop(permit);
             result
         });
-        Some(PendingResult::Running(task))
+        Some(PendingResult::FromTask(task))
     }
 }

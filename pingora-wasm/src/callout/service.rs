@@ -28,26 +28,27 @@ use std::sync::Arc;
 /// The state of the guest call in progress.
 #[derive(Default)]
 struct GuestCallState {
-    /// The stream context that the phase calls the guest for.
+    /// The stream context that the call is for.
     calling_context: Option<ContextId>,
     accepted: Vec<AcceptedCallout>,
 }
 
 /// The service that accepts the callouts of one guest.
 ///
-/// Callout ids are unique only within one guest, so each guest has its own service. The service
-/// accepts a callout only from the stream context that a phase calls the guest for. A plugin
-/// cannot send a callout from its root context, because no phase can deliver the result.
+/// Callout ids are unique only within one guest, so each guest has its own service. During a
+/// guest call, the service accepts callouts only from the stream context that the call is for.
+/// A plugin cannot send a callout from its root context, because no phase can deliver the
+/// result.
 pub(crate) struct GuestCalloutService {
     conf: Arc<PluginCalloutConf>,
-    guest_call: Mutex<GuestCallState>,
+    call_in_progress: Mutex<GuestCallState>,
 }
 
 impl GuestCalloutService {
     pub(crate) fn new(conf: Arc<PluginCalloutConf>) -> Self {
         GuestCalloutService {
             conf,
-            guest_call: Mutex::new(GuestCallState::default()),
+            call_in_progress: Mutex::new(GuestCallState::default()),
         }
     }
 
@@ -58,13 +59,13 @@ impl GuestCalloutService {
         context: ContextId,
         guest_call: impl FnOnce() -> R,
     ) -> (R, Vec<AcceptedCallout>) {
-        *self.guest_call.lock() = GuestCallState {
+        *self.call_in_progress.lock() = GuestCallState {
             calling_context: Some(context),
             accepted: Vec::new(),
         };
         let result = guest_call();
-        let ended = mem::take(&mut *self.guest_call.lock());
-        (result, ended.accepted)
+        let state_at_the_end = mem::take(&mut *self.call_in_progress.lock());
+        (result, state_at_the_end.accepted)
     }
 }
 
@@ -75,10 +76,10 @@ impl Callouts for GuestCalloutService {
         callout: CalloutId,
         request: HttpCall<'_>,
     ) -> Result<(), HttpCallRefusal> {
-        let plugin = &self.conf.plugin;
-        let mut guest_call = self.guest_call.lock();
-        if guest_call.calling_context != Some(call.context) {
-            warn!("wasm plugin {plugin} sent a callout from a context other than its current request, which is refused");
+        let plugin = &self.conf.plugin_name;
+        let mut call_in_progress = self.call_in_progress.lock();
+        if call_in_progress.calling_context != Some(call.context) {
+            warn!("wasm plugin {plugin} sent a callout from a context other than its current request, so the callout is refused");
             return Err(HttpCallRefusal::Failed);
         }
         let Ok(upstream) = std::str::from_utf8(&request.upstream) else {
@@ -94,9 +95,9 @@ impl Callouts for GuestCalloutService {
         if !request.trailers.is_empty() {
             debug!("wasm plugin {plugin} passed callout trailers, which are not sent");
         }
-        guest_call.accepted.push(AcceptedCallout {
+        call_in_progress.accepted.push(AcceptedCallout {
             id: callout,
-            conf: self.conf.clone(),
+            plugin_conf: self.conf.clone(),
             upstream: upstream.to_string(),
             request: Box::new(header),
             body: Bytes::copy_from_slice(&request.body),

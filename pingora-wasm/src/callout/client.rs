@@ -14,7 +14,7 @@
 
 //! The client that sends a callout to its peer.
 
-use super::result::OwnedHeaderPairs;
+use super::result::{OwnedHeaderPairs, PSEUDO_STATUS};
 use super::{AcceptedCallout, CalloutResult, CalloutTarget, CalloutUpstreams};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -27,8 +27,6 @@ use pingora_error::{Error, ErrorType, Result};
 use pingora_timeout::timeout;
 use std::sync::Arc;
 use std::time::Instant;
-
-const PSEUDO_STATUS: &[u8] = b":status";
 
 /// The interface that sends a callout and returns its result.
 ///
@@ -58,13 +56,13 @@ impl CalloutSender for ConnectorSender {
         let deadline = Instant::now() + callout.timeout;
         let mut response = match timeout(callout.timeout, self.send_to_peer(&callout)).await {
             Ok(Ok(response)) => response,
-            Ok(Err(made_response)) => return made_response,
+            Ok(Err(synthetic_response)) => return synthetic_response,
             Err(_) => return CalloutResult::timeout_response(),
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let limit = callout.conf.response_limit;
-        let rest = read_body_and_trailers(&mut response.session, limit);
-        let Ok(Ok(Some((body, trailers)))) = timeout(remaining, rest).await else {
+        let limit = callout.plugin_conf.response_limit;
+        let body_and_trailers = read_body_and_trailers(&mut response.session, limit);
+        let Ok(Ok(Some((body, trailers)))) = timeout(remaining, body_and_trailers).await else {
             return CalloutResult::Failed;
         };
         let idle_timeout = response.peer.idle_timeout();
@@ -87,7 +85,7 @@ impl ConnectorSender {
         &self,
         callout: &AcceptedCallout,
     ) -> Result<ResponseInProgress, CalloutResult> {
-        let plugin = &callout.conf.plugin;
+        let plugin = &callout.plugin_conf.plugin_name;
         let upstream = &callout.upstream;
         let target = CalloutTarget::new(plugin, upstream, &callout.request);
         let peer = match self.upstreams.callout_peer(&target).await {
@@ -108,7 +106,7 @@ impl ConnectorSender {
             };
             session.set_write_timeout(peer.options.write_timeout);
             session.set_read_timeout(peer.options.read_timeout);
-            let e = match exchange_headers(&mut session, callout).await {
+            let e = match write_request_and_read_response_header(&mut session, callout).await {
                 Ok(headers) => {
                     return Ok(ResponseInProgress {
                         session,
@@ -132,7 +130,7 @@ impl ConnectorSender {
 
 /// Write the request of `callout`, and read the response header as the pairs that the plugin
 /// reads.
-async fn exchange_headers(
+async fn write_request_and_read_response_header(
     session: &mut HttpSession,
     callout: &AcceptedCallout,
 ) -> Result<OwnedHeaderPairs> {
@@ -274,7 +272,7 @@ mod tests {
         let request = crate::callout::headers::callout_request_header("a", &headers, body.len());
         AcceptedCallout {
             id: 1.try_into().unwrap(),
-            conf: Arc::new(conf),
+            plugin_conf: Arc::new(conf),
             upstream: "authz".to_string(),
             request: Box::new(request.unwrap()),
             body: Bytes::from_static(body.as_bytes()),
@@ -365,7 +363,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_callout_with_no_response_header_returns_a_made_response() {
+    async fn a_callout_with_no_response_header_returns_a_synthetic_response() {
         let reset = |reason: &str| format!("{RESET_BODY_PREFIX}{reason}");
         let refused = closed_port().await;
         let closes = start_h1_origin(b"", AfterResponse::Close).await;
@@ -479,7 +477,7 @@ mod tests {
 
     #[async_trait]
     impl CalloutUpstreams for NoHealthyPeer {
-        fn has_upstream(&self, _plugin: &str, _upstream: &str) -> bool {
+        fn has_upstream(&self, _plugin_name: &str, _upstream_name: &str) -> bool {
             true
         }
 
@@ -489,7 +487,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_callout_with_no_peer_returns_a_made_response() {
+    async fn a_callout_with_no_peer_returns_a_synthetic_response() {
         let sender = ConnectorSender {
             connector: Arc::new(Connector::new(None)),
             upstreams: Arc::new(NoHealthyPeer),

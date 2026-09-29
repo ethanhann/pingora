@@ -96,10 +96,10 @@ impl WasmCtx {
         self.request_body.progress = RequestBodyProgress::Streaming;
         self.chain.runtime.start_ticker()?;
         let chunk = body.take().unwrap_or_default();
-        let ran = self
+        let outcome = self
             .run_body_callbacks(session, BodyDirection::Request, chunk, end_of_stream)
             .await?;
-        match ran {
+        match outcome {
             BodyOutcome::Released(output) => {
                 if end_of_stream {
                     self.request_body.progress = RequestBodyProgress::Ended;

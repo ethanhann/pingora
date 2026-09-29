@@ -84,7 +84,9 @@ impl WasmCtx {
         trailers: &mut http::HeaderMap,
     ) -> Result<()> {
         let mut remaining = self.records.len();
-        while let Some(position) = self.run_trailer_callbacks_of(session, trailers, remaining)? {
+        while let Some(position) =
+            self.run_trailer_callbacks_before(session, trailers, remaining)?
+        {
             let phase = PausedPhase::ResponseTrailers(&mut *trailers);
             match self.wait_for_callouts(session, position, phase).await? {
                 CalloutWaitOutcome::Continued => remaining = position,
@@ -101,7 +103,7 @@ impl WasmCtx {
     /// order.
     ///
     /// Return the position of a plugin that paused and has a callout to wait for.
-    fn run_trailer_callbacks_of<DS: DownstreamSession>(
+    fn run_trailer_callbacks_before<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
         trailers: &mut http::HeaderMap,

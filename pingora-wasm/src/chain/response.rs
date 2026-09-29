@@ -81,8 +81,8 @@ impl WasmCtx {
         loop {
             let positions = (0..remaining).rev();
             let origin = ResponseSource::Upstream;
-            let ran = self.response_pass(session, resp, positions, end_of_stream, origin)?;
-            let position = match ran {
+            let outcome = self.response_pass(session, resp, positions, end_of_stream, origin)?;
+            let position = match outcome {
                 ResponsePassOutcome::Finished => break,
                 ResponsePassOutcome::Respond(position, response) => {
                     return Err(self

@@ -20,13 +20,13 @@
 
 mod client;
 pub(crate) mod headers;
-mod pending;
+mod request_callouts;
 mod result;
 mod service;
 mod upstreams;
 
 pub(crate) use client::{CalloutSender, ConnectorSender};
-pub(crate) use pending::{PendingResult, RequestCallouts};
+pub(crate) use request_callouts::{PendingResult, RequestCallouts};
 pub(crate) use result::CalloutResult;
 pub(crate) use service::GuestCalloutService;
 pub use upstreams::{CalloutTarget, CalloutUpstreams, StaticCalloutUpstreams};
@@ -41,7 +41,7 @@ use std::time::Duration;
 
 /// The callout settings of one plugin. All guests of the plugin share them.
 pub(crate) struct PluginCalloutConf {
-    pub(crate) plugin: String,
+    pub(crate) plugin_name: String,
     pub(crate) upstreams: Arc<dyn CalloutUpstreams>,
     pub(crate) timeout_limit: Duration,
     pub(crate) response_limit: usize,
@@ -51,13 +51,13 @@ pub(crate) struct PluginCalloutConf {
 
 impl PluginCalloutConf {
     pub(crate) fn new(
-        plugin: &str,
+        plugin_name: &str,
         upstreams: Arc<dyn CalloutUpstreams>,
         timeout_limit: Duration,
         response_limit: usize,
     ) -> Self {
         PluginCalloutConf {
-            plugin: plugin.to_string(),
+            plugin_name: plugin_name.to_string(),
             upstreams,
             timeout_limit,
             response_limit,
@@ -74,7 +74,7 @@ impl PluginCalloutConf {
         if !self.timeout_warning_logged.swap(true, Ordering::Relaxed) {
             warn!(
                 "wasm plugin {} passed a callout timeout of {passed:?}, so its callout_timeout_limit of {:?} applies",
-                self.plugin, self.timeout_limit
+                self.plugin_name, self.timeout_limit
             );
         }
         self.timeout_limit
@@ -85,7 +85,7 @@ impl PluginCalloutConf {
         if !self.overflow_warning_logged.swap(true, Ordering::Relaxed) {
             warn!(
                 "wasm plugin {} sent a callout over max_callouts_in_flight, and receives a 503 response for it",
-                self.plugin
+                self.plugin_name
             );
         }
     }
@@ -94,7 +94,7 @@ impl PluginCalloutConf {
 /// A callout that a plugin sent with `proxy_http_call` and that no task has started yet.
 pub(crate) struct AcceptedCallout {
     pub(crate) id: CalloutId,
-    pub(crate) conf: Arc<PluginCalloutConf>,
+    pub(crate) plugin_conf: Arc<PluginCalloutConf>,
     pub(crate) upstream: String,
     pub(crate) request: Box<RequestHeader>,
     pub(crate) body: Bytes,

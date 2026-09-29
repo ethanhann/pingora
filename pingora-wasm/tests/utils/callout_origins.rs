@@ -122,12 +122,12 @@ impl CalloutOriginPerPlugin {
 
 #[async_trait]
 impl CalloutUpstreams for CalloutOriginPerPlugin {
-    fn has_upstream(&self, plugin: &str, _upstream: &str) -> bool {
-        self.origins.contains_key(plugin)
+    fn has_upstream(&self, plugin_name: &str, _upstream_name: &str) -> bool {
+        self.origins.contains_key(plugin_name)
     }
 
     async fn callout_peer(&self, target: &CalloutTarget<'_>) -> Result<Box<HttpPeer>> {
-        match self.origins.get(target.plugin) {
+        match self.origins.get(target.plugin_name) {
             Some(origin) => Ok(Box::new(HttpPeer::new(origin.addr, false, String::new()))),
             None => Error::e_explain(ErrorType::InternalError, "the plugin has no origin"),
         }

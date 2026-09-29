@@ -93,14 +93,14 @@ impl WasmCtx {
         let mut first_step = 0;
         let mut current = chunk;
         loop {
-            let ran = self.run_body_callbacks_from(
+            let outcome = self.run_body_callbacks_from(
                 session,
                 direction,
                 first_step,
                 current,
                 end_of_stream,
             )?;
-            let step = match ran {
+            let step = match outcome {
                 BodyCallbacksOutcome::Finished(outcome) => return Ok(outcome),
                 BodyCallbacksOutcome::WaitsForCallout(step) => step,
             };

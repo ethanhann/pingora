@@ -102,9 +102,9 @@
 //! that does not handle that status fails to start.
 //!
 //! The runtime sends at most [WasmServices::max_callouts_in_flight] callouts at the same time.
-//! Each guest accepts at most `max_open_callouts` of its [limits](WasmPluginConf::limits) open
-//! callouts, so at most that number of requests can wait in each of the plugin's
-//! [slots](WasmPluginConf::slots). If more requests of a plugin wait at the same time, raise
+//! Each guest can have at most `max_open_callouts` callouts open, which is one of the
+//! [limits](WasmPluginConf::limits) of its plugin. A plugin can therefore have that number of
+//! waiting requests in each of its [slots](WasmPluginConf::slots). If you expect more, raise
 //! the number of slots or that limit.
 //!
 //! # When a plugin fails

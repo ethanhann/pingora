@@ -218,7 +218,7 @@ impl WasmRuntime {
     /// A callout counts until it receives its response or reaches its timeout, even when its
     /// request has already ended.
     pub fn callouts_in_flight(&self) -> usize {
-        self.inner.callout_launcher.in_flight()
+        self.inner.callout_launcher.in_flight_count()
     }
 }
 

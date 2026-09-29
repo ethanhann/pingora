@@ -129,23 +129,23 @@ impl WasmCtx {
         position: usize,
     ) -> Result<Option<(CalloutId, CalloutResult)>> {
         let mut result = pin!(self.callouts.next_result(position));
-        let Some(closed) = session.as_downstream_mut().watch_h2_stream_close() else {
+        let Some(stream_close) = session.as_downstream_mut().watch_h2_stream_close() else {
             return Ok(result.await);
         };
-        let mut closed = pin!(closed);
+        let mut stream_close = pin!(stream_close);
         poll_fn(|cx| {
             if let Poll::Ready(result) = result.as_mut().poll(cx) {
                 return Poll::Ready(Ok(result));
             }
-            closed.as_mut().poll(cx).map(|reason| {
-                let closed = match reason {
+            stream_close.as_mut().poll(cx).map(|reason| {
+                let error = match reason {
                     Ok(reason) => Error::explain(
                         ErrorType::H2Error,
                         format!("downstream H2 stream closed (reason: {reason}) while a wasm plugin waited for a callout"),
                     ),
                     Err(e) => e,
                 };
-                Err(closed.into_down())
+                Err(error.into_down())
             })
         })
         .await
@@ -190,18 +190,18 @@ mod tests {
         ResponseTrailers,
     }
 
-    /// The response header, the body chunk, and the trailers that a phase can change.
-    struct Exchange {
+    /// The response header, the body chunk, and the trailers that a phase runs on.
+    struct PhaseInputs {
         response: ResponseHeader,
         body: Option<Bytes>,
         trailers: http::HeaderMap,
     }
 
-    impl Exchange {
+    impl PhaseInputs {
         fn new() -> Self {
             let mut response = ResponseHeader::build(200, None).unwrap();
             response.insert_header(CONTENT_LENGTH, 1).unwrap();
-            Exchange {
+            PhaseInputs {
                 response,
                 body: body_chunk("x"),
                 trailers: http::HeaderMap::new(),
@@ -210,23 +210,23 @@ mod tests {
     }
 
     /// Run the request headers and the first upstream attempt of a new request.
-    async fn start(ctx: &mut WasmCtx, session: &mut Session) {
+    async fn run_request_headers(ctx: &mut WasmCtx, session: &mut Session) {
         ctx.request_filter(session).await.unwrap();
         ctx.upstream_attempt();
     }
 
     /// Run `phase` on the last chunk of a body, or on the headers or the trailers.
-    async fn run(
+    async fn run_phase(
         ctx: &mut WasmCtx,
         session: &mut Session,
         phase: Phase,
-        exchange: &mut Exchange,
+        inputs: &mut PhaseInputs,
     ) -> Result<()> {
-        let Exchange {
+        let PhaseInputs {
             response,
             body,
             trailers,
-        } = exchange;
+        } = inputs;
         match phase {
             Phase::RequestBody => ctx.request_body_filter(session, body, true).await,
             Phase::ResponseHeaders => ctx.response_filter(session, response).await,
@@ -240,7 +240,7 @@ mod tests {
 
     /// Return a plugin whose `phase` has the callback `callback`, with `delivery` as its
     /// `proxy_on_http_call_response`.
-    fn plugin_for(
+    fn plugin_with_callback_in(
         name: &str,
         phase: Phase,
         callback: &'static str,
@@ -306,13 +306,13 @@ mod tests {
         let sender = FixedSender::responds("allowed");
         let (_runtime, mut ctx) = callout_ctx(vec![body_plugin("a", wat)], sender);
         let (mut session, _client) = session(POST).await;
-        start(&mut ctx, &mut session).await;
-        let mut exchange = Exchange::new();
+        run_request_headers(&mut ctx, &mut session).await;
+        let mut inputs = PhaseInputs::new();
 
-        let ran = run(&mut ctx, &mut session, Phase::RequestBody, &mut exchange).await;
+        let result = run_phase(&mut ctx, &mut session, Phase::RequestBody, &mut inputs).await;
 
-        assert!(ran.is_ok());
-        assert_eq!(exchange.body, body_chunk("ax"));
+        assert!(result.is_ok());
+        assert_eq!(inputs.body, body_chunk("ax"));
     }
 
     #[tokio::test]
@@ -395,16 +395,16 @@ mod tests {
 
         for (phase, callback) in cases {
             let sender = FixedSender::responds("unused");
-            let plugins = vec![plugin_for("a", phase, callback, STAY_PAUSED)];
+            let plugins = vec![plugin_with_callback_in("a", phase, callback, STAY_PAUSED)];
             let (_runtime, mut ctx) = callout_ctx(plugins, sender);
             let (mut session, _client) = session(POST).await;
-            start(&mut ctx, &mut session).await;
-            let mut exchange = Exchange::new();
+            run_request_headers(&mut ctx, &mut session).await;
+            let mut inputs = PhaseInputs::new();
 
-            let ran = run(&mut ctx, &mut session, phase, &mut exchange).await;
+            let result = run_phase(&mut ctx, &mut session, phase, &mut inputs).await;
 
-            assert!(ran.is_ok(), "{phase:?}");
-            assert_eq!(exchange.body, body_chunk("x"), "{phase:?}");
+            assert!(result.is_ok(), "{phase:?}");
+            assert_eq!(inputs.body, body_chunk("x"), "{phase:?}");
         }
     }
 
@@ -468,18 +468,13 @@ mod tests {
             ];
             let (_runtime, mut ctx) = callout_ctx(plugins, sender.clone());
             let (mut session, _client) = session(GET).await;
-            start(&mut ctx, &mut session).await;
-            let mut exchange = Exchange::new();
+            run_request_headers(&mut ctx, &mut session).await;
+            let mut inputs = PhaseInputs::new();
 
-            let stopped = run(
-                &mut ctx,
-                &mut session,
-                Phase::ResponseHeaders,
-                &mut exchange,
-            )
-            .await;
+            let result =
+                run_phase(&mut ctx, &mut session, Phase::ResponseHeaders, &mut inputs).await;
 
-            assert!(stopped.is_err(), "{stops}");
+            assert!(result.is_err(), "{stops}");
             assert!(eventually(|| sender.sent_count() == 1).await, "{stops}");
         }
     }
@@ -522,47 +517,57 @@ mod tests {
     async fn a_plugin_releases_its_body_to_the_next_plugin_after_its_callout() {
         let phase = Phase::RequestBody;
         let plugins = vec![
-            plugin_for("a", phase, CALL_AND_PAUSE, CONTINUE_REQUEST),
+            plugin_with_callback_in("a", phase, CALL_AND_PAUSE, CONTINUE_REQUEST),
             body_plugin("b", Wat::request_body(MARK_B_REQUEST)),
         ];
         let (_runtime, mut ctx) = callout_ctx(plugins, FixedSender::responds("allowed"));
         let (mut session, _client) = session(POST).await;
-        start(&mut ctx, &mut session).await;
-        let mut exchange = Exchange::new();
+        run_request_headers(&mut ctx, &mut session).await;
+        let mut inputs = PhaseInputs::new();
 
-        let ran = run(&mut ctx, &mut session, phase, &mut exchange).await;
+        let result = run_phase(&mut ctx, &mut session, phase, &mut inputs).await;
 
-        assert!(ran.is_ok());
-        assert_eq!(exchange.body, body_chunk("bx"));
+        assert!(result.is_ok());
+        assert_eq!(inputs.body, body_chunk("bx"));
     }
 
     #[tokio::test]
     async fn a_plugin_that_stays_paused_after_its_callout_holds_its_body() {
         let phase = Phase::RequestBody;
-        let plugins = vec![plugin_for("a", phase, CALL_AND_PAUSE, STAY_PAUSED)];
+        let plugins = vec![plugin_with_callback_in(
+            "a",
+            phase,
+            CALL_AND_PAUSE,
+            STAY_PAUSED,
+        )];
         let (_runtime, mut ctx) = callout_ctx(plugins, FixedSender::responds("allowed"));
         let (mut session, _client) = session(POST).await;
-        start(&mut ctx, &mut session).await;
+        run_request_headers(&mut ctx, &mut session).await;
         let mut first = body_chunk("x");
 
-        let held = ctx
+        let result = ctx
             .request_body_filter(&mut session, &mut first, false)
             .await;
 
-        assert!(held.is_ok());
+        assert!(result.is_ok());
         assert_eq!(first, Some(Bytes::new()));
     }
 
     #[tokio::test]
     async fn a_plugin_that_stays_paused_at_the_end_of_a_body_fails_the_request() {
         let phase = Phase::RequestBody;
-        let plugins = vec![plugin_for("a", phase, CALL_AND_PAUSE, STAY_PAUSED)];
+        let plugins = vec![plugin_with_callback_in(
+            "a",
+            phase,
+            CALL_AND_PAUSE,
+            STAY_PAUSED,
+        )];
         let (_runtime, mut ctx) = callout_ctx(plugins, FixedSender::responds("allowed"));
         let (mut session, _client) = session(POST).await;
-        start(&mut ctx, &mut session).await;
-        let mut exchange = Exchange::new();
+        run_request_headers(&mut ctx, &mut session).await;
+        let mut inputs = PhaseInputs::new();
 
-        let err = run(&mut ctx, &mut session, phase, &mut exchange)
+        let err = run_phase(&mut ctx, &mut session, phase, &mut inputs)
             .await
             .unwrap_err();
 
@@ -580,27 +585,32 @@ mod tests {
         let sender = FixedSender::responds_after("late", Arc::new(Notify::new()));
         let (_runtime, mut ctx) = callout_ctx(vec![body_plugin("a", wat)], sender);
         let (mut session, _client) = session(POST).await;
-        start(&mut ctx, &mut session).await;
+        run_request_headers(&mut ctx, &mut session).await;
         let mut body = body_chunk("x");
 
-        let held = ctx
+        let result = ctx
             .request_body_filter(&mut session, &mut body, false)
             .await;
 
-        assert!(held.is_ok());
+        assert!(result.is_ok());
         assert_eq!(body, Some(Bytes::new()));
     }
 
     #[tokio::test]
     async fn a_plugin_responds_to_a_request_body_from_a_delivery() {
         let phase = Phase::RequestBody;
-        let plugins = vec![plugin_for("a", phase, CALL_AND_PAUSE, RELAY_CALLOUT_BODY)];
+        let plugins = vec![plugin_with_callback_in(
+            "a",
+            phase,
+            CALL_AND_PAUSE,
+            RELAY_CALLOUT_BODY,
+        )];
         let (_runtime, mut ctx) = callout_ctx(plugins, FixedSender::responds("denied"));
         let (mut session, mut client) = session(POST).await;
-        start(&mut ctx, &mut session).await;
-        let mut exchange = Exchange::new();
+        run_request_headers(&mut ctx, &mut session).await;
+        let mut inputs = PhaseInputs::new();
 
-        let err = run(&mut ctx, &mut session, phase, &mut exchange)
+        let err = run_phase(&mut ctx, &mut session, phase, &mut inputs)
             .await
             .unwrap_err();
 
@@ -623,21 +633,21 @@ mod tests {
             let sender = FixedSender::responds("allowed");
             let plugins = vec![
                 body_plugin("first", runs_after),
-                plugin_for("last", phase, CALL_AND_PAUSE, CONTINUE_RESPONSE),
+                plugin_with_callback_in("last", phase, CALL_AND_PAUSE, CONTINUE_RESPONSE),
             ];
             let (_runtime, mut ctx) = callout_ctx(plugins, sender.clone());
             let (mut session, _client) = session(GET).await;
-            start(&mut ctx, &mut session).await;
-            let mut exchange = Exchange::new();
+            run_request_headers(&mut ctx, &mut session).await;
+            let mut inputs = PhaseInputs::new();
 
-            let ran = run(&mut ctx, &mut session, phase, &mut exchange).await;
+            let result = run_phase(&mut ctx, &mut session, phase, &mut inputs).await;
 
-            assert!(ran.is_ok(), "{phase:?}");
+            assert!(result.is_ok(), "{phase:?}");
             assert_eq!(sender.sent_count(), 1, "{phase:?}");
             let changed = match phase {
-                Phase::ResponseHeaders => !exchange.response.headers.contains_key(CONTENT_LENGTH),
-                Phase::ResponseBody => exchange.body == body_chunk("bx"),
-                _ => exchange.trailers["x-trailer"] == "set",
+                Phase::ResponseHeaders => !inputs.response.headers.contains_key(CONTENT_LENGTH),
+                Phase::ResponseBody => inputs.body == body_chunk("bx"),
+                _ => inputs.trailers["x-trailer"] == "set",
             };
             assert!(changed, "{phase:?}");
         }
@@ -646,13 +656,18 @@ mod tests {
     #[tokio::test]
     async fn a_plugin_that_stays_paused_after_its_callout_fails_the_trailers() {
         let phase = Phase::ResponseTrailers;
-        let plugins = vec![plugin_for("a", phase, CALL_AND_PAUSE, STAY_PAUSED)];
+        let plugins = vec![plugin_with_callback_in(
+            "a",
+            phase,
+            CALL_AND_PAUSE,
+            STAY_PAUSED,
+        )];
         let (_runtime, mut ctx) = callout_ctx(plugins, FixedSender::responds("allowed"));
         let (mut session, _client) = session(GET).await;
-        start(&mut ctx, &mut session).await;
-        let mut exchange = Exchange::new();
+        run_request_headers(&mut ctx, &mut session).await;
+        let mut inputs = PhaseInputs::new();
 
-        let err = run(&mut ctx, &mut session, phase, &mut exchange)
+        let err = run_phase(&mut ctx, &mut session, phase, &mut inputs)
             .await
             .unwrap_err();
 
@@ -662,13 +677,18 @@ mod tests {
     #[tokio::test]
     async fn a_plugin_responds_in_place_of_the_upstream_response_from_a_delivery() {
         let phase = Phase::ResponseHeaders;
-        let plugins = vec![plugin_for("a", phase, CALL_AND_PAUSE, RELAY_CALLOUT_BODY)];
+        let plugins = vec![plugin_with_callback_in(
+            "a",
+            phase,
+            CALL_AND_PAUSE,
+            RELAY_CALLOUT_BODY,
+        )];
         let (_runtime, mut ctx) = callout_ctx(plugins, FixedSender::responds("replaced"));
         let (mut session, mut client) = session(GET).await;
-        start(&mut ctx, &mut session).await;
-        let mut exchange = Exchange::new();
+        run_request_headers(&mut ctx, &mut session).await;
+        let mut inputs = PhaseInputs::new();
 
-        let err = run(&mut ctx, &mut session, phase, &mut exchange)
+        let err = run_phase(&mut ctx, &mut session, phase, &mut inputs)
             .await
             .unwrap_err();
 
@@ -680,13 +700,18 @@ mod tests {
     #[tokio::test]
     async fn a_response_from_a_delivery_after_the_response_header_is_an_error() {
         let phase = Phase::ResponseBody;
-        let plugins = vec![plugin_for("a", phase, CALL_AND_PAUSE, RELAY_CALLOUT_BODY)];
+        let plugins = vec![plugin_with_callback_in(
+            "a",
+            phase,
+            CALL_AND_PAUSE,
+            RELAY_CALLOUT_BODY,
+        )];
         let (_runtime, mut ctx) = callout_ctx(plugins, FixedSender::responds("late"));
         let (mut session, _client) = session(GET).await;
-        start(&mut ctx, &mut session).await;
-        let mut exchange = Exchange::new();
+        run_request_headers(&mut ctx, &mut session).await;
+        let mut inputs = PhaseInputs::new();
 
-        let err = run(&mut ctx, &mut session, phase, &mut exchange)
+        let err = run_phase(&mut ctx, &mut session, phase, &mut inputs)
             .await
             .unwrap_err();
 
@@ -730,7 +755,7 @@ mod tests {
         let sender = FixedSender::responds("stored");
         let (_runtime, mut ctx) = callout_ctx(vec![body_plugin("a", wat)], sender.clone());
         let (mut session, _client) = session(GET).await;
-        start(&mut ctx, &mut session).await;
+        run_request_headers(&mut ctx, &mut session).await;
 
         ctx.logging(&mut session).await;
 
@@ -800,9 +825,9 @@ mod tests {
 
     /// Start a request whose plugin waits in `phase`, and drop the future of that phase.
     async fn cancel_a_wait_in(phase: Phase, ctx: &mut WasmCtx, session: &mut Session) {
-        start(ctx, session).await;
-        let mut exchange = Exchange::new();
-        let mut waits = pin!(run(ctx, session, phase, &mut exchange));
+        run_request_headers(ctx, session).await;
+        let mut inputs = PhaseInputs::new();
+        let mut waits = pin!(run_phase(ctx, session, phase, &mut inputs));
         assert!(poll!(waits.as_mut()).is_pending());
     }
 
@@ -829,9 +854,9 @@ mod tests {
             let (mut session, _client) = session(POST).await;
             cancel_a_wait_in(Phase::RequestBody, &mut ctx, &mut session).await;
             ctx.upstream_attempt();
-            let mut exchange = Exchange::new();
+            let mut inputs = PhaseInputs::new();
 
-            let err = run(&mut ctx, &mut session, phase, &mut exchange)
+            let err = run_phase(&mut ctx, &mut session, phase, &mut inputs)
                 .await
                 .unwrap_err();
 
@@ -844,7 +869,12 @@ mod tests {
     async fn logging_ends_the_context_after_a_cancelled_wait() {
         let phase = Phase::RequestBody;
         let sender = FixedSender::responds_after("late", Arc::new(Notify::new()));
-        let plugins = vec![plugin_for("a", phase, CALL_AND_PAUSE, CONTINUE_REQUEST)];
+        let plugins = vec![plugin_with_callback_in(
+            "a",
+            phase,
+            CALL_AND_PAUSE,
+            CONTINUE_REQUEST,
+        )];
         let (runtime, mut ctx) = callout_ctx(plugins, sender);
         let (mut session, _client) = session(POST).await;
         cancel_a_wait_in(phase, &mut ctx, &mut session).await;
@@ -858,7 +888,12 @@ mod tests {
     async fn dropping_a_ctx_after_a_cancelled_wait_ends_its_context() {
         let phase = Phase::RequestBody;
         let sender = FixedSender::responds_after("late", Arc::new(Notify::new()));
-        let plugins = vec![plugin_for("a", phase, CALL_AND_PAUSE, CONTINUE_REQUEST)];
+        let plugins = vec![plugin_with_callback_in(
+            "a",
+            phase,
+            CALL_AND_PAUSE,
+            CONTINUE_REQUEST,
+        )];
         let (runtime, mut ctx) = callout_ctx(plugins, sender);
         let (mut session, _client) = session(POST).await;
         cancel_a_wait_in(phase, &mut ctx, &mut session).await;
