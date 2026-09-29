@@ -82,12 +82,14 @@ impl Callouts for GuestCalloutService {
             warn!("wasm plugin {plugin} sent a callout from a context other than its current request, so the callout is refused");
             return Err(HttpCallRefusal::Failed);
         }
-        let Ok(upstream) = std::str::from_utf8(&request.upstream) else {
+        let upstream = std::str::from_utf8(&request.upstream)
+            .ok()
+            .filter(|upstream| self.conf.upstreams.has_upstream(plugin, upstream));
+        let Some(upstream) = upstream else {
+            let upstream = String::from_utf8_lossy(&request.upstream);
+            warn!("wasm plugin {plugin} sent a callout to the upstream {upstream}, which is not in callout_upstreams");
             return Err(HttpCallRefusal::UnknownUpstream);
         };
-        if !self.conf.upstreams.has_upstream(plugin, upstream) {
-            return Err(HttpCallRefusal::UnknownUpstream);
-        }
         let header = callout_request_header(plugin, &request.headers, request.body.len());
         let Some(header) = header else {
             return Err(HttpCallRefusal::UnknownUpstream);
@@ -112,6 +114,7 @@ mod tests {
     use super::*;
     use crate::callout::headers::tests::{pairs, post_to_authz};
     use crate::callout::StaticCalloutUpstreams;
+    use crate::test_support::{crate_log_lines_with, record_crate_logs};
     use pingora_core::upstreams::peer::HttpPeer;
     use proxy_wasm_host::abi::v0_2_1::{Callback, GuestId};
     use std::time::Duration;
@@ -166,6 +169,27 @@ mod tests {
             assert_eq!(got, want);
             assert_eq!(accepted.len(), usize::from(want.is_ok()));
         }
+    }
+
+    #[test]
+    fn a_refusal_for_an_unknown_upstream_logs_the_plugin_and_the_upstream_name() {
+        record_crate_logs();
+        let conf = PluginCalloutConf::new(
+            "refused-plugin",
+            Arc::new(StaticCalloutUpstreams::new()),
+            Duration::from_secs(10),
+            1024,
+        );
+        let service = GuestCalloutService::new(Arc::new(conf));
+
+        let (refused, _) =
+            service.record_callouts(context(2), || send_from(&service, 2, call_to(b"audit")));
+
+        assert_eq!(refused, Err(HttpCallRefusal::UnknownUpstream));
+        let lines = crate_log_lines_with("refused-plugin");
+        let want = "wasm plugin refused-plugin sent a callout to the upstream audit, \
+                    which is not in callout_upstreams";
+        assert_eq!(lines, [want]);
     }
 
     #[test]
