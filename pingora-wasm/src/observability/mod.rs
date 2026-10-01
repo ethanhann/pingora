@@ -15,8 +15,10 @@
 //! The metrics that plugins define, and where your proxy sends them.
 
 mod prometheus_sink;
+mod log_sink;
 
 pub use prometheus_sink::PrometheusMetricSink;
+pub(crate) use log_sink::LogCrateSink;
 
 /// A receiver of the metrics that plugins define, and of a report for each failed callout.
 ///

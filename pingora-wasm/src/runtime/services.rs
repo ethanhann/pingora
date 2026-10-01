@@ -14,12 +14,11 @@
 
 //! The services of the proxy that the plugins of a runtime use.
 
-use super::log_sink::LogCrateSink;
 use crate::callout::{
     AcceptedCallout, CalloutResult, CalloutSender, CalloutUpstreams, PendingResult,
     StaticCalloutUpstreams,
 };
-use crate::observability::{CalloutFailure, NoMetricSink, WasmMetricSink};
+use crate::observability::{CalloutFailure, NoMetricSink, WasmMetricSink, LogCrateSink};
 use crate::properties::WasmProperties;
 use futures::FutureExt;
 use log::warn;

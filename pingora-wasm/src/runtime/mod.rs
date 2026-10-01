@@ -16,7 +16,6 @@
 
 mod build;
 use build::{build_pool, checked_plugin_indexes, new_shared_store, PoolInputs};
-mod log_sink;
 mod plugin;
 pub(crate) mod pool;
 mod services;
