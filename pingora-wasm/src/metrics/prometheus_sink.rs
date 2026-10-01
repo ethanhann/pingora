@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! The sink that publishes plugin metrics in a Prometheus registry.
+
 use super::{CalloutFailure, WasmMetric, WasmMetricKind, WasmMetricRecorder, WasmMetricSink};
 use log::warn;
 use parking_lot::Mutex;

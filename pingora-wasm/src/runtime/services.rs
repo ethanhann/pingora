@@ -52,21 +52,22 @@ pub struct WasmServices {
     /// When you replace a runtime to reload plugins, pass the connector of the old runtime to
     /// the new one to keep the connections.
     ///
-    /// Callouts from ticks and other root callbacks use a connector of their own with the default
-    /// options, because they run on a thread that stops with the runtime.
+    /// Callouts that a plugin sends with no request, for example from a tick, use a connector of
+    /// their own with the default options, because they run on a thread that stops with the
+    /// runtime.
     pub callout_connector: Option<Arc<Connector>>,
     /// The maximum number of callouts that the runtime sends at the same time. Default 1024.
     ///
     /// A callout over this limit is not sent, and its plugin receives a 503 response. The
     /// limit cannot be zero or more than `tokio::sync::Semaphore::MAX_PERMITS`.
     pub max_callouts_in_flight: usize,
-    /// The destination of the metrics that plugins define, and of the callouts that fail. The
-    /// default publishes nothing.
+    /// The sink that receives the metrics that plugins define, and a report for each failed
+    /// callout. The default publishes nothing.
     ///
     /// When you replace a runtime to reload plugins, pass the same sink to the new one.
     pub metric_sink: Arc<dyn WasmMetricSink>,
-    /// The properties of your proxy that do not change, such as `node.metadata.NAME`, which
-    /// every plugin reads. Default empty.
+    /// Properties for values of your proxy that do not change, such as `node.metadata.NAME`.
+    /// Every plugin can read them, also in `proxy_on_configure`. Default empty.
     pub fixed_properties: WasmProperties,
 }
 

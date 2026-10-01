@@ -18,7 +18,7 @@ mod prometheus_sink;
 
 pub use prometheus_sink::PrometheusMetricSink;
 
-/// The destination of the metrics that plugins define, and of the callouts that fail.
+/// A receiver of the metrics that plugins define, and of a report for each failed callout.
 ///
 /// A plugin can read its own metrics whatever sink you pass, because the runtime keeps their
 /// values. Pass a sink in [WasmServices::metric_sink](crate::WasmServices::metric_sink) to publish the
@@ -32,7 +32,8 @@ pub trait WasmMetricSink: Send + Sync {
         None
     }
 
-    /// Count a callout of `plugin` that failed. By default it does nothing.
+    /// Receive a callout of `plugin` that failed, with the reason in `failure`. By default it
+    /// does nothing.
     fn callout_failed(&self, _plugin: &str, _failure: CalloutFailure) {}
 }
 
@@ -76,11 +77,13 @@ pub enum WasmMetricKind {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CalloutFailure {
-    /// The callout reached its timeout before the response header.
+    /// The callout, or a read or a write of its connection, reached its timeout before the
+    /// response header.
     Timeout,
-    /// The callout upstreams returned no peer for the upstream name.
+    /// The [CalloutUpstreams](crate::CalloutUpstreams) returned no peer for the upstream name.
     NoPeer,
-    /// The runtime was already sending `max_callouts_in_flight` callouts.
+    /// The runtime was already sending
+    /// [max_callouts_in_flight](crate::WasmServices::max_callouts_in_flight) callouts.
     Overflow,
     /// The connection or the TLS handshake reached its timeout.
     ConnectTimeout,
@@ -92,7 +95,8 @@ pub enum CalloutFailure {
     ConnectionClosed,
     /// The callout failed after the response header.
     FailedAfterHeader,
-    /// The response body is over `callout_response_limit`.
+    /// The response body is over
+    /// [callout_response_limit](crate::WasmPluginConf::callout_response_limit).
     ResponseTooLarge,
     /// The task that sends the callout panicked, or no tokio runtime was running.
     TaskFailed,

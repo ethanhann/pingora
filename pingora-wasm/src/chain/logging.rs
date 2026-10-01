@@ -27,6 +27,9 @@ impl WasmCtx {
     /// `proxy_on_done`, `proxy_on_log`, and `proxy_on_delete`, and can read the request headers
     /// and the response headers. A plugin failure here is logged and not returned, because the
     /// response is already sent.
+    ///
+    /// A plugin whose `proxy_on_done` returns `false` holds its context, and it runs
+    /// `proxy_on_log` later, after it calls `proxy_done`, with empty header maps.
     pub async fn logging<DS: DownstreamSession>(&mut self, session: &mut Session<DS>) {
         let runtime = self.chain.runtime.clone();
         self.callouts.clear();
@@ -107,7 +110,7 @@ impl WasmCtx {
 
 /// End a context with `on_done`, then `on_log` when `log` is set, then `on_delete`.
 ///
-/// Return `false` when the guest keeps the context.
+/// Return `false` when the guest holds the context.
 pub(super) fn finish<H: StreamState>(
     scope: &mut CallScope<'_, H>,
     context: ContextId,

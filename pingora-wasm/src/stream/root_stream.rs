@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! The stream state of the callbacks that run with no request.
+
 use crate::properties::{join_path, WasmProperties};
 use log::warn;
 use proxy_wasm_host::abi::v0_2_1::types::{BufferType, MapType, Status, StreamType};

@@ -147,8 +147,8 @@ impl WasmCtx {
     /// Record the upstream peer that the request connected to, for the properties
     /// `upstream.address` and `upstream.port`.
     ///
-    /// Call it from `connected_to_upstream`. It runs no plugin. A later call, for example on a
-    /// retry, replaces the peer.
+    /// Call it from `connected_to_upstream`. It runs no plugin, and a later call, for example
+    /// after a retry, replaces the recorded peer.
     pub fn upstream_connected(&mut self, peer: &HttpPeer) {
         self.stream.facts.upstream_address = peer.address().as_inet().copied();
     }
