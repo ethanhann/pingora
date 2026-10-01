@@ -309,17 +309,18 @@
 
 mod callout;
 mod chain;
-mod metrics;
+mod observability;
 mod properties;
 mod root_callbacks;
 mod runtime;
-mod stream;
+mod stream_state;
 #[cfg(test)]
 mod test_support;
 
 pub use callout::{CalloutTarget, CalloutUpstreams, StaticCalloutUpstreams};
+pub use chain::write_plugin_response;
 pub use chain::{RequestOutcome, WasmChain, WasmCtx};
-pub use metrics::{
+pub use observability::{
     CalloutFailure, PrometheusMetricSink, WasmMetric, WasmMetricKind, WasmMetricRecorder,
     WasmMetricSink,
 };
@@ -331,7 +332,6 @@ pub use proxy_wasm_host::abi::v0_2_1::types::LogLevel;
 pub use proxy_wasm_host::abi::v0_2_1::{LogContext, LogSink};
 pub use proxy_wasm_host::Limits;
 pub use runtime::{WasmPluginConf, WasmRuntime, WasmServices};
-pub use stream::write_plugin_response;
 
 use http::StatusCode;
 use pingora_error::{Error, ErrorType};

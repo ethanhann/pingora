@@ -17,7 +17,7 @@ use super::slot::LockedSlot;
 use super::wait::{CalloutWaitOutcome, PausedPhase};
 use super::{RequestOutcome, ResponseProgress, WasmCtx};
 use crate::properties::built_in::{RequestStart, TlsFacts};
-use crate::stream::PluginResponse;
+use crate::stream_state::PluginResponse;
 use http::uri::Scheme;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_error::Result;

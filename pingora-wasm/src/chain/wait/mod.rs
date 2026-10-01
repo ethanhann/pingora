@@ -20,7 +20,7 @@ pub(super) use delivery::PausedPhase;
 
 use super::WasmCtx;
 use crate::callout::CalloutResult;
-use crate::stream::PluginResponse;
+use crate::stream_state::PluginResponse;
 use crate::ERR_PLUGIN_FAILED;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_error::{Error, ErrorType, Result};

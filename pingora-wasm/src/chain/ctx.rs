@@ -20,7 +20,7 @@ use crate::callout::RequestCallouts;
 use crate::plugin_unavailable;
 use crate::properties::WasmPropertyValue;
 use crate::runtime::pool::{GuestPool, Loaded};
-use crate::stream::{PingoraStream, RequestHeaders, ResponseHeaders};
+use crate::stream_state::{PingoraStream, RequestHeaders, ResponseHeaders};
 use http::uri::Scheme;
 use http::{Method, StatusCode};
 use pingora_core::upstreams::peer::{HttpPeer, Peer};

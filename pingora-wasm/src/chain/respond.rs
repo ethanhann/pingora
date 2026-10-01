@@ -16,7 +16,8 @@
 
 use super::response::{frame_if_length_removed, ResponseSource};
 use super::{ResponseProgress, WasmCtx};
-use crate::stream::{write_plugin_response, PluginResponse};
+use crate::stream_state::PluginResponse;
+use bytes::Bytes;
 use http::header::CONTENT_LENGTH;
 use http::Method;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
@@ -122,4 +123,23 @@ impl WasmCtx {
     pub(super) fn late_response_error(&self, position: usize) -> Box<Error> {
         self.plugin_error(position, "sent a response after the response header")
     }
+}
+
+/// Write the response that a plugin sent to the downstream.
+///
+/// Use it for the header and the body of [RequestOutcome::Respond](crate::RequestOutcome). If
+/// your proxy writes its responses with its own code, for example to add headers or record
+/// metrics, write the header and the body with that code instead.
+pub async fn write_plugin_response<DS: DownstreamSession>(
+    session: &mut Session<DS>,
+    header: Box<ResponseHeader>,
+    body: Bytes,
+) -> Result<()> {
+    if session.req_header().method == Method::HEAD || body.is_empty() {
+        session.write_response_header(header, true).await?;
+        // An HTTP/2 stream needs an end of stream after the header
+        return session.write_response_body(None, true).await;
+    }
+    session.write_response_header(header, false).await?;
+    session.write_response_body(Some(body), true).await
 }

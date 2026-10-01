@@ -14,11 +14,8 @@
 
 use bytes::Bytes;
 use http::header::{HeaderValue, CONTENT_LENGTH, TRANSFER_ENCODING};
-use http::{Method, StatusCode};
-use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
-use pingora_error::Result;
+use http::StatusCode;
 use pingora_http::ResponseHeader;
-use pingora_proxy::Session;
 use proxy_wasm_host::abi::v0_2_1::LocalResponse;
 
 /// A response that a plugin sent in place of the upstream response, with
@@ -58,25 +55,6 @@ impl PluginResponse {
             body: Bytes::copy_from_slice(&response.body),
         })
     }
-}
-
-/// Write the response that a plugin sent to the downstream.
-///
-/// Use it for the header and the body of [RequestOutcome::Respond](crate::RequestOutcome). If
-/// your proxy writes its responses with its own code, for example to add headers or record
-/// metrics, write the header and the body with that code instead.
-pub async fn write_plugin_response<DS: DownstreamSession>(
-    session: &mut Session<DS>,
-    header: Box<ResponseHeader>,
-    body: Bytes,
-) -> Result<()> {
-    if session.req_header().method == Method::HEAD || body.is_empty() {
-        session.write_response_header(header, true).await?;
-        // An HTTP/2 stream needs an end of stream after the header
-        return session.write_response_body(None, true).await;
-    }
-    session.write_response_header(header, false).await?;
-    session.write_response_body(Some(body), true).await
 }
 
 /// Return `true` when `status` ends a response, which is true from 200 to 599.

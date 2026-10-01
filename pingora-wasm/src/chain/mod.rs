@@ -24,6 +24,7 @@ mod slot;
 mod wait;
 
 pub use ctx::WasmCtx;
+pub use respond::write_plugin_response;
 
 use ctx::ResponseProgress;
 
@@ -60,7 +61,7 @@ pub enum RequestOutcome {
     /// Every plugin let the request continue to the upstream.
     Continue,
     /// A plugin sent its own response. Write it to the downstream, for example with
-    /// [write_plugin_response](crate::write_plugin_response), and return `Ok(true)` from
+    /// [write_plugin_response], and return `Ok(true)` from
     /// `request_filter`.
     Respond(Box<ResponseHeader>, Bytes),
 }

@@ -12,7 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Header names and values, shared by the header maps and the trailer map.
+//! The header maps and the trailer map that a plugin reads and writes, with the handling of
+//! header names and values that they share.
+
+mod request;
+mod response;
+mod trailers;
+
+pub(crate) use request::RequestHeaders;
+pub(crate) use response::ResponseHeaders;
+pub(crate) use trailers::ResponseTrailers;
 
 use http::header::{HeaderName, HeaderValue, HOST};
 use pingora_http::{RequestHeader, ResponseHeader};

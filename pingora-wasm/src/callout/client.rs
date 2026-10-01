@@ -16,7 +16,7 @@
 
 use super::result::{connect_failure, session_failure, OwnedHeaderPairs, PSEUDO_STATUS};
 use super::{AcceptedCallout, CalloutResult, CalloutTarget, CalloutUpstreams};
-use crate::metrics::{CalloutFailure, WasmMetricSink};
+use crate::observability::{CalloutFailure, WasmMetricSink};
 use crate::WasmServices;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -226,7 +226,7 @@ mod tests {
     use super::*;
     use crate::callout::headers::tests::{pairs, post_to_authz};
     use crate::callout::{PluginCalloutConf, StaticCalloutUpstreams};
-    use crate::metrics::NoMetricSink;
+    use crate::observability::NoMetricSink;
     use parking_lot::Mutex;
     use std::net::SocketAddr;
     use std::time::Duration;

@@ -17,7 +17,7 @@
 use super::events::{GuestAddress, RootCallbackLink, SlotIndex};
 use super::{GuestPool, Loaded};
 use crate::callout::{AcceptedCallout, GuestCalloutService};
-use crate::stream::RootStream;
+use crate::root_callbacks::RootStream;
 use crate::{plugin_failure, plugin_unavailable};
 use pingora_error::Result;
 use proxy_wasm_host::abi::v0_2_1::{Callback, GuestError};

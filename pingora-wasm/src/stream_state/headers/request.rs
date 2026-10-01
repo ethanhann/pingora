@@ -18,7 +18,7 @@
 //! Pingora header. The map hides `host` and shows it as `:authority`, as Proxy-Wasm plugins
 //! expect.
 
-use super::names::{classify, value_of, visit_headers, Name, Regular, WriteResult};
+use super::{classify, value_of, visit_headers, Name, Regular, WriteResult};
 use http::header::{HeaderValue, HOST};
 use http::uri::{Authority, PathAndQuery, Scheme};
 use http::{Method, Uri, Version};

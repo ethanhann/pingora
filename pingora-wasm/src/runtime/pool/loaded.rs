@@ -17,7 +17,7 @@
 
 use super::events::{RootCallbackEvent, RootCallbackLink};
 use crate::callout::{AcceptedCallout, GuestCalloutService};
-use crate::stream::RootStream;
+use crate::root_callbacks::RootStream;
 use proxy_wasm_host::abi::v0_2_1::{CallScope, ContextId, ContextState, Guest};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

@@ -14,7 +14,7 @@
 
 //! The response header map that a guest sees.
 
-use super::names::{classify, visit_headers, Name, Regular, WriteResult};
+use super::{classify, visit_headers, Name, Regular, WriteResult};
 use http::header::HeaderValue;
 use pingora_http::ResponseHeader;
 use proxy_wasm_host::{HeaderMap, NotAllowed, PairVisitor};

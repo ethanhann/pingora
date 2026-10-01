@@ -15,7 +15,7 @@
 use super::slot::LockedSlot;
 use super::wait::{CalloutWaitOutcome, PausedPhase};
 use super::{ResponseProgress, WasmCtx};
-use crate::stream::PluginResponse;
+use crate::stream_state::PluginResponse;
 use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::{Method, StatusCode, Version};
 use log::warn;

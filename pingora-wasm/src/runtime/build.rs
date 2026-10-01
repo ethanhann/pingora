@@ -20,10 +20,10 @@ use super::pool::events::RootCallbackEvent;
 use super::pool::{GuestPool, GuestPoolConf};
 use super::shared_store::SharedStore;
 use crate::callout::CalloutUpstreams;
-use crate::metrics::WasmMetricSink;
+use crate::observability::WasmMetricSink;
 use crate::properties::WasmProperties;
+use crate::root_callbacks::RootCallbackPluginState;
 use crate::root_callbacks::RootCallbackThread;
-use crate::stream::RootCallbackPluginState;
 use pingora_error::{Error, ErrorType, OrErr, Result};
 use proxy_wasm_host::abi::v0_2_1::{
     GuestSpec, Host, InMemoryStoreLimits, LogSink, QueueEnqueued, SharedServices,

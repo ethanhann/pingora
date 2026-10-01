@@ -14,7 +14,7 @@
 
 //! The response trailer map that a guest sees.
 
-use super::names::{header_name, value_of, visit_headers, WriteResult};
+use super::{header_name, value_of, visit_headers, WriteResult};
 use http::header::HeaderValue;
 use proxy_wasm_host::{HeaderMap, PairVisitor};
 use std::borrow::Cow;

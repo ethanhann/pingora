@@ -18,7 +18,7 @@
 //! The status codes and the bodies match those of Envoy, because plugins are written against
 //! them.
 
-use crate::metrics::CalloutFailure;
+use crate::observability::CalloutFailure;
 use bytes::Bytes;
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::StatusCode;

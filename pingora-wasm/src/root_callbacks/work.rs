@@ -16,10 +16,10 @@
 
 use super::callback_loop::RootCallbackLoop;
 use super::root_callouts::FinishedCallout;
+use crate::root_callbacks::RootStream;
 use crate::runtime::pool::events::GuestAddress;
 use crate::runtime::pool::SlotLockAttempt;
 use crate::runtime::RuntimeInner;
-use crate::stream::RootStream;
 use log::{debug, warn};
 use proxy_wasm_host::abi::v0_2_1::{CallScope, ContextId, GuestError, QueueId};
 use std::time::Instant;

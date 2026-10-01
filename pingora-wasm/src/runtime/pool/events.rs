@@ -15,7 +15,7 @@
 //! What a guest tells the root callback thread, and where the guest is.
 
 use crate::callout::AcceptedCallout;
-use crate::stream::RootCallbackPluginState;
+use crate::root_callbacks::RootCallbackPluginState;
 use proxy_wasm_host::abi::v0_2_1::{CalloutId, Changes, ContextId, GuestId, QueueId};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;

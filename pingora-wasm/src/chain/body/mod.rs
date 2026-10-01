@@ -28,7 +28,7 @@ pub(crate) use retry::RequestBodyState;
 use super::slot::LockedSlot;
 use super::wait::CalloutWaitOutcome;
 use super::{ResponseProgress, WasmCtx};
-use crate::stream::{BodyBuffer, PluginResponse};
+use crate::stream_state::{BodyBuffer, PluginResponse};
 use bytes::Bytes;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_error::{Error, Result};

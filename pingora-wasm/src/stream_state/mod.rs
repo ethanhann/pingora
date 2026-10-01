@@ -17,20 +17,12 @@
 //! upstream response.
 
 mod body;
-mod names;
+mod headers;
 mod plugin_response;
-mod request_headers;
-mod response_headers;
-mod response_trailers;
-mod root_stream;
 
 pub(crate) use body::BodyBuffer;
-pub use plugin_response::write_plugin_response;
+pub(crate) use headers::{RequestHeaders, ResponseHeaders, ResponseTrailers};
 pub(crate) use plugin_response::PluginResponse;
-pub(crate) use request_headers::RequestHeaders;
-pub(crate) use response_headers::ResponseHeaders;
-pub(crate) use response_trailers::ResponseTrailers;
-pub(crate) use root_stream::{RootCallbackPluginState, RootStream};
 
 use crate::properties::built_in::{write_built_in_property, ReadableHeaders, RequestFacts};
 use crate::properties::{join_path, WasmProperties};

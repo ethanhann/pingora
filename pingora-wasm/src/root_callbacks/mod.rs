@@ -23,8 +23,11 @@
 mod callback_loop;
 mod queue_registrations;
 mod root_callouts;
+mod root_stream;
 mod tick_schedule;
 mod work;
+
+pub(crate) use root_stream::{RootCallbackPluginState, RootStream};
 
 use crate::runtime::pool::events::{RootCallbackEvent, RootCallbackSender};
 use crate::runtime::RuntimeInner;
@@ -141,7 +144,7 @@ fn run_root_callback_loop(
 #[cfg(test)]
 mod tests {
     use crate::callout::CalloutResult;
-    use crate::metrics::PrometheusMetricSink;
+    use crate::observability::PrometheusMetricSink;
     use crate::runtime::pool::events::{GuestAddress, SlotIndex};
     use crate::test_support::callouts::{authz_services, callout_ctx_with_services, FixedSender};
     use crate::test_support::{

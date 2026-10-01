@@ -14,7 +14,7 @@
 
 //! The store of shared data, queues, and metrics that all plugins of a runtime use.
 
-use crate::metrics::{WasmMetric, WasmMetricKind, WasmMetricRecorder, WasmMetricSink};
+use crate::observability::{WasmMetric, WasmMetricKind, WasmMetricRecorder, WasmMetricSink};
 use parking_lot::Mutex;
 use proxy_wasm_host::abi::v0_2_1::types::{MetricType, Status};
 use proxy_wasm_host::abi::v0_2_1::{

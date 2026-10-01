@@ -18,7 +18,7 @@ use crate::callout::CalloutResult;
 use crate::chain::body::BodyDirection;
 use crate::chain::slot::LockedSlot;
 use crate::chain::WasmCtx;
-use crate::stream::{BodyBuffer, ResponseTrailers};
+use crate::stream_state::{BodyBuffer, ResponseTrailers};
 use bytes::Bytes;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_error::Result;

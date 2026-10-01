@@ -25,7 +25,7 @@ pub(crate) use loaded::Loaded;
 
 use crate::callout::PluginCalloutConf;
 use crate::plugin_unavailable;
-use crate::stream::RootCallbackPluginState;
+use crate::root_callbacks::RootCallbackPluginState;
 use events::RootCallbackSender;
 use guest_start::StartedGuest;
 use log::{error, info, warn};

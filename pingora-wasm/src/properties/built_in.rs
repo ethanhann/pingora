@@ -14,7 +14,7 @@
 
 //! The properties that the crate reads from the session and the headers of a request.
 
-use crate::stream::RequestHeaders;
+use crate::stream_state::RequestHeaders;
 use http::header::CONTENT_LENGTH;
 use http::Version;
 use pingora_core::protocols::tls::SslDigest;

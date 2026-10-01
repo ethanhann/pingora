@@ -15,7 +15,7 @@
 use crate::chain::slot::LockedSlot;
 use crate::chain::wait::{CalloutWaitOutcome, PausedPhase};
 use crate::chain::{ResponseProgress, WasmCtx};
-use crate::stream::ResponseTrailers;
+use crate::stream_state::ResponseTrailers;
 use bytes::{Bytes, BytesMut};
 use log::{error, warn};
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;

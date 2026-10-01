@@ -19,7 +19,7 @@ use crate::callout::{
     AcceptedCallout, CalloutResult, CalloutSender, CalloutUpstreams, PendingResult,
     StaticCalloutUpstreams,
 };
-use crate::metrics::{CalloutFailure, NoMetricSink, WasmMetricSink};
+use crate::observability::{CalloutFailure, NoMetricSink, WasmMetricSink};
 use crate::properties::WasmProperties;
 use futures::FutureExt;
 use log::warn;
