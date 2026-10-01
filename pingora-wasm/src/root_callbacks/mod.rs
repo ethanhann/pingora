@@ -162,8 +162,10 @@ mod tests {
         slots: usize,
     ) -> (WasmRuntime, Arc<S>) {
         let logs = Arc::new(S::default());
-        let mut services = WasmServices::default();
-        services.log_sink = logs.clone();
+        let services = WasmServices {
+            log_sink: logs.clone(),
+            ..WasmServices::default()
+        };
         let conf = plugin(label, wat_guest(label, wat), slots);
         let runtime = WasmRuntime::new_with_services(vec![conf], services).unwrap();
         (runtime, logs)
@@ -356,9 +358,11 @@ mod tests {
         };
         let registry = prometheus::Registry::new();
         let logs = Arc::new(RecordedGuestLogs::default());
-        let mut services = WasmServices::default();
-        services.log_sink = logs.clone();
-        services.metric_sink = Arc::new(PrometheusMetricSink::new(registry.clone()).unwrap());
+        let services = WasmServices {
+            log_sink: logs.clone(),
+            metric_sink: Arc::new(PrometheusMetricSink::new(registry.clone()).unwrap()),
+            ..WasmServices::default()
+        };
         let mut plugins = vec![
             plugin("first", wat_guest("shared-first", first), 1),
             plugin("second", wat_guest("shared-second", second), 1),
