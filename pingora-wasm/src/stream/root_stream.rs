@@ -22,16 +22,19 @@ use proxy_wasm_host::{Buffer, HeaderMap, VecHeaderMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// The settings of a plugin that its root callbacks use.
-pub(crate) struct RootCallbackConf {
+/// The plugin data that the callbacks with no request use.
+///
+/// It holds the plugin name, the fixed properties, and whether the warning about a call that
+/// tries to change a request was logged.
+pub(crate) struct RootCallbackPlugin {
     pub(crate) plugin_name: String,
     pub(crate) fixed_properties: Arc<WasmProperties>,
     request_change_warning_logged: AtomicBool,
 }
 
-impl RootCallbackConf {
+impl RootCallbackPlugin {
     pub(crate) fn new(plugin_name: &str, fixed_properties: Arc<WasmProperties>) -> Self {
-        RootCallbackConf {
+        RootCallbackPlugin {
             plugin_name: plugin_name.to_string(),
             fixed_properties,
             request_change_warning_logged: AtomicBool::new(false),
@@ -51,20 +54,20 @@ impl RootCallbackConf {
     }
 }
 
-/// The stream state of a callback that runs with no request: a root callback, or the end of a
-/// context that the guest held after its request.
+/// The stream state of a callback that runs with no request.
 ///
-/// A plugin reads empty header maps and the fixed properties.
+/// Such a callback is a root callback, or the end of a context that the guest held after its
+/// request. A plugin reads empty header maps and the fixed properties.
 pub(crate) struct RootStream {
-    conf: Arc<RootCallbackConf>,
+    plugin: Arc<RootCallbackPlugin>,
     empty: VecHeaderMap,
     path_key: Vec<u8>,
 }
 
 impl RootStream {
-    pub(crate) fn new(conf: Arc<RootCallbackConf>) -> Self {
+    pub(crate) fn new(plugin: Arc<RootCallbackPlugin>) -> Self {
         RootStream {
-            conf,
+            plugin,
             empty: VecHeaderMap::default(),
             path_key: Vec::new(),
         }
@@ -96,7 +99,7 @@ impl StreamState for RootStream {
     }
 
     fn continue_stream(&mut self, _call: Invocation, _stream: StreamType) -> Result<(), Status> {
-        self.conf
+        self.plugin
             .warn_of_request_change_once("proxy_continue_stream");
         Ok(())
     }
@@ -106,7 +109,7 @@ impl StreamState for RootStream {
         _call: Invocation,
         _response: LocalResponse<'_>,
     ) -> Result<(), Status> {
-        self.conf
+        self.plugin
             .warn_of_request_change_once("proxy_send_local_response");
         Ok(())
     }
@@ -118,7 +121,7 @@ impl StreamState for RootStream {
         out: &mut Vec<u8>,
     ) -> Result<(), Status> {
         join_path(path.iter().copied(), &mut self.path_key);
-        match self.conf.fixed_properties.get_joined(&self.path_key) {
+        match self.plugin.fixed_properties.get_joined(&self.path_key) {
             Some(value) => {
                 out.extend_from_slice(value);
                 Ok(())
@@ -149,7 +152,7 @@ mod tests {
     }
 
     fn root_stream(plugin: &str, fixed: WasmProperties) -> RootStream {
-        RootStream::new(Arc::new(RootCallbackConf::new(plugin, Arc::new(fixed))))
+        RootStream::new(Arc::new(RootCallbackPlugin::new(plugin, Arc::new(fixed))))
     }
 
     #[test]
@@ -183,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn a_continue_returns_ok_and_warns_once_for_each_plugin() {
+    fn proxy_continue_stream_returns_ok_and_warns_once_for_each_plugin() {
         record_crate_logs();
         let mut stream = root_stream("continue-from-tick", WasmProperties::new());
 

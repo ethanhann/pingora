@@ -25,7 +25,7 @@ pub(crate) use loaded::Loaded;
 
 use crate::callout::PluginCalloutConf;
 use crate::plugin_unavailable;
-use crate::stream::RootCallbackConf;
+use crate::stream::RootCallbackPlugin;
 use events::RootCallbackSender;
 use guest_start::StartedGuest;
 use log::{error, info, warn};
@@ -93,7 +93,7 @@ pub(crate) struct GuestPoolConf {
     pub(crate) slots: usize,
     pub(crate) phases: PluginPhases,
     pub(crate) callout_conf: PluginCalloutConf,
-    pub(crate) root_callback_conf: Arc<RootCallbackConf>,
+    pub(crate) root_callback_plugin: Arc<RootCallbackPlugin>,
     pub(crate) root_callback_sender: RootCallbackSender,
 }
 
@@ -104,7 +104,7 @@ pub(crate) struct GuestPool {
     pool_index: usize,
     spec: GuestSpec,
     plugin: PluginConfig,
-    root_callback_conf: Arc<RootCallbackConf>,
+    root_callback_plugin: Arc<RootCallbackPlugin>,
     root_callback_sender: RootCallbackSender,
     next: AtomicUsize,
     slots: Vec<Slot>,
@@ -120,7 +120,7 @@ impl GuestPool {
             pool_index: conf.pool_index,
             spec: conf.spec,
             plugin: conf.plugin,
-            root_callback_conf: conf.root_callback_conf,
+            root_callback_plugin: conf.root_callback_plugin,
             root_callback_sender: conf.root_callback_sender,
             next: AtomicUsize::new(0),
             slots: (0..conf.slots).map(|_| Slot::default()).collect(),
@@ -196,7 +196,9 @@ impl GuestPool {
     }
 
     /// Replace the guest of a slot when `err` leaves it unusable, which happens after a trap or
-    /// when the guest has no context ids left. Return whether the guest was replaced.
+    /// when the guest has no context ids left.
+    ///
+    /// Return whether the guest left its slot, which is also the case when the rebuild fails.
     pub(crate) fn check(&self, index: usize, mut guard: SlotGuard<'_>, err: &GuestError) -> bool {
         let lost = match guard.as_ref() {
             Some(loaded) => {

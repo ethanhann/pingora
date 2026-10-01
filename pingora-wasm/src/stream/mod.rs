@@ -29,7 +29,7 @@ pub(crate) use plugin_response::PluginResponse;
 pub(crate) use request_headers::RequestHeaders;
 pub(crate) use response_headers::ResponseHeaders;
 pub(crate) use response_trailers::ResponseTrailers;
-pub(crate) use root_stream::{RootCallbackConf, RootStream};
+pub(crate) use root_stream::{RootCallbackPlugin, RootStream};
 
 use crate::properties::built_in::{read_built_in, HeadersInStream, RequestFacts};
 use crate::properties::{join_path, WasmProperties};
@@ -233,8 +233,9 @@ impl StreamState for PingoraStream {
         }
     }
 
-    // A guest built with the Rust SDK panics on a status other than `Ok`, so a write that a
-    // value of the proxy or a built-in value hides still returns `Ok`, as in Envoy
+    // A guest built with the Rust SDK panics on a status other than `Ok`, so a write to a path
+    // that the proxy or a built-in value provides still returns `Ok`, as in Envoy. A read of
+    // that path still returns the value of the proxy or the built-in value
     fn set_property(
         &mut self,
         _call: Invocation,

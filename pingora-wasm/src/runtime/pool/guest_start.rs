@@ -52,7 +52,7 @@ impl GuestPool {
             .clone()
             .with_callouts(callout_service.clone());
         *guest.services_mut() = services;
-        let mut scope = guest.enter(RootStream::new(self.root_callback_conf.clone()));
+        let mut scope = guest.enter(RootStream::new(self.root_callback_plugin.clone()));
         let root = match scope.on_context_create(None) {
             Ok(root) => root,
             Err(e) => return Err(plugin_failure(&self.name, "failed to start", e)),
@@ -87,7 +87,7 @@ impl GuestPool {
         };
         let link = RootThreadLink::new(
             address,
-            self.root_callback_conf.clone(),
+            self.root_callback_plugin.clone(),
             self.root_callback_sender.clone(),
         );
         let held = self.slots[slot].held.clone();

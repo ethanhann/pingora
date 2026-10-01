@@ -15,7 +15,7 @@
 //! What a guest tells the root callback thread, and where the guest is.
 
 use crate::callout::AcceptedCallout;
-use crate::stream::RootCallbackConf;
+use crate::stream::RootCallbackPlugin;
 use proxy_wasm_host::abi::v0_2_1::{CalloutId, Changes, ContextId, GuestId, QueueId};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
@@ -44,8 +44,8 @@ pub(crate) enum RootCallbackEvent {
     },
     /// A queue got an item.
     QueueItem(QueueId),
-    /// Callouts whose results go to `context` with no request: callouts of a root, and
-    /// callouts of a context that the guest held after its request.
+    /// Callouts whose results go to `context` with no request. These are the callouts of a root,
+    /// and the callouts of a context that the guest held after its request.
     CalloutsWithNoRequest {
         address: GuestAddress,
         context: ContextId,
@@ -53,7 +53,7 @@ pub(crate) enum RootCallbackEvent {
     },
     /// Callouts that a held context sent during its request, whose results no task delivers.
     /// The context receives a failure for each one.
-    CalloutsWithNoResult {
+    OpenCalloutsToFail {
         address: GuestAddress,
         context: ContextId,
         callouts: Vec<CalloutId>,
@@ -68,22 +68,22 @@ pub(crate) enum RootCallbackEvent {
 
 pub(crate) type RootCallbackSender = UnboundedSender<RootCallbackEvent>;
 
-/// What a guest needs to reach the root callback thread.
+/// The address and plugin of a guest, and the sender to the root callback thread.
 pub(crate) struct RootThreadLink {
     pub(crate) address: GuestAddress,
-    pub(crate) conf: Arc<RootCallbackConf>,
+    pub(crate) plugin: Arc<RootCallbackPlugin>,
     sender: RootCallbackSender,
 }
 
 impl RootThreadLink {
     pub(crate) fn new(
         address: GuestAddress,
-        conf: Arc<RootCallbackConf>,
+        plugin: Arc<RootCallbackPlugin>,
         sender: RootCallbackSender,
     ) -> Self {
         RootThreadLink {
             address,
-            conf,
+            plugin,
             sender,
         }
     }

@@ -21,7 +21,8 @@ use std::collections::HashMap;
 /// A property value in the encoding that plugins expect.
 ///
 /// A string or bytes stay as they are, a bool is one byte, and an integer is 8 little-endian
-/// bytes, as Envoy encodes them. Create one with `From`, for example `WasmPropertyValue::from(8080)`.
+/// bytes, as Envoy encodes them. Create one with `From`, for example
+/// `WasmPropertyValue::from(8080_u16)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmPropertyValue(Vec<u8>);
 
@@ -78,7 +79,7 @@ integer_property_value!(i32 => i64, i64 => i64, u16 => u64, u32 => u64, u64 => u
 ///
 /// A path is a list of segments, such as `["node", "metadata", "NAME"]` for the property that a
 /// plugin reads as `node.metadata.NAME`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WasmProperties {
     values: HashMap<Vec<u8>, Vec<u8>>,
 }
@@ -144,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn a_path_reads_by_its_segments_and_by_the_path_the_abi_sends() {
+    fn a_value_is_found_by_its_segments_and_by_its_joined_path_but_not_by_a_prefix() {
         let mut properties = WasmProperties::new();
 
         properties.insert(&["xds", "route_name"], "checkout");

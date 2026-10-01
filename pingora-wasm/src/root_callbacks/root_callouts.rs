@@ -21,7 +21,6 @@ use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
 use proxy_wasm_host::abi::v0_2_1::{CalloutId, ContextId};
-use std::collections::HashSet;
 
 /// The result of a callout that no request waits for.
 pub(super) struct FinishedCallout {
@@ -35,9 +34,6 @@ pub(super) struct FinishedCallout {
 #[derive(Default)]
 pub(super) struct RootCallouts {
     results: FuturesUnordered<BoxFuture<'static, FinishedCallout>>,
-    in_flight: HashSet<(GuestAddress, CalloutId)>,
-    /// The callouts in flight whose context ended, so that their results go nowhere.
-    ended: HashSet<(GuestAddress, CalloutId)>,
 }
 
 impl RootCallouts {
@@ -53,7 +49,6 @@ impl RootCallouts {
         let Some(pending) = runtime.callout_launcher.spawn_root(callout) else {
             return;
         };
-        self.in_flight.insert((address, id));
         self.results.push(
             async move {
                 let result = match pending {
@@ -71,29 +66,13 @@ impl RootCallouts {
         );
     }
 
-    /// Wait for the next result. Never returns when no callout is in flight.
+    /// Wait for the next result.
+    ///
+    /// When no callout is in flight, the future never completes.
     pub(super) async fn next_finished(&mut self) -> Option<FinishedCallout> {
         if self.results.is_empty() {
             return std::future::pending().await;
         }
-        let finished = self.results.next().await?;
-        self.in_flight.remove(&(finished.address, finished.id));
-        Some(finished)
-    }
-
-    /// Record that `proxy_on_delete` ended the callouts `ids` of a context of the guest at
-    /// `address`. Only the callouts that are in flight here are recorded, because a callout of
-    /// a request sends its result nowhere.
-    pub(super) fn end(&mut self, address: GuestAddress, ids: &[CalloutId]) {
-        let in_flight = ids
-            .iter()
-            .filter(|id| self.in_flight.contains(&(address, **id)));
-        let ended: Vec<_> = in_flight.map(|id| (address, *id)).collect();
-        self.ended.extend(ended);
-    }
-
-    /// Return whether the context of the callout `id` ended, and forget the callout.
-    pub(super) fn was_ended(&mut self, address: GuestAddress, id: CalloutId) -> bool {
-        self.ended.remove(&(address, id))
+        self.results.next().await
     }
 }

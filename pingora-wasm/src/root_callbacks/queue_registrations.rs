@@ -109,22 +109,33 @@ mod tests {
     }
 
     #[test]
-    fn a_new_registration_of_a_slot_moves_it_to_the_end_once() {
+    fn a_new_registration_of_a_slot_moves_it_to_the_end() {
+        let mut registrations = QueueRegistrations::default();
+        let slot_0 = registrant(0, 0);
+        register(&mut registrations, slot_0);
+        register(&mut registrations, registrant(0, 1));
+
+        register(&mut registrations, slot_0);
+
+        assert_eq!(registrations.last_registrant(queue()), Some(slot_0));
+    }
+
+    #[test]
+    fn a_slot_that_registers_twice_has_one_entry() {
         let mut registrations = QueueRegistrations::default();
         let slot_0 = registrant(0, 0);
         let slot_1 = registrant(0, 1);
         register(&mut registrations, slot_0);
         register(&mut registrations, slot_1);
-
         register(&mut registrations, slot_0);
 
-        assert_eq!(registrations.last_registrant(queue()), Some(slot_0));
         registrations.remove(queue(), slot_0);
+
         assert_eq!(registrations.last_registrant(queue()), Some(slot_1));
     }
 
     #[test]
-    fn the_registrant_before_receives_an_item_when_the_last_left() {
+    fn the_previous_registrant_receives_an_item_when_the_last_one_leaves() {
         let mut registrations = QueueRegistrations::default();
         let first = registrant(0, 0);
         let replaced = registrant(0, 1);
@@ -142,9 +153,19 @@ mod tests {
         registrations.keep_pending(queue());
         registrations.keep_pending(queue());
 
-        let waiting = register(&mut registrations, registrant(0, 0));
+        let pending = register(&mut registrations, registrant(0, 0));
 
-        assert_eq!(waiting, 2);
-        assert_eq!(register(&mut registrations, registrant(0, 1)), 0);
+        assert_eq!(pending, 2);
+    }
+
+    #[test]
+    fn a_pending_item_goes_to_one_registrant_only() {
+        let mut registrations = QueueRegistrations::default();
+        registrations.keep_pending(queue());
+        register(&mut registrations, registrant(0, 0));
+
+        let pending = register(&mut registrations, registrant(0, 1));
+
+        assert_eq!(pending, 0);
     }
 }

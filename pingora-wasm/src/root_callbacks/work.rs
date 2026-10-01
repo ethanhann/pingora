@@ -24,7 +24,7 @@ use log::{debug, warn};
 use proxy_wasm_host::abi::v0_2_1::{CallScope, ContextId, GuestError, QueueId};
 use std::time::Instant;
 
-/// Work for one guest.
+/// A piece of work for the root callback thread.
 pub(super) enum Work {
     Tick(GuestAddress),
     QueueItem(QueueId),
@@ -65,8 +65,8 @@ impl<R> GuestCallOutcome<R> {
 /// The context that a guest call on the root callback thread is for.
 #[derive(Clone, Copy)]
 enum GuestCallContext {
-    Root,
-    Stream(ContextId),
+    RootOfGuest,
+    Given(ContextId),
 }
 
 impl RootCallbackLoop {
@@ -84,7 +84,7 @@ impl RootCallbackLoop {
     }
 
     fn run_tick(&mut self, runtime: &RuntimeInner, address: GuestAddress) -> WorkOutcome {
-        let context = GuestCallContext::Root;
+        let context = GuestCallContext::RootOfGuest;
         let tick = self.call_guest(runtime, address, context, "proxy_on_tick", |scope, root| {
             scope.on_tick(root)?;
             Ok(scope.guest().tick_period(root))
@@ -98,11 +98,11 @@ impl RootCallbackLoop {
     fn run_queue_item(&mut self, runtime: &RuntimeInner, queue: QueueId) -> WorkOutcome {
         loop {
             let Some(registrant) = self.queues.last_registrant(queue) else {
-                debug!("wasm queue {queue:?} got an item, and no live plugin registered it");
+                debug!("wasm queue {queue} got an item, and no live plugin registered it");
                 self.queues.keep_pending(queue);
                 return WorkOutcome::Done;
             };
-            let context = GuestCallContext::Stream(registrant.root);
+            let context = GuestCallContext::Given(registrant.root);
             let callback_name = "proxy_on_queue_ready";
             let ready = self.call_guest(runtime, registrant.address, context, callback_name, {
                 |scope, root| scope.on_queue_ready(root, queue)
@@ -114,14 +114,18 @@ impl RootCallbackLoop {
         }
     }
 
+    /// Deliver the result of a callout with `proxy_on_http_call_response`.
+    ///
+    /// The result is dropped when the callout is no longer open, which happens when
+    /// `proxy_on_delete` ended its context first.
     fn run_delivery(&mut self, runtime: &RuntimeInner, finished: &FinishedCallout) -> WorkOutcome {
-        if self.callouts.was_ended(finished.address, finished.id) {
-            return WorkOutcome::Done;
-        }
-        let context = GuestCallContext::Stream(finished.context);
+        let context = GuestCallContext::Given(finished.context);
         let callback_name = "proxy_on_http_call_response";
         let delivery = self.call_guest(runtime, finished.address, context, callback_name, {
             |scope, context| {
+                if scope.guest().open_callout(finished.id).is_none() {
+                    return Ok(());
+                }
                 let response = finished.result.as_http_call_response();
                 scope.on_http_call_response(context, finished.id, response)
             }
@@ -129,10 +133,14 @@ impl RootCallbackLoop {
         delivery.work_outcome()
     }
 
-    /// Run `proxy_on_log`, when the context still owes it, and `proxy_on_delete`.
+    /// Run `proxy_on_log`, when the context still owes it, and then `proxy_on_delete`.
     ///
-    /// The results of the callouts that the context still had open are dropped when they
-    /// arrive.
+    /// `proxy_on_delete` also runs after a failure of `proxy_on_log` that left the guest in its
+    /// slot. The results of the callouts that the context still had open are dropped when they
+    /// arrive, because the callouts are no longer open.
+    ///
+    /// When the slot is busy for `proxy_on_delete`, only `proxy_on_delete` runs again later, so
+    /// `proxy_on_log` never runs twice.
     fn end_held_context(
         &mut self,
         runtime: &RuntimeInner,
@@ -140,30 +148,34 @@ impl RootCallbackLoop {
         context: ContextId,
         log_owed: bool,
     ) -> WorkOutcome {
-        let call_context = GuestCallContext::Stream(context);
-        let callback_name = match log_owed {
-            true => "proxy_on_log or proxy_on_delete",
-            false => "proxy_on_delete",
-        };
-        let ended = self.call_guest(runtime, address, call_context, callback_name, {
-            |scope, context| {
-                if log_owed {
-                    scope.on_log(context)?;
-                }
-                scope.on_delete(context)
+        let call_context = GuestCallContext::Given(context);
+        if log_owed {
+            let logged = self.call_guest(runtime, address, call_context, "proxy_on_log", {
+                |scope, context| scope.on_log(context)
+            });
+            match logged {
+                GuestCallOutcome::SlotBusy => return WorkOutcome::SlotBusy,
+                GuestCallOutcome::GuestGone => return WorkOutcome::Done,
+                GuestCallOutcome::Ran(()) | GuestCallOutcome::Failed => {}
             }
-        });
-        if let GuestCallOutcome::Ran(open_callouts) = &ended {
-            self.callouts.end(address, open_callouts);
         }
-        ended.work_outcome()
+        let deleted = self.call_guest(runtime, address, call_context, "proxy_on_delete", {
+            |scope, context| scope.on_delete(context)
+        });
+        if let GuestCallOutcome::SlotBusy = deleted {
+            self.retry_later(Work::EndHeldContext {
+                address,
+                context,
+                log_owed: false,
+            });
+        }
+        WorkOutcome::Done
     }
 
-    /// Run `body` on the guest at `address` with no request, pass it the context of the call,
-    /// and start the callouts that the guest sent.
+    /// Run `body` on the guest at `address` with no request, and start the callouts it sent.
     ///
-    /// A failure logs a warning that mentions `callback_name`, unless it replaced the guest,
-    /// which logs its own warning.
+    /// `body` receives the context of the call. A failure logs a warning with `callback_name`,
+    /// unless the failure removed the guest from its slot, because the pool logs that itself.
     fn call_guest<R>(
         &mut self,
         runtime: &RuntimeInner,
@@ -182,8 +194,8 @@ impl RootCallbackLoop {
             return GuestCallOutcome::GuestGone;
         };
         let context = match context {
-            GuestCallContext::Root => loaded.root,
-            GuestCallContext::Stream(context) => context,
+            GuestCallContext::RootOfGuest => loaded.root,
+            GuestCallContext::Given(context) => context,
         };
         let (result, callouts) = loaded.run_with_no_request(context, |scope| body(scope, context));
         match result {

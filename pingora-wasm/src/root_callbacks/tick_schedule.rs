@@ -28,7 +28,9 @@ pub(super) struct TickSchedule {
 }
 
 impl TickSchedule {
-    /// Set the tick period of the guest at `address`. `None` stops its ticks.
+    /// Set the tick period of the guest at `address`.
+    ///
+    /// `None` stops the ticks of that guest.
     pub(super) fn set_period(
         &mut self,
         address: GuestAddress,

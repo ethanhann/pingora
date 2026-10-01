@@ -26,7 +26,7 @@ use std::sync::Arc;
 /// `proxy_on_done` returned `false`.
 struct HeldContext {
     context: ContextId,
-    /// Whether the context ended in `logging`, so that it still owes `proxy_on_log`.
+    /// Whether the context ended in `logging`, which means that it still owes `proxy_on_log`.
     log_owed: bool,
 }
 
@@ -60,8 +60,10 @@ impl Loaded {
         }
     }
 
-    /// Report what the last guest call changed to the root callback thread: the tick period and
-    /// the queues of the root, and each held context that the guest finished with `proxy_done`.
+    /// Report to the root callback thread what the last guest call changed.
+    ///
+    /// The report has the tick period and the queues of the root, and each held context that the
+    /// guest finished with `proxy_done`.
     pub(crate) fn report_to_root_thread(&mut self) {
         let changes = self.guest.take_changes();
         if !changes.is_empty() {
@@ -111,7 +113,7 @@ impl Loaded {
         self.held.fetch_add(1, Ordering::Relaxed);
         self.send_callouts_to_root_thread(context, callouts);
         if !open_with_no_result.is_empty() {
-            self.link.send(RootCallbackEvent::CalloutsWithNoResult {
+            self.link.send(RootCallbackEvent::OpenCalloutsToFail {
                 address: self.link.address,
                 context,
                 callouts: open_with_no_result,
@@ -119,8 +121,9 @@ impl Loaded {
         }
     }
 
-    /// Send callouts that no request waits for to the root callback thread, which delivers
-    /// their results to `context`.
+    /// Send the callouts that no request waits for to the root callback thread.
+    ///
+    /// The thread delivers their results to `context`.
     pub(crate) fn send_callouts_to_root_thread(
         &self,
         context: ContextId,
@@ -137,14 +140,15 @@ impl Loaded {
 
     /// Run `body` for `context` with no request, under the root stream state.
     ///
-    /// Return the result with the callouts that the guest sent from `context`.
+    /// Return the result with the callouts that the guest sent from `context`, after the changes
+    /// of the call are reported to the root callback thread.
     pub(crate) fn run_with_no_request<R>(
         &mut self,
         context: ContextId,
         body: impl FnOnce(&mut CallScope<'_, RootStream>) -> R,
     ) -> (R, Vec<AcceptedCallout>) {
         let service = self.callout_service.clone();
-        let stream = RootStream::new(self.link.conf.clone());
+        let stream = RootStream::new(self.link.plugin.clone());
         let guest = &mut self.guest;
         let result_and_callouts = service.record_callouts(context, || {
             let mut scope = guest.enter(stream);

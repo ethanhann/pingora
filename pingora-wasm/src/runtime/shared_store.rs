@@ -26,9 +26,9 @@ use std::sync::Arc;
 
 /// The shared services of a runtime.
 ///
-/// Shared data and queues stay in an [InMemoryStore], and the metrics live here instead.
-/// `proxy_record_metric` adds to a counter, as in Envoy, where the store would replace the
-/// value, and each change also goes to the metric sink.
+/// Shared data and queues are kept in an [InMemoryStore], and this type keeps the metrics.
+/// `proxy_record_metric` adds to a counter, as in Envoy, where [InMemoryStore] would replace
+/// the value. Each change is also sent to the metric sink.
 pub(crate) struct SharedStore {
     store: InMemoryStore,
     metrics: Mutex<Metrics>,
@@ -50,8 +50,10 @@ struct MetricEntry {
 }
 
 impl SharedStore {
-    /// Create a store with `limits`, which calls `enqueue_observer` for each queue item and
-    /// sends the metrics to `sink`.
+    /// Create a store with `limits`.
+    ///
+    /// The store calls `enqueue_observer` for each queue item and sends each metric change to
+    /// `sink`.
     pub(crate) fn new(
         limits: InMemoryStoreLimits,
         enqueue_observer: Arc<dyn Fn(QueueEnqueued<'_>) + Send + Sync>,
@@ -67,8 +69,9 @@ impl SharedStore {
         }
     }
 
-    /// Change the value of `metric` with `change` under the lock, and send what `change`
-    /// returns to the recorder of the metric after the lock is released.
+    /// Apply `change` to `metric`, and pass its result to the recorder of the metric.
+    ///
+    /// The recorder runs after the lock is released, so a slow recorder does not hold the lock.
     fn change_metric(
         &self,
         metric: MetricId,
@@ -90,14 +93,15 @@ impl SharedStore {
     }
 }
 
-// A recorder can be shared with a runtime that replaces this one, so a gauge takes back its
-// value, and the gauge of a sink is the sum of the runtimes that are alive, as in Envoy
+// A runtime that replaces this one can share its recorders. When the store drops, each gauge
+// takes back the value that it added, so a gauge in the sink is the sum over the runtimes
+// that are alive, as in Envoy
 impl Drop for SharedStore {
     fn drop(&mut self) {
         let metrics = self.metrics.get_mut();
         for entry in metrics.entries.values() {
             if let (MetricType::Gauge, Some(recorder)) = (entry.kind, &entry.recorder) {
-                recorder.add(saturating_delta(entry.value, 0));
+                recorder.add(-gauge_total_sent(entry.value));
             }
         }
     }
@@ -106,6 +110,13 @@ impl Drop for SharedStore {
 enum RecorderCall {
     Add(i64),
     Record(u64),
+}
+
+/// Return the total of the deltas that a gauge at `value` sent to its recorder.
+///
+/// The total stops at `i64::MAX`, because a recorder takes an `i64` delta.
+fn gauge_total_sent(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn saturating_delta(from: u64, to: u64) -> i64 {
@@ -225,9 +236,9 @@ impl SharedServices for SharedStore {
                 Ok(RecorderCall::Add(saturating_delta(before, entry.value)))
             }
             MetricType::Gauge => {
-                let before = entry.value;
+                let before = gauge_total_sent(entry.value);
                 entry.value = value;
-                Ok(RecorderCall::Add(saturating_delta(before, value)))
+                Ok(RecorderCall::Add(gauge_total_sent(value) - before))
             }
             MetricType::Histogram => Ok(RecorderCall::Record(value)),
         })
@@ -250,7 +261,11 @@ impl SharedServices for SharedStore {
                     .ok_or(Status::BadArgument)?,
                 MetricType::Histogram => return Err(Status::BadArgument),
             };
-            Ok(RecorderCall::Add(saturating_delta(before, entry.value)))
+            let sent = match entry.kind {
+                MetricType::Gauge => gauge_total_sent(entry.value) - gauge_total_sent(before),
+                _ => saturating_delta(before, entry.value),
+            };
+            Ok(RecorderCall::Add(sent))
         })
     }
 
@@ -415,5 +430,21 @@ mod tests {
         drop(store);
 
         assert_eq!(events.lock().last().unwrap(), "add vm/open -5");
+    }
+
+    #[test]
+    fn a_dropped_store_takes_back_the_saturated_value_of_a_gauge() {
+        let (store, events) = store();
+        let gauge = store
+            .define_metric(call(), b"vm", MetricType::Gauge, b"g")
+            .unwrap();
+        store.record_metric(call(), gauge, u64::MAX).unwrap();
+
+        drop(store);
+
+        assert_eq!(
+            *events.lock().last().unwrap(),
+            format!("add vm/g {}", -i64::MAX)
+        );
     }
 }

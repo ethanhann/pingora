@@ -26,7 +26,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-/// How long the thread waits before it tries again a slot that a request holds.
+/// The wait before the thread retries work whose slot a request holds.
 const BUSY_SLOT_RETRY: Duration = Duration::from_millis(1);
 
 /// The state of the loop on the root callback thread.
@@ -60,8 +60,9 @@ impl RootCallbackLoop {
             }
             _ = sleep_until_due(due), if due.is_some() => {}
         }
-        // A guest call that registers a queue and puts an item on it sends the item first, so
-        // the thread takes every waiting event before it runs work
+        // A guest call that registers a queue and puts an item on it sends the item event before
+        // the registration, so the thread takes every waiting event before it runs work, and the
+        // item finds its registrant
         while let Ok(event) = events.try_recv() {
             self.accept(event);
         }
@@ -85,6 +86,11 @@ impl RootCallbackLoop {
             } => {
                 if let Some(period) = changes.tick_periods.get(&root) {
                     self.ticks.set_period(address, *period, Instant::now());
+                    if period.is_none() {
+                        let waits_for =
+                            |work: &Work| matches!(work, Work::Tick(a) if *a == address);
+                        self.retries.retain(|(_, work)| !waits_for(work));
+                    }
                 }
                 for registration in changes.queues {
                     let queue = registration.queue;
@@ -104,7 +110,7 @@ impl RootCallbackLoop {
                 let callouts = callouts.into_iter().map(|c| (address, context, c));
                 self.callouts_to_start.extend(callouts);
             }
-            RootCallbackEvent::CalloutsWithNoResult {
+            RootCallbackEvent::OpenCalloutsToFail {
                 address,
                 context,
                 callouts,
@@ -131,10 +137,15 @@ impl RootCallbackLoop {
         }
     }
 
+    /// Schedule `work` to run again after `BUSY_SLOT_RETRY`.
+    pub(super) fn retry_later(&mut self, work: Work) {
+        self.retries.push((Instant::now() + BUSY_SLOT_RETRY, work));
+    }
+
     /// Start the callouts that arrived, and run each piece of work that is due.
     ///
-    /// It runs outside the async context of the thread, inside the tokio runtime of the thread
-    /// so that callouts start there.
+    /// It runs after `block_on` returns, with the tokio runtime of the thread entered, so the
+    /// callouts that it starts run on that runtime.
     pub(super) fn run_due_work(&mut self, runtime: &RuntimeInner) {
         for (address, context, callout) in self.callouts_to_start.drain(..) {
             self.callouts.start(runtime, address, context, callout);
@@ -143,7 +154,8 @@ impl RootCallbackLoop {
         let (due, waiting) = self.retries.drain(..).partition(|(at, _)| *at <= now);
         self.retries = waiting;
         for (_, work) in due {
-            // A tick that waited for its slot is dropped when the guest set a new period since
+            // Drop a tick that waited for its slot when the guest set a new period in the meantime,
+            // because the schedule already holds the next tick of that slot
             if let Work::Tick(address) = &work {
                 if self.ticks.has_next_tick(address.slot) {
                     continue;
@@ -155,7 +167,7 @@ impl RootCallbackLoop {
         self.ready_work.extend(ticks.into_iter().map(Work::Tick));
         while let Some(work) = self.ready_work.pop_front() {
             if let WorkOutcome::SlotBusy = self.run_work(runtime, &work) {
-                self.retries.push((Instant::now() + BUSY_SLOT_RETRY, work));
+                self.retry_later(work);
             }
         }
     }
@@ -164,5 +176,33 @@ impl RootCallbackLoop {
 async fn sleep_until_due(due: Option<Instant>) {
     if let Some(due) = due {
         tokio::time::sleep_until(due.into()).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::pool::events::SlotIndex;
+    use proxy_wasm_host::abi::v0_2_1::{Changes, GuestId};
+
+    #[test]
+    fn a_period_of_zero_removes_a_tick_that_waits_for_its_slot() {
+        let mut state = RootCallbackLoop::default();
+        let address = GuestAddress {
+            slot: SlotIndex { pool: 0, slot: 0 },
+            guest: GuestId::next(),
+        };
+        let root = ContextId::try_from(1).unwrap();
+        state.retries.push((Instant::now(), Work::Tick(address)));
+        let mut changes = Changes::default();
+        changes.tick_periods.insert(root, None);
+
+        state.accept(RootCallbackEvent::GuestChanged {
+            address,
+            root,
+            changes,
+        });
+
+        assert!(state.retries.is_empty());
     }
 }

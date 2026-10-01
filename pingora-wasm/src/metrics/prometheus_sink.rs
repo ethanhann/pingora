@@ -44,8 +44,8 @@ const HISTOGRAM_BUCKETS: [f64; 19] = [
 /// Failed callouts are counted in `wasm_callout_failures_total`, with the labels `plugin` and
 /// `failure`.
 ///
-/// Create one sink and pass it to each runtime you build, also when you reload plugins, because
-/// a registry accepts each name once.
+/// Create one sink and pass it to each runtime that you build, including the runtimes that you
+/// build to reload plugins, because a registry accepts each name once.
 ///
 /// ```no_run
 /// use pingora_wasm::{PrometheusMetricSink, WasmServices};
@@ -175,10 +175,14 @@ impl WasmMetricSink for PrometheusMetricSink {
             Entry::Vacant(entry) => {
                 let vector = match FamilyVector::new(entry.key(), metric.kind) {
                     Ok(vector) => vector,
-                    Err(e) => return self.skip_metric(&metric.name, &e.to_string()),
+                    Err(e) => {
+                        let reason = format!("its name is not valid: {e}");
+                        return self.skip_metric(&metric.name, &reason);
+                    }
                 };
                 if let Err(e) = self.registry.register(vector.collector()) {
-                    return self.skip_metric(&metric.name, &e.to_string());
+                    let reason = format!("the registry refused it: {e}");
+                    return self.skip_metric(&metric.name, &reason);
                 }
                 entry.insert(Family {
                     name_in_plugin: metric.name.clone(),
@@ -205,8 +209,10 @@ impl WasmMetricSink for PrometheusMetricSink {
     }
 }
 
-/// Return `name` with each character that Prometheus does not permit replaced by `_`, and with
-/// `_` before a leading digit. Return `None` for an empty name.
+/// Return `name` as a valid Prometheus name, or `None` for an empty name.
+///
+/// Each character that Prometheus does not permit becomes `_`, and a leading digit gets `_`
+/// before it.
 fn prometheus_name(name: &str) -> Option<String> {
     if name.is_empty() {
         return None;
@@ -247,7 +253,7 @@ struct HistogramRecorder(Histogram);
 
 impl WasmMetricRecorder for HistogramRecorder {
     fn record(&self, value: u64) {
-        // A histogram of Prometheus holds f64 values, which lose precision only above 2^53
+        // A Prometheus histogram holds f64 values, which lose precision only above 2^53
         #[allow(clippy::cast_precision_loss)]
         self.0.observe(value as f64);
     }
@@ -275,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn the_names_of_plugins_become_valid_prometheus_names() {
+    fn plugin_metric_names_become_valid_prometheus_names() {
         let cases = [
             ("waf_filter.tx.total", Some("waf_filter_tx_total")),
             (
@@ -307,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn a_name_with_another_type_or_the_same_prometheus_name_is_not_published() {
+    fn a_metric_whose_type_or_prometheus_name_conflicts_is_not_published() {
         let sink = PrometheusMetricSink::new(Registry::new()).unwrap();
         sink.metric_defined(&metric("a", "a.b", WasmMetricKind::Counter));
 

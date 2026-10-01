@@ -14,6 +14,8 @@
 
 //! The plugins of a proxy and their guests, built once and shared by every request.
 
+mod build;
+use build::{build_pool, new_shared_store, plugin_names, PoolInputs};
 mod log_sink;
 mod plugin;
 pub(crate) mod pool;
@@ -31,17 +33,12 @@ use crate::callout::ConnectorSender;
 use crate::chain::WasmChain;
 use crate::properties::WasmProperties;
 use crate::root_callbacks::RootCallbackThread;
-use crate::stream::RootCallbackConf;
 use once_cell::sync::OnceCell;
 use pingora_core::connectors::http::Connector;
 use pingora_error::{Error, ErrorType, OrErr, Result};
-use pool::events::RootCallbackEvent;
-use pool::{GuestPool, GuestPoolConf};
-use proxy_wasm_host::abi::v0_2_1::{
-    GuestSpec, Host, InMemoryStoreLimits, QueueEnqueued, SharedServices,
-};
-use proxy_wasm_host::{Engine, EngineConfig, Module};
-use shared_store::SharedStore;
+use pool::GuestPool;
+use proxy_wasm_host::abi::v0_2_1::Host;
+use proxy_wasm_host::{Engine, EngineConfig};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -104,7 +101,8 @@ impl WasmRuntime {
             .unwrap_or_else(|| Arc::new(Connector::new(None)));
         let request = Arc::new(ConnectorSender::new(connector, &services));
         // A callout from the root callback thread opens its connections on the tokio runtime of
-        // that thread, which stops with this runtime, so it has a connector of its own
+        // that thread. That tokio runtime stops when this `WasmRuntime` drops, so the root
+        // callouts use a connector of their own
         let root_connector = Arc::new(Connector::new(None));
         let root = Arc::new(ConnectorSender::new(root_connector, &services));
         Self::new_with_callout_senders(plugins, services, CalloutSenders { request, root })
@@ -128,26 +126,12 @@ impl WasmRuntime {
         services: WasmServices,
         senders: CalloutSenders,
     ) -> Result<Self> {
-        let sink = services.log_sink;
-        let upstreams = services.callout_upstreams;
         let callout_launcher = CalloutLauncher::new(
             senders,
             services.metric_sink.clone(),
             services.max_callouts_in_flight,
         )?;
-        if plugins.is_empty() {
-            return Error::e_explain(ErrorType::InternalError, "no wasm plugin to run");
-        }
-        let mut names = HashMap::with_capacity(plugins.len());
-        for (index, plugin) in plugins.iter().enumerate() {
-            plugin.check()?;
-            if names.insert(plugin.name.clone(), index).is_some() {
-                return Error::e_explain(
-                    ErrorType::InternalError,
-                    format!("wasm plugin {} is listed twice", plugin.name),
-                );
-            }
-        }
+        let names = plugin_names(&plugins)?;
         let engine = EngineConfig::new()
             .with_external_ticks(true)
             .build()
@@ -155,54 +139,21 @@ impl WasmRuntime {
         let host =
             Host::new(&engine).or_err(ErrorType::InternalError, "failed to link the host")?;
         let root_callbacks = RootCallbackThread::new();
-        let queue_items = root_callbacks.sender();
-        let enqueue_observer = Arc::new(move |item: QueueEnqueued<'_>| {
-            let _ = queue_items.send(RootCallbackEvent::QueueItem(item.queue));
-        });
-        let limits = InMemoryStoreLimits::default();
-        let shared: Arc<dyn SharedServices> = Arc::new(SharedStore::new(
-            limits,
-            enqueue_observer,
-            services.metric_sink.clone(),
-        ));
+        let shared = new_shared_store(&root_callbacks, services.metric_sink.clone());
         let fixed_properties = Arc::new(services.fixed_properties);
+        let inputs = PoolInputs {
+            engine: &engine,
+            host: &host,
+            log_sink: services.log_sink,
+            shared,
+            upstreams: services.callout_upstreams,
+            fixed_properties: fixed_properties.clone(),
+            root_callbacks: &root_callbacks,
+        };
         let pools = with_ticker(&engine, || {
-            plugins
-                .iter()
-                .enumerate()
-                .map(|(index, plugin)| {
-                    let bytes =
-                        std::fs::read(&plugin.path).or_err_with(ErrorType::ReadError, || {
-                            format!(
-                                "wasm plugin {} cannot read {}",
-                                plugin.name,
-                                plugin.path.display()
-                            )
-                        })?;
-                    let module = Module::new(&engine, &bytes)
-                        .or_err_with(ErrorType::InternalError, || {
-                            format!("wasm plugin {} does not compile", plugin.name)
-                        })?;
-                    let services = plugin.services(sink.clone(), shared.clone());
-                    let spec = GuestSpec::new(&host, &module, services, &plugin.limits)
-                        .or_err_with(ErrorType::InternalError, || {
-                            format!("wasm plugin {} is not a supported module", plugin.name)
-                        })?;
-                    GuestPool::new(GuestPoolConf {
-                        pool_index: index,
-                        name: plugin.name.clone(),
-                        spec,
-                        plugin: plugin.plugin_config(),
-                        slots: plugin.slots,
-                        phases: plugin.phase_conf(),
-                        callout_conf: plugin.callout_conf(upstreams.clone()),
-                        root_callback_conf: Arc::new(RootCallbackConf::new(
-                            &plugin.name,
-                            fixed_properties.clone(),
-                        )),
-                        root_callback_sender: root_callbacks.sender(),
-                    })
-                })
+            let pools = plugins.iter().enumerate();
+            pools
+                .map(|(index, plugin)| build_pool(index, plugin, &inputs))
                 .collect::<Result<Vec<_>>>()
         })?;
         Ok(WasmRuntime {
