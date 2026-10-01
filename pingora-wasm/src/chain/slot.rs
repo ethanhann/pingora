@@ -60,7 +60,7 @@ impl<'a> LockedSlot<'a> {
     ///
     /// A failure that leaves the guest unusable also replaces the guest.
     pub(super) fn guest_failure(self, what: &str, cause: GuestError) -> Box<Error> {
-        self.pool.check(self.slot, self.guard, &cause);
+        self.pool.replace_if_unusable(self.slot, self.guard, &cause);
         plugin_failure(&self.pool.name, what, cause)
     }
 }

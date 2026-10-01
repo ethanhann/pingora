@@ -88,7 +88,10 @@ mod tests {
 
     fn address(slot: usize, guest: GuestId) -> GuestAddress {
         GuestAddress {
-            slot: SlotIndex { pool: 0, slot },
+            slot: SlotIndex {
+                pool_index: 0,
+                slot_index: slot,
+            },
             guest,
         }
     }
@@ -97,14 +100,14 @@ mod tests {
     fn a_tick_is_due_one_period_after_the_period_was_set() {
         let mut schedule = TickSchedule::default();
         let start = Instant::now();
-        let slot = address(0, GuestId::next());
-        schedule.set_period(slot, Some(Duration::from_millis(100)), start);
+        let address = address(0, GuestId::next());
+        schedule.set_period(address, Some(Duration::from_millis(100)), start);
 
         let early = schedule.take_due(start + Duration::from_millis(99));
         let due = schedule.take_due(start + Duration::from_millis(100));
 
         assert!(early.is_empty());
-        assert_eq!(due, vec![slot]);
+        assert_eq!(due, vec![address]);
         assert_eq!(schedule.next_due(), None);
     }
 
@@ -112,10 +115,10 @@ mod tests {
     fn a_period_of_zero_stops_the_ticks() {
         let mut schedule = TickSchedule::default();
         let start = Instant::now();
-        let slot = address(0, GuestId::next());
-        schedule.set_period(slot, Some(Duration::from_millis(100)), start);
+        let address = address(0, GuestId::next());
+        schedule.set_period(address, Some(Duration::from_millis(100)), start);
 
-        schedule.set_period(slot, None, start);
+        schedule.set_period(address, None, start);
 
         assert_eq!(schedule.next_due(), None);
     }
@@ -124,8 +127,8 @@ mod tests {
     fn a_period_of_zero_from_a_replaced_guest_keeps_the_ticks_of_the_new_guest() {
         let mut schedule = TickSchedule::default();
         let start = Instant::now();
-        let new = address(0, GuestId::next());
-        schedule.set_period(new, Some(Duration::from_millis(100)), start);
+        let new_guest = address(0, GuestId::next());
+        schedule.set_period(new_guest, Some(Duration::from_millis(100)), start);
 
         schedule.set_period(address(0, GuestId::next()), None, start);
 

@@ -18,7 +18,7 @@ use super::{get, header};
 use crate::utils::{echo_origin, eventually, guest_messages, init};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-fn int(bytes: &[u8]) -> Option<i64> {
+fn decode_i64(bytes: &[u8]) -> Option<i64> {
     Some(i64::from_le_bytes(bytes.try_into().ok()?))
 }
 
@@ -48,9 +48,14 @@ async fn a_plugin_reads_the_request_properties() {
     assert!(source.starts_with("127.0.0.1:"), "{source}");
     assert!(eventually(|| guest_messages("request-properties").len() >= 2).await);
     let logged = guest_messages("request-properties");
-    let time = Duration::from_nanos(int(&logged[logged.len() - 1]).unwrap().try_into().unwrap());
+    let time = Duration::from_nanos(
+        decode_i64(&logged[logged.len() - 1])
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
     let age = SystemTime::now().duration_since(UNIX_EPOCH).unwrap() - time;
-    assert_eq!(int(&logged[logged.len() - 2]), Some(6406));
+    assert_eq!(decode_i64(&logged[logged.len() - 2]), Some(6406));
     assert!(age < Duration::from_secs(5), "{age:?}");
 }
 
@@ -67,7 +72,7 @@ async fn a_plugin_reads_the_upstream_and_the_response_code_in_the_response_phase
         Some(format!("127.0.0.1:{port}"))
     );
     let logged = guest_messages("response-properties");
-    let logged: Vec<_> = logged.iter().map(|value| int(value)).collect();
+    let logged: Vec<_> = logged.iter().map(|value| decode_i64(value)).collect();
     assert_eq!(
         logged[logged.len() - 2..],
         [Some(200), Some(i64::from(port))]
@@ -84,7 +89,7 @@ async fn a_plugin_reads_the_sizes_and_the_duration_in_proxy_on_log() {
 
     assert!(eventually(|| guest_messages("logging-properties").len() >= 3).await);
     let logged = guest_messages("logging-properties");
-    let logged: Vec<_> = logged.iter().map(|value| int(value)).collect();
+    let logged: Vec<_> = logged.iter().map(|value| decode_i64(value)).collect();
     let [request_size, response_size, duration] = logged[logged.len() - 3..] else {
         unreachable!("three values were logged");
     };

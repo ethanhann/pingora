@@ -30,9 +30,9 @@ pub(crate) use plugin_response::PluginResponse;
 pub(crate) use request_headers::RequestHeaders;
 pub(crate) use response_headers::ResponseHeaders;
 pub(crate) use response_trailers::ResponseTrailers;
-pub(crate) use root_stream::{RootCallbackPlugin, RootStream};
+pub(crate) use root_stream::{RootCallbackPluginState, RootStream};
 
-use crate::properties::built_in::{read_built_in, HeadersInStream, RequestFacts};
+use crate::properties::built_in::{write_built_in_property, ReadableHeaders, RequestFacts};
 use crate::properties::{join_path, WasmProperties};
 use log::{debug, warn};
 use proxy_wasm_host::abi::v0_2_1::types::{BufferType, MapType, Status, StreamType};
@@ -56,13 +56,13 @@ pub(crate) struct PingoraStream {
     /// The callback whose access applies while the plugin receives the result of a callout.
     pub(crate) delivery_callback: Option<Callback>,
     empty: VecHeaderMap,
-    pub(crate) facts: RequestFacts,
+    pub(crate) request_facts: RequestFacts,
     /// The request properties that the proxy set, which a plugin cannot change.
     pub(crate) proxy_properties: WasmProperties,
     /// The request properties that the plugins wrote.
     pub(crate) guest_properties: WasmProperties,
     fixed_properties: Arc<WasmProperties>,
-    path_key: Vec<u8>,
+    joined_path: Vec<u8>,
 }
 
 impl PingoraStream {
@@ -211,9 +211,9 @@ impl StreamState for PingoraStream {
         path: &[&[u8]],
         out: &mut Vec<u8>,
     ) -> Result<(), Status> {
-        join_path(path.iter().copied(), &mut self.path_key);
-        let key = &self.path_key;
-        let headers = HeadersInStream {
+        join_path(path.iter().copied(), &mut self.joined_path);
+        let key = &self.joined_path;
+        let headers = ReadableHeaders {
             request: self.request.as_ref(),
             response: self.response.as_ref().map(|r| &r.header),
         };
@@ -221,7 +221,7 @@ impl StreamState for PingoraStream {
             out.extend_from_slice(value);
             return Ok(());
         }
-        if read_built_in(key, &self.facts, &headers, out) {
+        if write_built_in_property(key, &self.request_facts, &headers, out) {
             return Ok(());
         }
         let stored = self.guest_properties.get_joined(key);
@@ -243,8 +243,9 @@ impl StreamState for PingoraStream {
         path: &[&[u8]],
         value: &[u8],
     ) -> Result<(), Status> {
-        join_path(path.iter().copied(), &mut self.path_key);
-        self.guest_properties.insert_joined(&self.path_key, value);
+        join_path(path.iter().copied(), &mut self.joined_path);
+        self.guest_properties
+            .insert_joined(&self.joined_path, value);
         Ok(())
     }
 
@@ -528,7 +529,8 @@ mod tests {
     }
 
     #[test]
-    fn send_local_response_is_allowed_only_in_the_request_and_response_callbacks() {
+    fn send_local_response_is_allowed_only_in_the_request_and_response_callbacks_with_a_valid_status(
+    ) {
         let cases = [
             (Callback::RequestHeaders, 403, Ok(())),
             (Callback::RequestBody, 403, Ok(())),

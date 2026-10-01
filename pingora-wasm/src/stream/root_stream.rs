@@ -26,28 +26,28 @@ use std::sync::Arc;
 ///
 /// It holds the plugin name, the fixed properties, and whether the warning about a call that
 /// tries to change a request was logged.
-pub(crate) struct RootCallbackPlugin {
+pub(crate) struct RootCallbackPluginState {
     pub(crate) plugin_name: String,
     pub(crate) fixed_properties: Arc<WasmProperties>,
     request_change_warning_logged: AtomicBool,
 }
 
-impl RootCallbackPlugin {
+impl RootCallbackPluginState {
     pub(crate) fn new(plugin_name: &str, fixed_properties: Arc<WasmProperties>) -> Self {
-        RootCallbackPlugin {
+        RootCallbackPluginState {
             plugin_name: plugin_name.to_string(),
             fixed_properties,
             request_change_warning_logged: AtomicBool::new(false),
         }
     }
 
-    fn warn_of_request_change_once(&self, what: &str) {
+    fn warn_of_request_change_once(&self, function_name: &str) {
         if !self
             .request_change_warning_logged
             .swap(true, Ordering::Relaxed)
         {
             warn!(
-                "wasm plugin {} called {what} outside a request phase, which has no effect",
+                "wasm plugin {} called {function_name} outside a request phase, which has no effect",
                 self.plugin_name
             );
         }
@@ -59,17 +59,17 @@ impl RootCallbackPlugin {
 /// Such a callback is a root callback, or the end of a context that the guest held after its
 /// request. A plugin reads empty header maps and the fixed properties.
 pub(crate) struct RootStream {
-    plugin: Arc<RootCallbackPlugin>,
-    empty: VecHeaderMap,
-    path_key: Vec<u8>,
+    plugin: Arc<RootCallbackPluginState>,
+    empty_header_map: VecHeaderMap,
+    joined_path: Vec<u8>,
 }
 
 impl RootStream {
-    pub(crate) fn new(plugin: Arc<RootCallbackPlugin>) -> Self {
+    pub(crate) fn new(plugin: Arc<RootCallbackPluginState>) -> Self {
         RootStream {
             plugin,
-            empty: VecHeaderMap::default(),
-            path_key: Vec::new(),
+            empty_header_map: VecHeaderMap::default(),
+            joined_path: Vec::new(),
         }
     }
 }
@@ -86,7 +86,7 @@ impl StreamState for RootStream {
         if access != Access::Read {
             return Err(Status::NotFound);
         }
-        Ok(&mut self.empty)
+        Ok(&mut self.empty_header_map)
     }
 
     fn buffer(
@@ -120,8 +120,8 @@ impl StreamState for RootStream {
         path: &[&[u8]],
         out: &mut Vec<u8>,
     ) -> Result<(), Status> {
-        join_path(path.iter().copied(), &mut self.path_key);
-        match self.plugin.fixed_properties.get_joined(&self.path_key) {
+        join_path(path.iter().copied(), &mut self.joined_path);
+        match self.plugin.fixed_properties.get_joined(&self.joined_path) {
             Some(value) => {
                 out.extend_from_slice(value);
                 Ok(())
@@ -146,13 +146,16 @@ mod tests {
     use crate::test_support::{crate_log_lines_with, record_crate_logs};
     use proxy_wasm_host::abi::v0_2_1::{Callback, ContextId, GuestId};
 
-    fn call() -> Invocation {
+    fn tick_invocation() -> Invocation {
         Invocation::new(GuestId::next(), ContextId::try_from(1).unwrap())
             .with_callback(Callback::Tick)
     }
 
-    fn root_stream(plugin: &str, fixed: WasmProperties) -> RootStream {
-        RootStream::new(Arc::new(RootCallbackPlugin::new(plugin, Arc::new(fixed))))
+    fn root_stream(plugin_name: &str, fixed_properties: WasmProperties) -> RootStream {
+        RootStream::new(Arc::new(RootCallbackPluginState::new(
+            plugin_name,
+            Arc::new(fixed_properties),
+        )))
     }
 
     #[test]
@@ -160,10 +163,14 @@ mod tests {
         let mut stream = root_stream("maps", WasmProperties::new());
 
         let read = stream
-            .header_map(call(), Access::Read, MapType::HttpRequestHeaders)
+            .header_map(tick_invocation(), Access::Read, MapType::HttpRequestHeaders)
             .map(|map| map.len());
         let write = stream
-            .header_map(call(), Access::Write, MapType::HttpRequestHeaders)
+            .header_map(
+                tick_invocation(),
+                Access::Write,
+                MapType::HttpRequestHeaders,
+            )
             .map(|map| map.len());
 
         assert_eq!(read, Ok(0));
@@ -177,8 +184,8 @@ mod tests {
         let mut stream = root_stream("fixed", fixed);
         let mut value = Vec::new();
 
-        let found = stream.property(call(), &[b"node", b"name"], &mut value);
-        let missing = stream.property(call(), &[b"request", b"path"], &mut Vec::new());
+        let found = stream.property(tick_invocation(), &[b"node", b"name"], &mut value);
+        let missing = stream.property(tick_invocation(), &[b"request", b"path"], &mut Vec::new());
 
         assert_eq!(found, Ok(()));
         assert_eq!(value, b"edge-1");
@@ -190,8 +197,8 @@ mod tests {
         record_crate_logs();
         let mut stream = root_stream("continue-from-tick", WasmProperties::new());
 
-        let first = stream.continue_stream(call(), StreamType::HttpRequest);
-        let second = stream.continue_stream(call(), StreamType::HttpRequest);
+        let first = stream.continue_stream(tick_invocation(), StreamType::HttpRequest);
+        let second = stream.continue_stream(tick_invocation(), StreamType::HttpRequest);
 
         assert_eq!((first, second), (Ok(()), Ok(())));
         let warnings = crate_log_lines_with("continue-from-tick called proxy_continue_stream");

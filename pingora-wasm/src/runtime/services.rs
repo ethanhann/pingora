@@ -95,11 +95,11 @@ impl fmt::Debug for WasmServices {
 /// The senders of the callouts of a runtime.
 pub(crate) struct CalloutSenders {
     /// The sender of the callouts that requests wait for.
-    pub(crate) request: Arc<dyn CalloutSender>,
+    pub(crate) for_requests: Arc<dyn CalloutSender>,
     /// The sender of the callouts that the root callback thread delivers. It has a connector
     /// of its own, because a connection belongs to the tokio runtime that opened it, and the
     /// runtime of that thread stops when the `WasmRuntime` drops.
-    pub(crate) root: Arc<dyn CalloutSender>,
+    pub(crate) root_callback: Arc<dyn CalloutSender>,
 }
 
 /// The launcher of callout tasks for a runtime, with the limit on how many are in flight.
@@ -140,12 +140,15 @@ impl CalloutLauncher {
     /// Return a response in place of the task for a callout over the limit, and `None` when no
     /// tokio runtime is running, so the callout cannot be sent.
     pub(crate) fn spawn(&self, callout: AcceptedCallout) -> Option<PendingResult> {
-        self.spawn_with(&self.senders.request, callout)
+        self.spawn_with(&self.senders.for_requests, callout)
     }
 
     /// Start the task that sends `callout` for the root callback thread.
-    pub(crate) fn spawn_root(&self, callout: AcceptedCallout) -> Option<PendingResult> {
-        self.spawn_with(&self.senders.root, callout)
+    pub(crate) fn spawn_for_root_callback(
+        &self,
+        callout: AcceptedCallout,
+    ) -> Option<PendingResult> {
+        self.spawn_with(&self.senders.root_callback, callout)
     }
 
     fn spawn_with(
@@ -153,19 +156,19 @@ impl CalloutLauncher {
         sender: &Arc<dyn CalloutSender>,
         callout: AcceptedCallout,
     ) -> Option<PendingResult> {
-        let plugin = callout.plugin_conf.plugin_name.clone();
+        let plugin_name = callout.plugin_conf.plugin_name.clone();
         let Ok(permit) = self.in_flight_permits.clone().try_acquire_owned() else {
             callout.plugin_conf.warn_of_overflow_once();
             self.metric_sink
-                .callout_failed(&plugin, CalloutFailure::Overflow);
+                .callout_failed(&plugin_name, CalloutFailure::Overflow);
             return Some(PendingResult::Known(CalloutResult::overflow_response()));
         };
         let Ok(tokio_runtime) = Handle::try_current() else {
             warn!(
-                "wasm plugin {plugin} sent a callout with no tokio runtime running, and the callout is dropped"
+                "wasm plugin {plugin_name} sent a callout with no tokio runtime running, and the callout is dropped"
             );
             self.metric_sink
-                .callout_failed(&plugin, CalloutFailure::TaskFailed);
+                .callout_failed(&plugin_name, CalloutFailure::TaskFailed);
             return None;
         };
         let sender = sender.clone();
@@ -174,7 +177,7 @@ impl CalloutLauncher {
             let sent = AssertUnwindSafe(sender.send(callout)).catch_unwind().await;
             drop(permit);
             sent.unwrap_or_else(|_| {
-                metric_sink.callout_failed(&plugin, CalloutFailure::TaskFailed);
+                metric_sink.callout_failed(&plugin_name, CalloutFailure::TaskFailed);
                 CalloutResult::Failed
             })
         });

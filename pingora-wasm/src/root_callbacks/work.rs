@@ -28,11 +28,11 @@ use std::time::Instant;
 pub(super) enum Work {
     Tick(GuestAddress),
     QueueItem(QueueId),
-    Delivery(FinishedCallout),
+    DeliverCalloutResult(FinishedCallout),
     EndHeldContext {
         address: GuestAddress,
         context: ContextId,
-        log_owed: bool,
+        needs_on_log: bool,
     },
 }
 
@@ -74,12 +74,12 @@ impl RootCallbackLoop {
         match work {
             Work::Tick(address) => self.run_tick(runtime, *address),
             Work::QueueItem(queue) => self.run_queue_item(runtime, *queue),
-            Work::Delivery(finished) => self.run_delivery(runtime, finished),
+            Work::DeliverCalloutResult(finished) => self.deliver_callout_result(runtime, finished),
             Work::EndHeldContext {
                 address,
                 context,
-                log_owed,
-            } => self.end_held_context(runtime, *address, *context, *log_owed),
+                needs_on_log,
+            } => self.end_held_context(runtime, *address, *context, *needs_on_log),
         }
     }
 
@@ -99,7 +99,7 @@ impl RootCallbackLoop {
         loop {
             let Some(registrant) = self.queues.last_registrant(queue) else {
                 debug!("wasm queue {queue} got an item, and no live plugin registered it");
-                self.queues.keep_pending(queue);
+                self.queues.add_pending_item(queue);
                 return WorkOutcome::Done;
             };
             let context = GuestCallContext::Given(registrant.root);
@@ -118,7 +118,11 @@ impl RootCallbackLoop {
     ///
     /// The result is dropped when the callout is no longer open, which happens when
     /// `proxy_on_delete` ended its context first.
-    fn run_delivery(&mut self, runtime: &RuntimeInner, finished: &FinishedCallout) -> WorkOutcome {
+    fn deliver_callout_result(
+        &mut self,
+        runtime: &RuntimeInner,
+        finished: &FinishedCallout,
+    ) -> WorkOutcome {
         let context = GuestCallContext::Given(finished.context);
         let callback_name = "proxy_on_http_call_response";
         let delivery = self.call_guest(runtime, finished.address, context, callback_name, {
@@ -146,10 +150,10 @@ impl RootCallbackLoop {
         runtime: &RuntimeInner,
         address: GuestAddress,
         context: ContextId,
-        log_owed: bool,
+        needs_on_log: bool,
     ) -> WorkOutcome {
         let call_context = GuestCallContext::Given(context);
-        if log_owed {
+        if needs_on_log {
             let logged = self.call_guest(runtime, address, call_context, "proxy_on_log", {
                 |scope, context| scope.on_log(context)
             });
@@ -166,7 +170,7 @@ impl RootCallbackLoop {
             self.retry_later(Work::EndHeldContext {
                 address,
                 context,
-                log_owed: false,
+                needs_on_log: false,
             });
         }
         WorkOutcome::Done
@@ -184,9 +188,9 @@ impl RootCallbackLoop {
         callback_name: &str,
         body: impl FnOnce(&mut CallScope<'_, RootStream>, ContextId) -> Result<R, GuestError>,
     ) -> GuestCallOutcome<R> {
-        let pool = &runtime.pools[address.slot.pool];
-        let mut guard = match pool.try_lock_guest(address.slot.slot, address.guest) {
-            SlotLockAttempt::Locked(guard) => guard,
+        let pool = &runtime.pools[address.slot.pool_index];
+        let mut guard = match pool.try_lock_guest(address.slot.slot_index, address.guest) {
+            SlotLockAttempt::LockedGuest(guard) => guard,
             SlotLockAttempt::Busy => return GuestCallOutcome::SlotBusy,
             SlotLockAttempt::GuestGone => return GuestCallOutcome::GuestGone,
         };
@@ -197,7 +201,7 @@ impl RootCallbackLoop {
             GuestCallContext::RootOfGuest => loaded.root,
             GuestCallContext::Given(context) => context,
         };
-        let (result, callouts) = loaded.run_with_no_request(context, |scope| body(scope, context));
+        let (result, callouts) = loaded.run_root_callback(context, |scope| body(scope, context));
         match result {
             Ok(value) => {
                 for callout in callouts {
@@ -206,7 +210,7 @@ impl RootCallbackLoop {
                 GuestCallOutcome::Ran(value)
             }
             Err(e) => {
-                if !pool.check(address.slot.slot, guard, &e) {
+                if !pool.replace_if_unusable(address.slot.slot_index, guard, &e) {
                     warn!("wasm plugin {} failed in {callback_name}: {e}", pool.name);
                 }
                 GuestCallOutcome::Failed

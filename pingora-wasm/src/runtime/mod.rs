@@ -15,7 +15,7 @@
 //! The plugins of a proxy and their guests, built once and shared by every request.
 
 mod build;
-use build::{build_pool, new_shared_store, plugin_names, PoolInputs};
+use build::{build_pool, checked_plugin_indexes, new_shared_store, PoolInputs};
 mod log_sink;
 mod plugin;
 pub(crate) mod pool;
@@ -63,7 +63,7 @@ pub(crate) struct RuntimeInner {
     threads_started: OnceCell<()>,
     pub(crate) pools: Vec<GuestPool>,
     pub(crate) callout_launcher: CalloutLauncher,
-    pub(crate) root_callbacks: RootCallbackThread,
+    pub(crate) root_callback_thread: RootCallbackThread,
     pub(crate) fixed_properties: Arc<WasmProperties>,
     names: HashMap<String, usize>,
 }
@@ -99,13 +99,21 @@ impl WasmRuntime {
             .callout_connector
             .clone()
             .unwrap_or_else(|| Arc::new(Connector::new(None)));
-        let request = Arc::new(ConnectorSender::new(connector, &services));
+        let request_sender = Arc::new(ConnectorSender::new(connector, &services));
         // A callout from the root callback thread opens its connections on the tokio runtime of
         // that thread. That tokio runtime stops when this `WasmRuntime` drops, so the root
         // callouts use a connector of their own
-        let root_connector = Arc::new(Connector::new(None));
-        let root = Arc::new(ConnectorSender::new(root_connector, &services));
-        Self::new_with_callout_senders(plugins, services, CalloutSenders { request, root })
+        let root_callback_connector = Arc::new(Connector::new(None));
+        let root_callback_sender =
+            Arc::new(ConnectorSender::new(root_callback_connector, &services));
+        Self::new_with_callout_senders(
+            plugins,
+            services,
+            CalloutSenders {
+                for_requests: request_sender,
+                root_callback: root_callback_sender,
+            },
+        )
     }
 
     #[cfg(test)]
@@ -115,8 +123,8 @@ impl WasmRuntime {
         sender: Arc<dyn CalloutSender>,
     ) -> Result<Self> {
         let senders = CalloutSenders {
-            request: sender.clone(),
-            root: sender,
+            for_requests: sender.clone(),
+            root_callback: sender,
         };
         Self::new_with_callout_senders(plugins, services, senders)
     }
@@ -131,29 +139,29 @@ impl WasmRuntime {
             services.metric_sink.clone(),
             services.max_callouts_in_flight,
         )?;
-        let names = plugin_names(&plugins)?;
+        let names = checked_plugin_indexes(&plugins)?;
         let engine = EngineConfig::new()
             .with_external_ticks(true)
             .build()
             .or_err(ErrorType::InternalError, "failed to build the wasm engine")?;
         let host =
             Host::new(&engine).or_err(ErrorType::InternalError, "failed to link the host")?;
-        let root_callbacks = RootCallbackThread::new();
-        let shared = new_shared_store(&root_callbacks, services.metric_sink.clone());
+        let root_callback_thread = RootCallbackThread::new();
+        let shared_store = new_shared_store(&root_callback_thread, services.metric_sink.clone());
         let fixed_properties = Arc::new(services.fixed_properties);
         let inputs = PoolInputs {
             engine: &engine,
             host: &host,
             log_sink: services.log_sink,
-            shared,
+            shared_store,
             upstreams: services.callout_upstreams,
             fixed_properties: fixed_properties.clone(),
-            root_callbacks: &root_callbacks,
+            root_callback_thread: &root_callback_thread,
         };
         let pools = with_ticker(&engine, || {
-            let pools = plugins.iter().enumerate();
-            pools
-                .map(|(index, plugin)| build_pool(index, plugin, &inputs))
+            let indexed_plugins = plugins.iter().enumerate();
+            indexed_plugins
+                .map(|(pool_index, plugin)| build_pool(pool_index, plugin, &inputs))
                 .collect::<Result<Vec<_>>>()
         })?;
         Ok(WasmRuntime {
@@ -163,7 +171,7 @@ impl WasmRuntime {
                 threads_started: OnceCell::new(),
                 pools,
                 callout_launcher,
-                root_callbacks,
+                root_callback_thread,
                 fixed_properties,
                 names,
             }),
@@ -244,7 +252,7 @@ impl RuntimeInner {
     /// thread cannot start, this returns an error and the next call tries again.
     pub(crate) fn start_threads(self: &Arc<Self>) -> Result<()> {
         self.threads_started.get_or_try_init(|| {
-            self.root_callbacks.start(Arc::downgrade(self))?;
+            self.root_callback_thread.start(Arc::downgrade(self))?;
             self.ticker.start(self)
         })?;
         Ok(())

@@ -34,9 +34,9 @@ impl WasmCtx {
         let runtime = self.chain.runtime.clone();
         self.callouts.clear();
         let mut response = session.response_written().cloned();
-        let facts = &mut self.stream().facts;
+        let facts = &mut self.stream().request_facts;
         facts.request_body_bytes = session.body_bytes_read();
-        let start = facts.start.map(|start| start.monotonic);
+        let start = facts.start.map(|start| start.monotonic_time);
         facts.logging = Some(LoggingFacts {
             duration: start.map(|at| at.elapsed()),
             response_body_bytes: session.body_bytes_sent(),
@@ -71,7 +71,7 @@ impl WasmCtx {
                 self.response_out(header);
             }
             self.request_out(session.req_header_mut());
-            self.after_finish(position, locked, record.context, result, true);
+            self.end_or_hold_context(position, locked, record.context, result, true);
         }
     }
 
@@ -79,14 +79,14 @@ impl WasmCtx {
     /// the plugin sent while it ended.
     ///
     /// A context that the guest holds gets the results of its callouts on the root callback
-    /// thread, and it still owes `proxy_on_log` when `log_owed` is `true`.
-    pub(super) fn after_finish(
+    /// thread, and it still owes `proxy_on_log` when `needs_on_log` is `true`.
+    pub(super) fn end_or_hold_context(
         &mut self,
         position: usize,
         mut locked: LockedSlot<'_>,
         context: ContextId,
         result: Result<bool, GuestError>,
-        log_owed: bool,
+        needs_on_log: bool,
     ) {
         match result {
             Ok(true) => {
@@ -100,7 +100,7 @@ impl WasmCtx {
                 );
                 locked.pool.deleted(locked.slot);
                 if let Ok(loaded) = locked.loaded() {
-                    loaded.hold_context(context, log_owed, self.callouts.take_accepted());
+                    loaded.hold_context(context, needs_on_log, self.callouts.take_accepted());
                 }
             }
             Err(e) => error!("{}", locked.guest_failure("failed to end a context", e)),

@@ -15,7 +15,7 @@
 //! What a guest tells the root callback thread, and where the guest is.
 
 use crate::callout::AcceptedCallout;
-use crate::stream::RootCallbackPlugin;
+use crate::stream::RootCallbackPluginState;
 use proxy_wasm_host::abi::v0_2_1::{CalloutId, Changes, ContextId, GuestId, QueueId};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
@@ -23,8 +23,8 @@ use tokio::sync::mpsc::UnboundedSender;
 /// One slot of one pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SlotIndex {
-    pub(crate) pool: usize,
-    pub(crate) slot: usize,
+    pub(crate) pool_index: usize,
+    pub(crate) slot_index: usize,
 }
 
 /// One guest, in the slot where it runs.
@@ -37,7 +37,7 @@ pub(crate) struct GuestAddress {
 /// An event that tells the root callback thread about a guest call on another thread.
 pub(crate) enum RootCallbackEvent {
     /// A guest call changed the tick period or registered a queue.
-    GuestChanged {
+    TicksOrQueuesChanged {
         address: GuestAddress,
         root: ContextId,
         changes: Changes,
@@ -46,7 +46,7 @@ pub(crate) enum RootCallbackEvent {
     QueueItem(QueueId),
     /// Callouts whose results go to `context` with no request. These are the callouts of a root,
     /// and the callouts of a context that the guest held after its request.
-    CalloutsWithNoRequest {
+    CalloutsToStart {
         address: GuestAddress,
         context: ContextId,
         callouts: Vec<AcceptedCallout>,
@@ -62,26 +62,26 @@ pub(crate) enum RootCallbackEvent {
     HeldContextDone {
         address: GuestAddress,
         context: ContextId,
-        log_owed: bool,
+        needs_on_log: bool,
     },
 }
 
 pub(crate) type RootCallbackSender = UnboundedSender<RootCallbackEvent>;
 
 /// The address and plugin of a guest, and the sender to the root callback thread.
-pub(crate) struct RootThreadLink {
+pub(crate) struct RootCallbackLink {
     pub(crate) address: GuestAddress,
-    pub(crate) plugin: Arc<RootCallbackPlugin>,
+    pub(crate) plugin: Arc<RootCallbackPluginState>,
     sender: RootCallbackSender,
 }
 
-impl RootThreadLink {
+impl RootCallbackLink {
     pub(crate) fn new(
         address: GuestAddress,
-        plugin: Arc<RootCallbackPlugin>,
+        plugin: Arc<RootCallbackPluginState>,
         sender: RootCallbackSender,
     ) -> Self {
-        RootThreadLink {
+        RootCallbackLink {
             address,
             plugin,
             sender,

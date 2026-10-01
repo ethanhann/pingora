@@ -29,7 +29,7 @@ use pingora_wasm::{
 };
 use std::sync::Arc;
 
-const PLUGIN: &str = concat!(
+const PLUGIN_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/plugin-services.wasm"
 );
@@ -146,17 +146,17 @@ fn main() {
         .fixed_properties
         .insert(&["node", "name"], "example-node");
     // One slot gives one tick each second. With a slot for each thread, each slot ticks
-    let plugin = WasmPluginConf::new("plugin-services", PLUGIN);
+    let plugin = WasmPluginConf::new("plugin-services", PLUGIN_PATH);
     let runtime = WasmRuntime::new_with_services(vec![plugin], services).unwrap();
     let chain = runtime.chain(&["plugin-services"]).unwrap();
 
     let mut my_proxy =
         pingora_proxy::http_proxy_service(&my_server.configuration, PluginProxy { chain });
     my_proxy.add_tcp("127.0.0.1:6190");
-    let mut metrics = pingora_prometheus::prometheus_http_service();
-    metrics.add_tcp("127.0.0.1:6192");
+    let mut metrics_service = pingora_prometheus::prometheus_http_service();
+    metrics_service.add_tcp("127.0.0.1:6192");
 
     my_server.add_service(my_proxy);
-    my_server.add_service(metrics);
+    my_server.add_service(metrics_service);
     my_server.run_forever();
 }

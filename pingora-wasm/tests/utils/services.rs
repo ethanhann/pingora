@@ -51,24 +51,24 @@ static CALLOUT_ORIGINS: Lazy<Arc<CalloutOriginPerPlugin>> = Lazy::new(|| {
 });
 
 /// The registry of the services that publish metrics, with the one sink that all of them use.
-static METRICS: Lazy<(Registry, Arc<PrometheusMetricSink>)> = Lazy::new(|| {
+static METRIC_REGISTRY_AND_SINK: Lazy<(Registry, Arc<PrometheusMetricSink>)> = Lazy::new(|| {
     let registry = Registry::new();
     let sink = Arc::new(PrometheusMetricSink::new(registry.clone()).unwrap());
     (registry, sink)
 });
 
 /// Return the text that a Prometheus scrape of the test metrics returns.
-pub fn metrics_output() -> String {
+pub fn metrics_text() -> String {
     let mut buffer = Vec::new();
     TextEncoder::new()
-        .encode(&METRICS.0.gather(), &mut buffer)
+        .encode(&METRIC_REGISTRY_AND_SINK.0.gather(), &mut buffer)
         .unwrap();
     String::from_utf8(buffer).unwrap()
 }
 
 /// Publish the metrics of a runtime, and give it the fixed property `node.name`.
-fn with_metrics_and_node_name(services: &mut WasmServices) {
-    services.metric_sink = METRICS.1.clone();
+fn add_metric_sink_and_node_name(services: &mut WasmServices) {
+    services.metric_sink = METRIC_REGISTRY_AND_SINK.1.clone();
     let mut fixed = WasmProperties::new();
     fixed.insert(&["node", "name"], "test-node");
     services.fixed_properties = fixed;
@@ -92,8 +92,8 @@ impl RuntimePlan {
         if self.has_callout_origins {
             services.callout_upstreams = CALLOUT_ORIGINS.clone();
         }
-        with_metrics_and_node_name(&mut services);
-        services.log_sink = Arc::new(super::RecordedGuestMessages);
+        add_metric_sink_and_node_name(&mut services);
+        services.log_sink = Arc::new(super::GuestMessageSink);
         WasmRuntime::new_with_services(self.plugins, services).unwrap()
     }
 }
@@ -197,7 +197,7 @@ pub fn services() -> Vec<(u16, WasmRuntime, Vec<&'static str>, Option<usize>)> {
     let request_properties = guests::property_reader(
         "request-properties",
         guests::PropertyReads {
-            request_headers: &[
+            to_request_headers: &[
                 ("request/path", "x-path"),
                 ("request/url_path", "x-url-path"),
                 ("request/method", "x-method"),
@@ -209,7 +209,7 @@ pub fn services() -> Vec<(u16, WasmRuntime, Vec<&'static str>, Option<usize>)> {
                 ("xds/route_name", "x-route"),
                 ("node/name", "x-node"),
             ],
-            logged_at_the_end: &["destination/port", "request/time"],
+            logged_in_on_log: &["destination/port", "request/time"],
             ..guests::PropertyReads::default()
         },
     );
@@ -217,8 +217,8 @@ pub fn services() -> Vec<(u16, WasmRuntime, Vec<&'static str>, Option<usize>)> {
     let response_properties = guests::property_reader(
         "response-properties",
         guests::PropertyReads {
-            response_headers: &[("upstream/address", "x-upstream")],
-            logged_with_the_response: &["response/code", "upstream/port"],
+            to_response_headers: &[("upstream/address", "x-upstream")],
+            logged_in_on_response_headers: &["response/code", "upstream/port"],
             ..guests::PropertyReads::default()
         },
     );
@@ -226,18 +226,21 @@ pub fn services() -> Vec<(u16, WasmRuntime, Vec<&'static str>, Option<usize>)> {
     let logging_properties = guests::property_reader(
         "logging-properties",
         guests::PropertyReads {
-            logged_at_the_end: &["request/size", "response/size", "request/duration"],
+            logged_in_on_log: &["request/size", "response/size", "request/duration"],
             ..guests::PropertyReads::default()
         },
     );
     plans.service(6408, vec![logging_properties], None);
-    let root_callout = guests::root_callout("root-callout", "root callout response of 6409");
-    plans.service_with_callout_origin(6409, root_callout);
-    let held_context = guests::held_context("held-context", "held context of 6410 logged");
-    plans.service_with_callout_origin(6410, held_context);
+    let tick_callout_sender =
+        guests::tick_callout_sender("root-callout", "root callout response of 6409");
+    plans.service_with_callout_origin(6409, tick_callout_sender);
+    let context_holder = guests::context_holder("held-context", "held context of 6410 logged");
+    plans.service_with_callout_origin(6410, context_holder);
     plans.service_with_callout_origin(6411, relay("relay-metric", limit));
-    let held_earlier =
-        guests::held_context_with_an_earlier_callout("held-earlier", "held context of 6412 logged");
+    let held_earlier = guests::context_holder_with_an_earlier_callout(
+        "held-earlier",
+        "held context of 6412 logged",
+    );
     plans.service_with_callout_origin(6412, held_earlier);
 
     let runtimes: Vec<WasmRuntime> = thread::scope(|scope| {

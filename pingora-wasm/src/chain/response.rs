@@ -66,7 +66,7 @@ impl WasmCtx {
         session: &mut Session<DS>,
         resp: &mut ResponseHeader,
     ) -> Result<()> {
-        self.stream().facts.response_code = Some(resp.status.as_u16());
+        self.stream().request_facts.response_code = Some(resp.status.as_u16());
         if session.subrequest_ctx.is_some()
             || skips_response(resp.status)
             || self.response_progress == ResponseProgress::FromPlugin

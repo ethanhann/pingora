@@ -30,15 +30,15 @@ use std::sync::Arc;
 /// `proxy_record_metric` adds to a counter, as in Envoy, where [InMemoryStore] would replace
 /// the value. Each change is also sent to the metric sink.
 pub(crate) struct SharedStore {
-    store: InMemoryStore,
+    data_and_queues: InMemoryStore,
     metrics: Mutex<Metrics>,
     metric_limit: usize,
-    sink: Arc<dyn WasmMetricSink>,
+    metric_sink: Arc<dyn WasmMetricSink>,
 }
 
 #[derive(Default)]
 struct Metrics {
-    ids: HashMap<(Vec<u8>, Vec<u8>), MetricId>,
+    ids_by_vm_id_and_name: HashMap<(Vec<u8>, Vec<u8>), MetricId>,
     entries: HashMap<MetricId, MetricEntry>,
     last_id: u32,
 }
@@ -53,19 +53,19 @@ impl SharedStore {
     /// Create a store with `limits`.
     ///
     /// The store calls `enqueue_observer` for each queue item and sends each metric change to
-    /// `sink`.
+    /// `metric_sink`.
     pub(crate) fn new(
         limits: InMemoryStoreLimits,
         enqueue_observer: Arc<dyn Fn(QueueEnqueued<'_>) + Send + Sync>,
-        sink: Arc<dyn WasmMetricSink>,
+        metric_sink: Arc<dyn WasmMetricSink>,
     ) -> Self {
         SharedStore {
             metric_limit: limits.metrics(),
-            store: InMemoryStore::new()
+            data_and_queues: InMemoryStore::new()
                 .with_limits(limits)
                 .with_enqueue_observer(enqueue_observer),
             metrics: Mutex::new(Metrics::default()),
-            sink,
+            metric_sink,
         }
     }
 
@@ -77,13 +77,13 @@ impl SharedStore {
         metric: MetricId,
         change: impl FnOnce(&mut MetricEntry) -> Result<RecorderCall, Status>,
     ) -> Result<(), Status> {
-        let (call, recorder) = {
+        let (recorder_call, recorder) = {
             let mut metrics = self.metrics.lock();
             let entry = metrics.entries.get_mut(&metric).ok_or(Status::NotFound)?;
             (change(entry)?, entry.recorder.clone())
         };
         if let Some(recorder) = recorder {
-            match call {
+            match recorder_call {
                 RecorderCall::Add(0) => {}
                 RecorderCall::Add(delta) => recorder.add(delta),
                 RecorderCall::Record(value) => recorder.record(value),
@@ -139,7 +139,7 @@ impl SharedServices for SharedStore {
         vm_id: &[u8],
         key: &[u8],
     ) -> Result<SharedValue, Status> {
-        self.store.get_shared_data(call, vm_id, key)
+        self.data_and_queues.get_shared_data(call, vm_id, key)
     }
 
     fn set_shared_data(
@@ -150,7 +150,8 @@ impl SharedServices for SharedStore {
         value: &[u8],
         cas: Option<u32>,
     ) -> Result<(), Status> {
-        self.store.set_shared_data(call, vm_id, key, value, cas)
+        self.data_and_queues
+            .set_shared_data(call, vm_id, key, value, cas)
     }
 
     fn register_shared_queue(
@@ -159,7 +160,8 @@ impl SharedServices for SharedStore {
         vm_id: &[u8],
         name: &[u8],
     ) -> Result<QueueId, Status> {
-        self.store.register_shared_queue(call, vm_id, name)
+        self.data_and_queues
+            .register_shared_queue(call, vm_id, name)
     }
 
     fn resolve_shared_queue(
@@ -168,7 +170,7 @@ impl SharedServices for SharedStore {
         vm_id: &[u8],
         name: &[u8],
     ) -> Result<QueueId, Status> {
-        self.store.resolve_shared_queue(call, vm_id, name)
+        self.data_and_queues.resolve_shared_queue(call, vm_id, name)
     }
 
     fn enqueue_shared_queue(
@@ -177,11 +179,12 @@ impl SharedServices for SharedStore {
         queue: QueueId,
         value: &[u8],
     ) -> Result<(), Status> {
-        self.store.enqueue_shared_queue(call, queue, value)
+        self.data_and_queues
+            .enqueue_shared_queue(call, queue, value)
     }
 
     fn dequeue_shared_queue(&self, call: Invocation, queue: QueueId) -> Result<Vec<u8>, Status> {
-        self.store.dequeue_shared_queue(call, queue)
+        self.data_and_queues.dequeue_shared_queue(call, queue)
     }
 
     fn define_metric(
@@ -193,7 +196,7 @@ impl SharedServices for SharedStore {
     ) -> Result<MetricId, Status> {
         let mut metrics = self.metrics.lock();
         let key = (vm_id.to_vec(), name.to_vec());
-        if let Some(id) = metrics.ids.get(&key).copied() {
+        if let Some(id) = metrics.ids_by_vm_id_and_name.get(&key).copied() {
             let entry = metrics.entries.get(&id).ok_or(Status::InternalFailure)?;
             return if entry.kind == kind {
                 Ok(id)
@@ -201,7 +204,7 @@ impl SharedServices for SharedStore {
                 Err(Status::BadArgument)
             };
         }
-        if metrics.ids.len() >= self.metric_limit {
+        if metrics.ids_by_vm_id_and_name.len() >= self.metric_limit {
             return Err(Status::InternalFailure);
         }
         let next = metrics
@@ -215,8 +218,8 @@ impl SharedServices for SharedStore {
             name: String::from_utf8_lossy(name).into_owned(),
             kind: metric_kind(kind),
         };
-        let recorder = self.sink.metric_defined(&metric).map(Arc::from);
-        metrics.ids.insert(key, id);
+        let recorder = self.metric_sink.register_metric(&metric).map(Arc::from);
+        metrics.ids_by_vm_id_and_name.insert(key, id);
         metrics.entries.insert(
             id,
             MetricEntry {
@@ -296,7 +299,7 @@ mod tests {
     }
 
     impl WasmMetricSink for RecordingSink {
-        fn metric_defined(&self, metric: &WasmMetric) -> Option<Box<dyn WasmMetricRecorder>> {
+        fn register_metric(&self, metric: &WasmMetric) -> Option<Box<dyn WasmMetricRecorder>> {
             let name = format!("{}/{}", metric.vm_id, metric.name);
             self.events.lock().push(format!("define {name}"));
             Some(Box::new(RecordingRecorder {
@@ -320,11 +323,11 @@ mod tests {
         }
     }
 
-    fn call() -> Invocation {
+    fn invocation() -> Invocation {
         Invocation::new(GuestId::next(), ContextId::try_from(1).unwrap())
     }
 
-    fn store() -> (SharedStore, Arc<Mutex<Vec<String>>>) {
+    fn store_with_recorded_events() -> (SharedStore, Arc<Mutex<Vec<String>>>) {
         let sink = RecordingSink::default();
         let events = sink.events.clone();
         (
@@ -345,31 +348,37 @@ mod tests {
         ];
 
         for (kind, expected, sent) in cases {
-            let (store, events) = store();
-            let metric = store.define_metric(call(), b"vm", kind, b"m").unwrap();
-            store.record_metric(call(), metric, 2).unwrap();
+            let (store, events) = store_with_recorded_events();
+            let metric = store
+                .define_metric(invocation(), b"vm", kind, b"m")
+                .unwrap();
+            store.record_metric(invocation(), metric, 2).unwrap();
 
-            store.record_metric(call(), metric, 5).unwrap();
+            store.record_metric(invocation(), metric, 5).unwrap();
 
-            assert_eq!(store.get_metric(call(), metric), Ok(expected), "{kind:?}");
+            assert_eq!(
+                store.get_metric(invocation(), metric),
+                Ok(expected),
+                "{kind:?}"
+            );
             assert_eq!(events.lock()[1..], sent, "{kind:?}");
         }
     }
 
     #[test]
     fn a_histogram_records_values_and_has_no_value_to_read() {
-        let (store, events) = store();
+        let (store, events) = store_with_recorded_events();
         let histogram = store
-            .define_metric(call(), b"vm", MetricType::Histogram, b"latency")
+            .define_metric(invocation(), b"vm", MetricType::Histogram, b"latency")
             .unwrap();
 
-        let recorded = store.record_metric(call(), histogram, 12);
-        let incremented = store.increment_metric(call(), histogram, 1);
+        let recorded = store.record_metric(invocation(), histogram, 12);
+        let incremented = store.increment_metric(invocation(), histogram, 1);
 
         assert_eq!(recorded, Ok(()));
         assert_eq!(incremented, Err(Status::BadArgument));
         assert_eq!(
-            store.get_metric(call(), histogram),
+            store.get_metric(invocation(), histogram),
             Err(Status::BadArgument)
         );
         assert_eq!(events.lock().last().unwrap(), "record vm/latency 12");
@@ -377,11 +386,12 @@ mod tests {
 
     #[test]
     fn plugins_with_one_vm_id_share_a_metric_that_is_defined_once() {
-        let (store, events) = store();
-        let first = store.define_metric(call(), b"vm", MetricType::Counter, b"requests");
-        let second = store.define_metric(call(), b"vm", MetricType::Counter, b"requests");
-        let other_vm = store.define_metric(call(), b"other", MetricType::Counter, b"requests");
-        let other_kind = store.define_metric(call(), b"vm", MetricType::Gauge, b"requests");
+        let (store, events) = store_with_recorded_events();
+        let first = store.define_metric(invocation(), b"vm", MetricType::Counter, b"requests");
+        let second = store.define_metric(invocation(), b"vm", MetricType::Counter, b"requests");
+        let other_vm =
+            store.define_metric(invocation(), b"other", MetricType::Counter, b"requests");
+        let other_kind = store.define_metric(invocation(), b"vm", MetricType::Gauge, b"requests");
 
         assert_eq!(first, second);
         assert_ne!(first, other_vm);
@@ -391,12 +401,12 @@ mod tests {
 
     #[test]
     fn a_counter_refuses_an_increment_that_is_not_positive() {
-        let (store, _events) = store();
+        let (store, _events) = store_with_recorded_events();
         let counter = store
-            .define_metric(call(), b"vm", MetricType::Counter, b"c")
+            .define_metric(invocation(), b"vm", MetricType::Counter, b"c")
             .unwrap();
 
-        let refused = [-1, 0].map(|delta| store.increment_metric(call(), counter, delta));
+        let refused = [-1, 0].map(|delta| store.increment_metric(invocation(), counter, delta));
 
         assert_eq!(
             refused,
@@ -406,12 +416,12 @@ mod tests {
 
     #[test]
     fn a_gauge_delta_over_the_range_of_i64_saturates() {
-        let (store, events) = store();
+        let (store, events) = store_with_recorded_events();
         let gauge = store
-            .define_metric(call(), b"vm", MetricType::Gauge, b"g")
+            .define_metric(invocation(), b"vm", MetricType::Gauge, b"g")
             .unwrap();
 
-        store.record_metric(call(), gauge, u64::MAX).unwrap();
+        store.record_metric(invocation(), gauge, u64::MAX).unwrap();
 
         assert_eq!(
             *events.lock().last().unwrap(),
@@ -421,30 +431,22 @@ mod tests {
 
     #[test]
     fn a_dropped_store_takes_back_the_value_of_each_gauge() {
-        let (store, events) = store();
-        let gauge = store
-            .define_metric(call(), b"vm", MetricType::Gauge, b"open")
-            .unwrap();
-        store.record_metric(call(), gauge, 5).unwrap();
+        let cases = [(5, -5), (u64::MAX, -i64::MAX)];
 
-        drop(store);
+        for (recorded, taken_back) in cases {
+            let (store, events) = store_with_recorded_events();
+            let gauge = store
+                .define_metric(invocation(), b"vm", MetricType::Gauge, b"open")
+                .unwrap();
+            store.record_metric(invocation(), gauge, recorded).unwrap();
 
-        assert_eq!(events.lock().last().unwrap(), "add vm/open -5");
-    }
+            drop(store);
 
-    #[test]
-    fn a_dropped_store_takes_back_the_saturated_value_of_a_gauge() {
-        let (store, events) = store();
-        let gauge = store
-            .define_metric(call(), b"vm", MetricType::Gauge, b"g")
-            .unwrap();
-        store.record_metric(call(), gauge, u64::MAX).unwrap();
-
-        drop(store);
-
-        assert_eq!(
-            *events.lock().last().unwrap(),
-            format!("add vm/g {}", -i64::MAX)
-        );
+            assert_eq!(
+                *events.lock().last().unwrap(),
+                format!("add vm/open {taken_back}"),
+                "{recorded}"
+            );
+        }
     }
 }

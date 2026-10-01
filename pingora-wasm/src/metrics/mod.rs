@@ -28,13 +28,13 @@ pub trait WasmMetricSink: Send + Sync {
     ///
     /// The runtime calls this once for each VM id and name, and sends each later change of the
     /// metric to the recorder. By default it returns `None`, and the metric is not published.
-    fn metric_defined(&self, _metric: &WasmMetric) -> Option<Box<dyn WasmMetricRecorder>> {
+    fn register_metric(&self, _metric: &WasmMetric) -> Option<Box<dyn WasmMetricRecorder>> {
         None
     }
 
-    /// Receive a callout of `plugin` that failed, with the reason in `failure`. By default it
+    /// Receive a callout of the plugin `plugin_name` that failed, with the reason in `failure`. By default it
     /// does nothing.
-    fn callout_failed(&self, _plugin: &str, _failure: CalloutFailure) {}
+    fn callout_failed(&self, _plugin_name: &str, _failure: CalloutFailure) {}
 }
 
 /// The receiver of the changes that plugins make to one metric.

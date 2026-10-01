@@ -126,7 +126,7 @@ impl WasmCtx {
         let guest_call = || self.run(&mut loaded.guest, body);
         let (result, accepted) = service.record_callouts(context, guest_call);
         self.callouts.set_accepted(accepted);
-        loaded.report_to_root_thread();
+        loaded.report_to_root_callbacks();
         result
     }
 
@@ -150,7 +150,7 @@ impl WasmCtx {
     /// Call it from `connected_to_upstream`. It runs no plugin, and a later call, for example
     /// after a retry, replaces the recorded peer.
     pub fn upstream_connected(&mut self, peer: &HttpPeer) {
-        self.stream.facts.upstream_address = peer.address().as_inet().copied();
+        self.stream.request_facts.upstream_address = peer.address().as_inet().copied();
     }
 
     /// Return the pool of the plugin at `position` of the chain.
@@ -229,7 +229,7 @@ impl Drop for WasmCtx {
             let result = self.run_for_context(loaded, record.context, |scope| {
                 finish(scope, record.context, false)
             });
-            self.after_finish(position, locked, record.context, result, false);
+            self.end_or_hold_context(position, locked, record.context, result, false);
         }
     }
 }

@@ -95,7 +95,7 @@ impl WasmCtx {
         }
         self.request_body.progress = RequestBodyProgress::Streaming;
         self.chain.runtime.start_threads()?;
-        self.stream().facts.request_body_bytes = session.body_bytes_read();
+        self.stream().request_facts.request_body_bytes = session.body_bytes_read();
         let chunk = body.take().unwrap_or_default();
         let outcome = self
             .run_body_callbacks(session, BodyDirection::Request, chunk, end_of_stream)

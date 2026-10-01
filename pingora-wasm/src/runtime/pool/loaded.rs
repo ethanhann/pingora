@@ -15,7 +15,7 @@
 //! A started guest in its slot, and what it reports to the root callback thread after each
 //! call.
 
-use super::events::{RootCallbackEvent, RootThreadLink};
+use super::events::{RootCallbackEvent, RootCallbackLink};
 use crate::callout::{AcceptedCallout, GuestCalloutService};
 use crate::stream::RootStream;
 use proxy_wasm_host::abi::v0_2_1::{CallScope, ContextId, ContextState, Guest};
@@ -27,7 +27,7 @@ use std::sync::Arc;
 struct HeldContext {
     context: ContextId,
     /// Whether the context ended in `logging`, which means that it still owes `proxy_on_log`.
-    log_owed: bool,
+    needs_on_log: bool,
 }
 
 /// A started guest, the root context of its plugin, and its callout service.
@@ -35,11 +35,11 @@ pub(crate) struct Loaded {
     pub(crate) guest: Guest,
     pub(crate) root: ContextId,
     pub(crate) callout_service: Arc<GuestCalloutService>,
-    link: RootThreadLink,
+    root_callback_link: RootCallbackLink,
     held_contexts: Vec<HeldContext>,
     /// The number of held contexts of the slot, which `held_contexts` of the runtime reads
     /// with no lock.
-    held: Arc<AtomicUsize>,
+    held_context_count: Arc<AtomicUsize>,
 }
 
 impl Loaded {
@@ -47,16 +47,16 @@ impl Loaded {
         guest: Guest,
         root: ContextId,
         callout_service: Arc<GuestCalloutService>,
-        link: RootThreadLink,
-        held: Arc<AtomicUsize>,
+        root_callback_link: RootCallbackLink,
+        held_context_count: Arc<AtomicUsize>,
     ) -> Self {
         Loaded {
             guest,
             root,
             callout_service,
-            link,
+            root_callback_link,
             held_contexts: Vec::new(),
-            held,
+            held_context_count,
         }
     }
 
@@ -64,14 +64,15 @@ impl Loaded {
     ///
     /// The report has the tick period and the queues of the root, and each held context that the
     /// guest finished with `proxy_done`.
-    pub(crate) fn report_to_root_thread(&mut self) {
+    pub(crate) fn report_to_root_callbacks(&mut self) {
         let changes = self.guest.take_changes();
         if !changes.is_empty() {
-            self.link.send(RootCallbackEvent::GuestChanged {
-                address: self.link.address,
-                root: self.root,
-                changes,
-            });
+            self.root_callback_link
+                .send(RootCallbackEvent::TicksOrQueuesChanged {
+                    address: self.root_callback_link.address,
+                    root: self.root,
+                    changes,
+                });
         }
         let mut index = 0;
         while index < self.held_contexts.len() {
@@ -80,13 +81,14 @@ impl Loaded {
                 index += 1;
                 continue;
             }
-            let held = self.held_contexts.swap_remove(index);
-            self.held.fetch_sub(1, Ordering::Relaxed);
-            self.link.send(RootCallbackEvent::HeldContextDone {
-                address: self.link.address,
-                context: held.context,
-                log_owed: held.log_owed,
-            });
+            let done_context = self.held_contexts.swap_remove(index);
+            self.held_context_count.fetch_sub(1, Ordering::Relaxed);
+            self.root_callback_link
+                .send(RootCallbackEvent::HeldContextDone {
+                    address: self.root_callback_link.address,
+                    context: done_context.context,
+                    needs_on_log: done_context.needs_on_log,
+                });
         }
     }
 
@@ -98,10 +100,10 @@ impl Loaded {
     pub(crate) fn hold_context(
         &mut self,
         context: ContextId,
-        log_owed: bool,
+        needs_on_log: bool,
         callouts: Vec<AcceptedCallout>,
     ) {
-        let open_with_no_result = self
+        let open_callouts_to_fail = self
             .guest
             .open_callouts()
             .into_iter()
@@ -109,32 +111,37 @@ impl Loaded {
             .map(|open| open.callout)
             .filter(|id| callouts.iter().all(|callout| callout.id != *id))
             .collect::<Vec<_>>();
-        self.held_contexts.push(HeldContext { context, log_owed });
-        self.held.fetch_add(1, Ordering::Relaxed);
-        self.send_callouts_to_root_thread(context, callouts);
-        if !open_with_no_result.is_empty() {
-            self.link.send(RootCallbackEvent::OpenCalloutsToFail {
-                address: self.link.address,
-                context,
-                callouts: open_with_no_result,
-            });
+        self.held_contexts.push(HeldContext {
+            context,
+            needs_on_log,
+        });
+        self.held_context_count.fetch_add(1, Ordering::Relaxed);
+        self.send_callouts_to_root_callbacks(context, callouts);
+        if !open_callouts_to_fail.is_empty() {
+            self.root_callback_link
+                .send(RootCallbackEvent::OpenCalloutsToFail {
+                    address: self.root_callback_link.address,
+                    context,
+                    callouts: open_callouts_to_fail,
+                });
         }
     }
 
     /// Send the callouts that no request waits for to the root callback thread.
     ///
     /// The thread delivers their results to `context`.
-    pub(crate) fn send_callouts_to_root_thread(
+    pub(crate) fn send_callouts_to_root_callbacks(
         &self,
         context: ContextId,
         callouts: Vec<AcceptedCallout>,
     ) {
         if !callouts.is_empty() {
-            self.link.send(RootCallbackEvent::CalloutsWithNoRequest {
-                address: self.link.address,
-                context,
-                callouts,
-            });
+            self.root_callback_link
+                .send(RootCallbackEvent::CalloutsToStart {
+                    address: self.root_callback_link.address,
+                    context,
+                    callouts,
+                });
         }
     }
 
@@ -142,13 +149,13 @@ impl Loaded {
     ///
     /// Return the result with the callouts that the guest sent from `context`, after the changes
     /// of the call are reported to the root callback thread.
-    pub(crate) fn run_with_no_request<R>(
+    pub(crate) fn run_root_callback<R>(
         &mut self,
         context: ContextId,
         body: impl FnOnce(&mut CallScope<'_, RootStream>) -> R,
     ) -> (R, Vec<AcceptedCallout>) {
         let service = self.callout_service.clone();
-        let stream = RootStream::new(self.link.plugin.clone());
+        let stream = RootStream::new(self.root_callback_link.plugin.clone());
         let guest = &mut self.guest;
         let result_and_callouts = service.record_callouts(context, || {
             let mut scope = guest.enter(stream);
@@ -156,7 +163,7 @@ impl Loaded {
             let _root_stream = scope.finish();
             result
         });
-        self.report_to_root_thread();
+        self.report_to_root_callbacks();
         result_and_callouts
     }
 }

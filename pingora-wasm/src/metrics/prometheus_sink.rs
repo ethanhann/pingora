@@ -25,7 +25,7 @@ use prometheus::{
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
-const CALLOUT_FAILURES: &str = "wasm_callout_failures_total";
+const CALLOUT_FAILURES_NAME: &str = "wasm_callout_failures_total";
 const CALLOUT_FAILURES_HELP: &str = "Callouts of wasm plugins that failed";
 const PLUGIN_METRIC_HELP: &str = "A metric of a wasm plugin";
 const VM_ID_LABEL: &str = "vm_id";
@@ -143,7 +143,7 @@ impl PrometheusMetricSink {
     /// second sink on the same registry.
     pub fn new(registry: Registry) -> prometheus::Result<Self> {
         let callout_failures = IntCounterVec::new(
-            Opts::new(CALLOUT_FAILURES, CALLOUT_FAILURES_HELP),
+            Opts::new(CALLOUT_FAILURES_NAME, CALLOUT_FAILURES_HELP),
             &[PLUGIN_LABEL, FAILURE_LABEL],
         )?;
         registry.register(Box::new(callout_failures.clone()))?;
@@ -165,12 +165,12 @@ impl PrometheusMetricSink {
 }
 
 impl WasmMetricSink for PrometheusMetricSink {
-    fn metric_defined(&self, metric: &WasmMetric) -> Option<Box<dyn WasmMetricRecorder>> {
-        let Some(clean_name) = prometheus_name(&metric.name) else {
+    fn register_metric(&self, metric: &WasmMetric) -> Option<Box<dyn WasmMetricRecorder>> {
+        let Some(prometheus_name) = prometheus_name(&metric.name) else {
             return self.skip_metric(&metric.name, "its name is empty");
         };
         let mut families = self.families.lock();
-        let family = match families.entry(clean_name) {
+        let family = match families.entry(prometheus_name) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
                 let vector = match FamilyVector::new(entry.key(), metric.kind) {
@@ -202,9 +202,9 @@ impl WasmMetricSink for PrometheusMetricSink {
         Some(family.vector.recorder(&metric.vm_id))
     }
 
-    fn callout_failed(&self, plugin: &str, failure: CalloutFailure) {
+    fn callout_failed(&self, plugin_name: &str, failure: CalloutFailure) {
         self.callout_failures
-            .with_label_values(&[plugin, failure.as_str()])
+            .with_label_values(&[plugin_name, failure.as_str()])
             .inc();
     }
 }
@@ -217,18 +217,18 @@ fn prometheus_name(name: &str) -> Option<String> {
     if name.is_empty() {
         return None;
     }
-    let mut clean = String::with_capacity(name.len() + 1);
+    let mut prometheus_name = String::with_capacity(name.len() + 1);
     if name.starts_with(|c: char| c.is_ascii_digit()) {
-        clean.push('_');
+        prometheus_name.push('_');
     }
-    clean.extend(name.chars().map(|c| {
+    prometheus_name.extend(name.chars().map(|c| {
         if c.is_ascii_alphanumeric() || c == '_' || c == ':' {
             c
         } else {
             '_'
         }
     }));
-    Some(clean)
+    Some(prometheus_name)
 }
 
 struct CounterRecorder(IntCounter);
@@ -272,7 +272,7 @@ mod tests {
         }
     }
 
-    fn output(registry: &Registry) -> String {
+    fn metrics_text(registry: &Registry) -> String {
         let mut buffer = Vec::new();
         TextEncoder::new()
             .encode(&registry.gather(), &mut buffer)
@@ -301,13 +301,13 @@ mod tests {
     fn two_vm_ids_on_one_sink_share_a_family_with_the_vm_id_as_label() {
         let registry = Registry::new();
         let sink = PrometheusMetricSink::new(registry.clone()).unwrap();
-        let first = sink.metric_defined(&metric("a", "requests", WasmMetricKind::Counter));
-        let second = sink.metric_defined(&metric("b", "requests", WasmMetricKind::Counter));
+        let first = sink.register_metric(&metric("a", "requests", WasmMetricKind::Counter));
+        let second = sink.register_metric(&metric("b", "requests", WasmMetricKind::Counter));
 
         first.unwrap().add(2);
         second.unwrap().add(3);
 
-        let text = output(&registry);
+        let text = metrics_text(&registry);
         assert!(text.contains("requests{vm_id=\"a\"} 2"), "{text}");
         assert!(text.contains("requests{vm_id=\"b\"} 3"), "{text}");
     }
@@ -315,13 +315,14 @@ mod tests {
     #[test]
     fn a_metric_whose_type_or_prometheus_name_conflicts_is_not_published() {
         let sink = PrometheusMetricSink::new(Registry::new()).unwrap();
-        sink.metric_defined(&metric("a", "a.b", WasmMetricKind::Counter));
+        sink.register_metric(&metric("a", "a.b", WasmMetricKind::Counter));
 
-        let other_type = sink.metric_defined(&metric("b", "a.b", WasmMetricKind::Gauge));
-        let same_clean_name = sink.metric_defined(&metric("a", "a_b", WasmMetricKind::Counter));
+        let other_type = sink.register_metric(&metric("b", "a.b", WasmMetricKind::Gauge));
+        let same_prometheus_name =
+            sink.register_metric(&metric("a", "a_b", WasmMetricKind::Counter));
 
         assert!(other_type.is_none());
-        assert!(same_clean_name.is_none());
+        assert!(same_prometheus_name.is_none());
     }
 
     #[test]
@@ -341,7 +342,7 @@ mod tests {
 
         sink.callout_failed("authz", CalloutFailure::ConnectTimeout);
 
-        let text = output(&registry);
+        let text = metrics_text(&registry);
         let line = "wasm_callout_failures_total{failure=\"connect_timeout\",plugin=\"authz\"} 1";
         assert!(text.contains(line), "{text}");
     }

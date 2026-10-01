@@ -23,7 +23,7 @@ use crate::callout::CalloutUpstreams;
 use crate::metrics::WasmMetricSink;
 use crate::properties::WasmProperties;
 use crate::root_callbacks::RootCallbackThread;
-use crate::stream::RootCallbackPlugin;
+use crate::stream::RootCallbackPluginState;
 use pingora_error::{Error, ErrorType, OrErr, Result};
 use proxy_wasm_host::abi::v0_2_1::{
     GuestSpec, Host, InMemoryStoreLimits, LogSink, QueueEnqueued, SharedServices,
@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Check each plugin, and return a map from the name of each plugin to its index.
-pub(super) fn plugin_names(plugins: &[WasmPluginConf]) -> Result<HashMap<String, usize>> {
+pub(super) fn checked_plugin_indexes(plugins: &[WasmPluginConf]) -> Result<HashMap<String, usize>> {
     if plugins.is_empty() {
         return Error::e_explain(ErrorType::InternalError, "no wasm plugin to run");
     }
@@ -54,12 +54,12 @@ pub(super) fn plugin_names(plugins: &[WasmPluginConf]) -> Result<HashMap<String,
 ///
 /// The store sends an event to the root callback thread for each item that a plugin enqueues.
 pub(super) fn new_shared_store(
-    root_callbacks: &RootCallbackThread,
+    root_callback_thread: &RootCallbackThread,
     metric_sink: Arc<dyn WasmMetricSink>,
 ) -> Arc<dyn SharedServices> {
-    let queue_items = root_callbacks.sender();
+    let root_callback_sender = root_callback_thread.sender();
     let enqueue_observer = Arc::new(move |item: QueueEnqueued<'_>| {
-        let _ = queue_items.send(RootCallbackEvent::QueueItem(item.queue));
+        let _ = root_callback_sender.send(RootCallbackEvent::QueueItem(item.queue));
     });
     let limits = InMemoryStoreLimits::default();
     Arc::new(SharedStore::new(limits, enqueue_observer, metric_sink))
@@ -70,15 +70,15 @@ pub(super) struct PoolInputs<'a> {
     pub(super) engine: &'a Engine,
     pub(super) host: &'a Host,
     pub(super) log_sink: Arc<dyn LogSink>,
-    pub(super) shared: Arc<dyn SharedServices>,
+    pub(super) shared_store: Arc<dyn SharedServices>,
     pub(super) upstreams: Arc<dyn CalloutUpstreams>,
     pub(super) fixed_properties: Arc<WasmProperties>,
-    pub(super) root_callbacks: &'a RootCallbackThread,
+    pub(super) root_callback_thread: &'a RootCallbackThread,
 }
 
 /// Compile `plugin` and start the guests of its pool.
 pub(super) fn build_pool(
-    index: usize,
+    pool_index: usize,
     plugin: &WasmPluginConf,
     inputs: &PoolInputs<'_>,
 ) -> Result<GuestPool> {
@@ -93,22 +93,22 @@ pub(super) fn build_pool(
         .or_err_with(ErrorType::InternalError, || {
             format!("wasm plugin {} does not compile", plugin.name)
         })?;
-    let services = plugin.services(inputs.log_sink.clone(), inputs.shared.clone());
+    let services = plugin.services(inputs.log_sink.clone(), inputs.shared_store.clone());
     let spec = GuestSpec::new(inputs.host, &module, services, &plugin.limits)
         .or_err_with(ErrorType::InternalError, || {
             format!("wasm plugin {} is not a supported module", plugin.name)
         })?;
     let root_callback_plugin =
-        RootCallbackPlugin::new(&plugin.name, inputs.fixed_properties.clone());
+        RootCallbackPluginState::new(&plugin.name, inputs.fixed_properties.clone());
     GuestPool::new(GuestPoolConf {
-        pool_index: index,
+        pool_index,
         name: plugin.name.clone(),
         spec,
-        plugin: plugin.plugin_config(),
-        slots: plugin.slots,
+        plugin_config: plugin.plugin_config(),
+        slot_count: plugin.slots,
         phases: plugin.phase_conf(),
         callout_conf: plugin.callout_conf(inputs.upstreams.clone()),
         root_callback_plugin: Arc::new(root_callback_plugin),
-        root_callback_sender: inputs.root_callbacks.sender(),
+        root_callback_sender: inputs.root_callback_thread.sender(),
     })
 }

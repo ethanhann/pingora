@@ -18,7 +18,7 @@ mod proxy;
 pub mod raw;
 mod services;
 
-pub use services::{callout_origin, metrics_output};
+pub use services::{callout_origin, metrics_text};
 
 use bytes::Bytes;
 use http::{Request, Response};
@@ -52,20 +52,20 @@ type GuestMessage = (String, Vec<u8>);
 static GUEST_MESSAGES: Lazy<Mutex<Vec<GuestMessage>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 /// The log sink of every runtime of the test server.
-pub struct RecordedGuestMessages;
+pub struct GuestMessageSink;
 
-impl LogSink for RecordedGuestMessages {
+impl LogSink for GuestMessageSink {
     fn log(&self, context: LogContext<'_>, _level: LogLevel, message: &[u8]) {
-        let plugin = context.plugin_name.as_deref().unwrap_or(&context.vm_id);
-        let plugin = String::from_utf8_lossy(plugin).into_owned();
+        let plugin_name = context.plugin_name.as_deref().unwrap_or(&context.vm_id);
+        let plugin_name = String::from_utf8_lossy(plugin_name).into_owned();
         GUEST_MESSAGES
             .lock()
             .unwrap()
-            .push((plugin, message.to_vec()));
+            .push((plugin_name, message.to_vec()));
     }
 }
 
-/// Return every guest log line so far, as `plugin: message`.
+/// Return every guest log line so far, as `plugin_name: message`.
 pub fn guest_lines() -> Vec<String> {
     let messages = GUEST_MESSAGES.lock().unwrap();
     messages

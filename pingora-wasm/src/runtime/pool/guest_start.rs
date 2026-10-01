@@ -14,7 +14,7 @@
 
 //! The start of a guest: its root context, `proxy_on_vm_start`, and `proxy_on_configure`.
 
-use super::events::{GuestAddress, RootThreadLink, SlotIndex};
+use super::events::{GuestAddress, RootCallbackLink, SlotIndex};
 use super::{GuestPool, Loaded};
 use crate::callout::{AcceptedCallout, GuestCalloutService};
 use crate::stream::RootStream;
@@ -40,7 +40,7 @@ impl GuestPool {
     ///
     /// The start runs with the root stream state, so the plugin reads the fixed properties in
     /// `proxy_on_configure`.
-    pub(super) fn start(&self, slot: usize) -> Result<StartedGuest> {
+    pub(super) fn start_guest(&self, slot: usize) -> Result<StartedGuest> {
         let mut guest = self
             .spec
             .build()
@@ -80,12 +80,12 @@ impl GuestPool {
         }
         let address = GuestAddress {
             slot: SlotIndex {
-                pool: self.pool_index,
-                slot,
+                pool_index: self.pool_index,
+                slot_index: slot,
             },
             guest: guest.id(),
         };
-        let link = RootThreadLink::new(
+        let link = RootCallbackLink::new(
             address,
             self.root_callback_plugin.clone(),
             self.root_callback_sender.clone(),

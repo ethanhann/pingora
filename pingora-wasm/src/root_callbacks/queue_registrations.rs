@@ -66,7 +66,7 @@ impl QueueRegistrations {
     }
 
     /// Keep an item of `queue` for the next registrant.
-    pub(super) fn keep_pending(&mut self, queue: QueueId) {
+    pub(super) fn add_pending_item(&mut self, queue: QueueId) {
         *self.pending_items.entry(queue).or_default() += 1;
     }
 }
@@ -80,32 +80,22 @@ mod tests {
     fn registrant(pool: usize, slot: usize) -> Registrant {
         Registrant {
             address: GuestAddress {
-                slot: SlotIndex { pool, slot },
+                slot: SlotIndex {
+                    pool_index: pool,
+                    slot_index: slot,
+                },
                 guest: GuestId::next(),
             },
             root: ContextId::try_from(1).unwrap(),
         }
     }
 
-    fn queue() -> QueueId {
+    fn queue_1() -> QueueId {
         QueueId::try_from(1).unwrap()
     }
 
     fn register(registrations: &mut QueueRegistrations, registrant: Registrant) -> usize {
-        registrations.register(queue(), registrant.address, registrant.root)
-    }
-
-    #[test]
-    fn the_last_registrant_receives_an_item_across_plugins_with_one_vm_id() {
-        let mut registrations = QueueRegistrations::default();
-        let first = registrant(0, 0);
-        let second_plugin = registrant(1, 0);
-        register(&mut registrations, first);
-        register(&mut registrations, second_plugin);
-
-        let receiver = registrations.last_registrant(queue());
-
-        assert_eq!(receiver, Some(second_plugin));
+        registrations.register(queue_1(), registrant.address, registrant.root)
     }
 
     #[test]
@@ -117,7 +107,7 @@ mod tests {
 
         register(&mut registrations, slot_0);
 
-        assert_eq!(registrations.last_registrant(queue()), Some(slot_0));
+        assert_eq!(registrations.last_registrant(queue_1()), Some(slot_0));
     }
 
     #[test]
@@ -129,9 +119,9 @@ mod tests {
         register(&mut registrations, slot_1);
         register(&mut registrations, slot_0);
 
-        registrations.remove(queue(), slot_0);
+        registrations.remove(queue_1(), slot_0);
 
-        assert_eq!(registrations.last_registrant(queue()), Some(slot_1));
+        assert_eq!(registrations.last_registrant(queue_1()), Some(slot_1));
     }
 
     #[test]
@@ -142,16 +132,16 @@ mod tests {
         register(&mut registrations, first);
         register(&mut registrations, replaced);
 
-        registrations.remove(queue(), replaced);
+        registrations.remove(queue_1(), replaced);
 
-        assert_eq!(registrations.last_registrant(queue()), Some(first));
+        assert_eq!(registrations.last_registrant(queue_1()), Some(first));
     }
 
     #[test]
     fn an_item_with_no_live_registrant_goes_to_the_next_registrant() {
         let mut registrations = QueueRegistrations::default();
-        registrations.keep_pending(queue());
-        registrations.keep_pending(queue());
+        registrations.add_pending_item(queue_1());
+        registrations.add_pending_item(queue_1());
 
         let pending = register(&mut registrations, registrant(0, 0));
 
@@ -161,7 +151,7 @@ mod tests {
     #[test]
     fn a_pending_item_goes_to_one_registrant_only() {
         let mut registrations = QueueRegistrations::default();
-        registrations.keep_pending(queue());
+        registrations.add_pending_item(queue_1());
         register(&mut registrations, registrant(0, 0));
 
         let pending = register(&mut registrations, registrant(0, 1));

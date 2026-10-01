@@ -41,9 +41,9 @@ pub(crate) struct RequestFacts {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RequestStart {
     /// The wall time, for `request.time`.
-    pub(crate) wall: SystemTime,
+    pub(crate) wall_time: SystemTime,
     /// The monotonic time, for `request.duration`.
-    pub(crate) monotonic: Instant,
+    pub(crate) monotonic_time: Instant,
 }
 
 #[derive(Debug)]
@@ -69,22 +69,22 @@ pub(crate) struct LoggingFacts {
 }
 
 /// The headers that a plugin can read in the running callback.
-pub(crate) struct HeadersInStream<'a> {
+pub(crate) struct ReadableHeaders<'a> {
     pub(crate) request: Option<&'a RequestHeaders>,
     pub(crate) response: Option<&'a ResponseHeader>,
 }
 
-/// Write the built-in property whose path segments are joined in `key` to `out`.
+/// Write the built-in property whose path segments are joined in `joined_path` to `out`.
 ///
 /// Return `false` when the property is not a built-in one or has no value yet.
-pub(crate) fn read_built_in(
-    key: &[u8],
+pub(crate) fn write_built_in_property(
+    joined_path: &[u8],
     facts: &RequestFacts,
-    headers: &HeadersInStream<'_>,
+    headers: &ReadableHeaders<'_>,
     out: &mut Vec<u8>,
 ) -> bool {
     let request = headers.request;
-    match key {
+    match joined_path {
         b"source\0address" => write_address(facts.client_address, out),
         b"source\0port" => write_port(facts.client_address, out),
         b"destination\0address" => write_address(facts.server_address, out),
@@ -110,7 +110,7 @@ pub(crate) fn read_built_in(
         b"request\0time" => {
             let since_epoch = facts
                 .start
-                .and_then(|start| start.wall.duration_since(SystemTime::UNIX_EPOCH).ok());
+                .and_then(|start| start.wall_time.duration_since(SystemTime::UNIX_EPOCH).ok());
             write_int(since_epoch.map(duration_nanos), out)
         }
         b"request\0size" => {
@@ -221,13 +221,17 @@ mod tests {
         TlsFacts::new(&digest)
     }
 
-    fn read(key: &[u8], facts: &RequestFacts, request: Option<&RequestHeaders>) -> Option<Vec<u8>> {
-        let headers = HeadersInStream {
+    fn read_property(
+        key: &[u8],
+        facts: &RequestFacts,
+        request: Option<&RequestHeaders>,
+    ) -> Option<Vec<u8>> {
+        let headers = ReadableHeaders {
             request,
             response: None,
         };
         let mut out = Vec::new();
-        read_built_in(key, facts, &headers, &mut out).then_some(out)
+        write_built_in_property(key, facts, &headers, &mut out).then_some(out)
     }
 
     #[test]
@@ -238,8 +242,8 @@ mod tests {
                 ..RequestFacts::default()
             };
 
-            let read_version = read(b"connection\0tls_version", &facts, None);
-            let mtls = read(b"connection\0mtls", &facts, None);
+            let read_version = read_property(b"connection\0tls_version", &facts, None);
+            let mtls = read_property(b"connection\0mtls", &facts, None);
 
             assert_eq!(read_version.as_deref(), Some(&b"TLSv1.3"[..]), "{version}");
             assert_eq!(mtls, Some(vec![0]));
@@ -268,7 +272,7 @@ mod tests {
         ];
 
         for (key, expected) in cases {
-            let value = read(key, &facts, Some(&request));
+            let value = read_property(key, &facts, Some(&request));
             assert_eq!(
                 value.as_deref(),
                 Some(&*expected),
@@ -289,7 +293,7 @@ mod tests {
             b"no\0such",
         ] {
             assert_eq!(
-                read(key, &facts, None),
+                read_property(key, &facts, None),
                 None,
                 "{}",
                 String::from_utf8_lossy(key)
@@ -304,7 +308,7 @@ mod tests {
             ..RequestFacts::default()
         };
 
-        let code = read(b"response\0code", &facts, None);
+        let code = read_property(b"response\0code", &facts, None);
 
         assert_eq!(code, Some(201_i64.to_le_bytes().to_vec()));
     }
@@ -319,7 +323,7 @@ mod tests {
             ..RequestFacts::default()
         };
 
-        let duration = read(b"request\0duration", &facts, None);
+        let duration = read_property(b"request\0duration", &facts, None);
 
         assert_eq!(duration, None);
     }

@@ -63,7 +63,7 @@ pub(crate) struct Wat {
     pub(crate) queue_ready: Option<&'static str>,
     pub(crate) delete: &'static str,
     /// Text for the callbacks, such as `(data (i32.const 700) "text")`.
-    pub(crate) data: &'static str,
+    pub(crate) data_segments: &'static str,
 }
 
 pub(crate) const CONTINUE: &str = "i32.const 0";
@@ -110,7 +110,7 @@ impl Default for Wat {
             tick: None,
             queue_ready: None,
             delete: "",
-            data: "",
+            data_segments: "",
         }
     }
 }
@@ -167,7 +167,7 @@ pub(crate) fn wat_guest(label: &str, guest: Wat) -> PathBuf {
     };
     let callbacks = [
         abi,
-        guest.data.to_string(),
+        guest.data_segments.to_string(),
         export("proxy_on_vm_start", "i32 i32", Some(guest.vm_start)),
         export("proxy_on_configure", "i32 i32", Some(guest.configure)),
         export(

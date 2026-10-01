@@ -92,37 +92,46 @@ impl WasmProperties {
 
     /// Set the value of `path`, replacing any previous value.
     pub fn insert(&mut self, path: &[&str], value: impl Into<WasmPropertyValue>) {
-        let mut key = Vec::new();
-        join_path(path.iter().map(|segment| segment.as_bytes()), &mut key);
-        self.values.insert(key, value.into().0);
+        let mut joined_path = Vec::new();
+        join_path(
+            path.iter().map(|segment| segment.as_bytes()),
+            &mut joined_path,
+        );
+        self.values.insert(joined_path, value.into().0);
     }
 
     /// Return the value of `path`, in the encoding that plugins read.
     pub fn get(&self, path: &[&str]) -> Option<&[u8]> {
-        let mut key = Vec::new();
-        join_path(path.iter().map(|segment| segment.as_bytes()), &mut key);
-        self.values.get(&key).map(Vec::as_slice)
+        let mut joined_path = Vec::new();
+        join_path(
+            path.iter().map(|segment| segment.as_bytes()),
+            &mut joined_path,
+        );
+        self.values.get(&joined_path).map(Vec::as_slice)
     }
 
-    /// Set the value of the path whose segments are joined in `key`.
-    pub(crate) fn insert_joined(&mut self, key: &[u8], value: &[u8]) {
-        self.values.insert(key.to_vec(), value.to_vec());
+    /// Set the value of the path whose segments are joined in `joined_path`.
+    pub(crate) fn insert_joined(&mut self, joined_path: &[u8], value: &[u8]) {
+        self.values.insert(joined_path.to_vec(), value.to_vec());
     }
 
-    /// Return the value of the path whose segments are joined in `key`.
-    pub(crate) fn get_joined(&self, key: &[u8]) -> Option<&[u8]> {
-        self.values.get(key).map(Vec::as_slice)
+    /// Return the value of the path whose segments are joined in `joined_path`.
+    pub(crate) fn get_joined(&self, joined_path: &[u8]) -> Option<&[u8]> {
+        self.values.get(joined_path).map(Vec::as_slice)
     }
 }
 
-/// Join the segments of a path with `\0` into `key`, as the ABI sends a path.
-pub(crate) fn join_path<'a>(segments: impl IntoIterator<Item = &'a [u8]>, key: &mut Vec<u8>) {
-    key.clear();
+/// Join the segments of a path with `\0` into `joined_path`, as the ABI sends a path.
+pub(crate) fn join_path<'a>(
+    segments: impl IntoIterator<Item = &'a [u8]>,
+    joined_path: &mut Vec<u8>,
+) {
+    joined_path.clear();
     for (index, segment) in segments.into_iter().enumerate() {
         if index > 0 {
-            key.push(0);
+            joined_path.push(0);
         }
-        key.extend_from_slice(segment);
+        joined_path.extend_from_slice(segment);
     }
 }
 

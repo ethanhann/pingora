@@ -15,7 +15,7 @@
 //! The state of the root callback thread: what it waits for, and what is due.
 
 use super::queue_registrations::QueueRegistrations;
-use super::root_callouts::{FinishedCallout, RootCallouts};
+use super::root_callouts::{FinishedCallout, RootCallbackCallouts};
 use super::tick_schedule::TickSchedule;
 use super::work::{Work, WorkOutcome};
 use crate::callout::{AcceptedCallout, CalloutResult};
@@ -27,14 +27,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// The wait before the thread retries work whose slot a request holds.
-const BUSY_SLOT_RETRY: Duration = Duration::from_millis(1);
+const BUSY_SLOT_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 /// The state of the loop on the root callback thread.
 #[derive(Default)]
 pub(super) struct RootCallbackLoop {
     pub(super) ticks: TickSchedule,
     pub(super) queues: QueueRegistrations,
-    pub(super) callouts: RootCallouts,
+    pub(super) callouts: RootCallbackCallouts,
     /// Callouts that the next run starts, on the tokio runtime of the thread.
     callouts_to_start: Vec<(GuestAddress, ContextId, AcceptedCallout)>,
     ready_work: VecDeque<Work>,
@@ -52,11 +52,11 @@ impl RootCallbackLoop {
         let due = self.next_due();
         tokio::select! {
             event = events.recv() => match event {
-                Some(event) => self.accept(event),
+                Some(event) => self.accept_event(event),
                 None => return false,
             },
             Some(finished) = self.callouts.next_finished() => {
-                self.ready_work.push_back(Work::Delivery(finished));
+                self.ready_work.push_back(Work::DeliverCalloutResult(finished));
             }
             _ = sleep_until_due(due), if due.is_some() => {}
         }
@@ -64,7 +64,7 @@ impl RootCallbackLoop {
         // the registration, so the thread takes every waiting event before it runs work, and the
         // item finds its registrant
         while let Ok(event) = events.try_recv() {
-            self.accept(event);
+            self.accept_event(event);
         }
         true
     }
@@ -77,9 +77,9 @@ impl RootCallbackLoop {
         }
     }
 
-    fn accept(&mut self, event: RootCallbackEvent) {
+    fn accept_event(&mut self, event: RootCallbackEvent) {
         match event {
-            RootCallbackEvent::GuestChanged {
+            RootCallbackEvent::TicksOrQueuesChanged {
                 address,
                 root,
                 changes,
@@ -87,22 +87,23 @@ impl RootCallbackLoop {
                 if let Some(period) = changes.tick_periods.get(&root) {
                     self.ticks.set_period(address, *period, Instant::now());
                     if period.is_none() {
-                        let waits_for =
+                        let is_tick_of_address =
                             |work: &Work| matches!(work, Work::Tick(a) if *a == address);
-                        self.retries.retain(|(_, work)| !waits_for(work));
+                        self.retries.retain(|(_, work)| !is_tick_of_address(work));
                     }
                 }
                 for registration in changes.queues {
                     let queue = registration.queue;
-                    let pending = self.queues.register(queue, address, registration.root);
-                    let items = (0..pending).map(|_| Work::QueueItem(queue));
+                    let pending_item_count =
+                        self.queues.register(queue, address, registration.root);
+                    let items = (0..pending_item_count).map(|_| Work::QueueItem(queue));
                     self.ready_work.extend(items);
                 }
             }
             RootCallbackEvent::QueueItem(queue) => {
                 self.ready_work.push_back(Work::QueueItem(queue));
             }
-            RootCallbackEvent::CalloutsWithNoRequest {
+            RootCallbackEvent::CalloutsToStart {
                 address,
                 context,
                 callouts,
@@ -116,7 +117,7 @@ impl RootCallbackLoop {
                 callouts,
             } => {
                 let failures = callouts.into_iter().map(|id| {
-                    Work::Delivery(FinishedCallout {
+                    Work::DeliverCalloutResult(FinishedCallout {
                         address,
                         context,
                         id,
@@ -128,18 +129,19 @@ impl RootCallbackLoop {
             RootCallbackEvent::HeldContextDone {
                 address,
                 context,
-                log_owed,
+                needs_on_log,
             } => self.ready_work.push_back(Work::EndHeldContext {
                 address,
                 context,
-                log_owed,
+                needs_on_log,
             }),
         }
     }
 
-    /// Schedule `work` to run again after `BUSY_SLOT_RETRY`.
+    /// Schedule `work` to run again after `BUSY_SLOT_RETRY_DELAY`.
     pub(super) fn retry_later(&mut self, work: Work) {
-        self.retries.push((Instant::now() + BUSY_SLOT_RETRY, work));
+        self.retries
+            .push((Instant::now() + BUSY_SLOT_RETRY_DELAY, work));
     }
 
     /// Start the callouts that arrived, and run each piece of work that is due.
@@ -187,22 +189,27 @@ mod tests {
 
     #[test]
     fn a_period_of_zero_removes_a_tick_that_waits_for_its_slot() {
-        let mut state = RootCallbackLoop::default();
+        let mut callback_loop = RootCallbackLoop::default();
         let address = GuestAddress {
-            slot: SlotIndex { pool: 0, slot: 0 },
+            slot: SlotIndex {
+                pool_index: 0,
+                slot_index: 0,
+            },
             guest: GuestId::next(),
         };
         let root = ContextId::try_from(1).unwrap();
-        state.retries.push((Instant::now(), Work::Tick(address)));
+        callback_loop
+            .retries
+            .push((Instant::now(), Work::Tick(address)));
         let mut changes = Changes::default();
         changes.tick_periods.insert(root, None);
 
-        state.accept(RootCallbackEvent::GuestChanged {
+        callback_loop.accept_event(RootCallbackEvent::TicksOrQueuesChanged {
             address,
             root,
             changes,
         });
 
-        assert!(state.retries.is_empty());
+        assert!(callback_loop.retries.is_empty());
     }
 }

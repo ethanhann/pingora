@@ -136,9 +136,9 @@ impl Default for Exports {
 }
 
 impl Exports {
-    fn into_wat(self, data: &str) -> String {
+    fn into_wat(self, data_segments: &str) -> String {
         format!(
-            r#"{data}
+            r#"{data_segments}
   (func (export "proxy_on_vm_start") (param i32 i32) (result i32) i32.const 1)
   (func (export "proxy_on_configure") (param i32 i32) (result i32) {})
   (func (export "proxy_on_request_headers") (param i32 i32 i32) (result i32) {})
@@ -160,34 +160,34 @@ impl Exports {
 }
 
 /// Text at address 700 and up, with the address and the length of each text.
-struct Texts {
-    data: String,
-    next: usize,
+struct MemoryTexts {
+    data_segments: String,
+    next_address: usize,
 }
 
-impl Texts {
+impl MemoryTexts {
     fn new() -> Self {
-        Texts {
-            data: String::new(),
-            next: 700,
+        MemoryTexts {
+            data_segments: String::new(),
+            next_address: 700,
         }
     }
 
     /// Add `text`, where `/` separates the segments of a property path.
     fn add(&mut self, text: &str) -> (usize, usize) {
-        let at = self.next;
+        let at = self.next_address;
         let escaped = text.replace('/', "\\00");
-        self.data += &format!("(data (i32.const {at}) \"{escaped}\")\n");
-        self.next += text.len() + 1;
+        self.data_segments += &format!("(data (i32.const {at}) \"{escaped}\")\n");
+        self.next_address += text.len() + 1;
         (at, text.len())
     }
 
-    fn log(&mut self, text: &str) -> String {
+    fn log_call(&mut self, text: &str) -> String {
         let (at, len) = self.add(text);
         format!("(drop (call $log (i32.const 2) (i32.const {at}) (i32.const {len})))")
     }
 
-    fn log_properties(&mut self, paths: &[&str]) -> String {
+    fn log_property_calls(&mut self, paths: &[&str]) -> String {
         let calls: Vec<_> = paths
             .iter()
             .map(|path| {
@@ -198,7 +198,7 @@ impl Texts {
         calls.join(" ")
     }
 
-    fn properties_to_headers(&mut self, map: u32, pairs: &[(&str, &str)]) -> String {
+    fn property_to_header_calls(&mut self, map: u32, pairs: &[(&str, &str)]) -> String {
         let calls: Vec<_> = pairs
             .iter()
             .map(|(path, header)| {
@@ -213,7 +213,7 @@ impl Texts {
     }
 }
 
-fn one_slot(name: &str, path: PathBuf) -> WasmPluginConf {
+fn one_slot_plugin(name: &str, path: PathBuf) -> WasmPluginConf {
     let mut conf = WasmPluginConf::new(name, path);
     conf.slots = 1;
     conf
@@ -221,61 +221,70 @@ fn one_slot(name: &str, path: PathBuf) -> WasmPluginConf {
 
 /// Build the configuration of a guest that logs `log_text` on each tick, every 100 ms.
 pub fn tick_logger(name: &str, log_text: &str) -> WasmPluginConf {
-    let mut texts = Texts::new();
+    let mut texts = MemoryTexts::new();
     let exports = Exports {
         configure: "(drop (call $set_tick_period (i32.const 100))) i32.const 1".to_string(),
-        tick: texts.log(log_text),
+        tick: texts.log_call(log_text),
         ..Exports::default()
     };
-    one_slot(name, write_module(name, &exports.into_wat(&texts.data)))
+    one_slot_plugin(
+        name,
+        write_module(name, &exports.into_wat(&texts.data_segments)),
+    )
 }
 
-/// Build the configuration of a guest that defines the counter `counter` and adds one to it for
+/// Build the configuration of a guest that defines the counter `counter_name` and adds one to it for
 /// each request.
-pub fn request_counter(name: &str, counter: &str) -> WasmPluginConf {
-    let mut texts = Texts::new();
-    let (at, len) = texts.add(counter);
+pub fn request_counter(name: &str, counter_name: &str) -> WasmPluginConf {
+    let mut texts = MemoryTexts::new();
+    let (at, len) = texts.add(counter_name);
     let exports = Exports {
         configure: format!("(drop (call $define_metric (i32.const 0) (i32.const {at}) (i32.const {len}) (i32.const 620))) i32.const 1"),
         request_headers: "(drop (call $increment_metric (i32.load (i32.const 620)) (i64.const 1))) i32.const 0".to_string(),
         ..Exports::default()
     };
-    one_slot(name, write_module(name, &exports.into_wat(&texts.data)))
+    one_slot_plugin(
+        name,
+        write_module(name, &exports.into_wat(&texts.data_segments)),
+    )
 }
 
 /// The properties that a property reader guest reads, and where it puts each one.
 #[derive(Default)]
 pub struct PropertyReads<'a> {
     /// A path and a header name for each property to add as a request header.
-    pub request_headers: &'a [(&'a str, &'a str)],
+    pub to_request_headers: &'a [(&'a str, &'a str)],
     /// A path and a header name for each property to add as a response header.
-    pub response_headers: &'a [(&'a str, &'a str)],
+    pub to_response_headers: &'a [(&'a str, &'a str)],
     /// The paths to log in `proxy_on_response_headers`.
-    pub logged_with_the_response: &'a [&'a str],
+    pub logged_in_on_response_headers: &'a [&'a str],
     /// The paths to log in `proxy_on_log`.
-    pub logged_at_the_end: &'a [&'a str],
+    pub logged_in_on_log: &'a [&'a str],
 }
 
 /// Build the configuration of a guest that reads the properties of `reads`.
 pub fn property_reader(name: &str, reads: PropertyReads<'_>) -> WasmPluginConf {
-    let mut texts = Texts::new();
-    let request = texts.properties_to_headers(0, reads.request_headers);
-    let response = texts.properties_to_headers(2, reads.response_headers);
-    let response_logs = texts.log_properties(reads.logged_with_the_response);
+    let mut texts = MemoryTexts::new();
+    let request = texts.property_to_header_calls(0, reads.to_request_headers);
+    let response = texts.property_to_header_calls(2, reads.to_response_headers);
+    let response_logs = texts.log_property_calls(reads.logged_in_on_response_headers);
     let exports = Exports {
         request_headers: format!("{request} i32.const 0"),
         response_headers: format!("{response} {response_logs} i32.const 0"),
-        log: texts.log_properties(reads.logged_at_the_end),
+        log: texts.log_property_calls(reads.logged_in_on_log),
         ..Exports::default()
     };
-    one_slot(name, write_module(name, &exports.into_wat(&texts.data)))
+    one_slot_plugin(
+        name,
+        write_module(name, &exports.into_wat(&texts.data_segments)),
+    )
 }
 
 /// Build the configuration of a guest that sends a callout on its first tick, and logs
 /// `log_text` when the callout response arrives.
-pub fn root_callout(name: &str, log_text: &str) -> WasmPluginConf {
-    let mut texts = Texts::new();
-    let log = texts.log(log_text);
+pub fn tick_callout_sender(name: &str, log_text: &str) -> WasmPluginConf {
+    let mut texts = MemoryTexts::new();
+    let log = texts.log_call(log_text);
     let exports = Exports {
         configure: "(drop (call $set_tick_period (i32.const 50))) i32.const 1".to_string(),
         tick: "(if (i32.eqz (i32.load (i32.const 604)))
@@ -284,40 +293,49 @@ pub fn root_callout(name: &str, log_text: &str) -> WasmPluginConf {
         http_call_response: format!("(if (local.get 2) (then {log}))"),
         ..Exports::default()
     };
-    one_slot(name, write_module(name, &exports.into_wat(&texts.data)))
+    one_slot_plugin(
+        name,
+        write_module(name, &exports.into_wat(&texts.data_segments)),
+    )
 }
 
 /// The body of `proxy_on_http_call_response` that calls `proxy_done` for the context that
 /// `proxy_on_done` stored at address 608.
 const DONE_FOR_THE_HELD_CONTEXT: &str =
-    "(drop (call $set_effective_context (i32.load (i32.const 608)))) (drop (call $done))";
+    "(drop (call $set_effective_context (i32.load (i32.const 608)))) (drop (call $proxy_done))";
 
 /// Build the configuration of a guest that sends a callout from `proxy_on_done` and holds its
 /// context, calls `proxy_done` for it when the response arrives, and logs `log_text` from
 /// `proxy_on_log`.
-pub fn held_context(name: &str, log_text: &str) -> WasmPluginConf {
-    let mut texts = Texts::new();
+pub fn context_holder(name: &str, log_text: &str) -> WasmPluginConf {
+    let mut texts = MemoryTexts::new();
     let exports = Exports {
         done: "(i32.store (i32.const 608) (local.get 0)) (call $call_and_log_status) i32.const 0"
             .to_string(),
         http_call_response: DONE_FOR_THE_HELD_CONTEXT.to_string(),
-        log: texts.log(log_text),
+        log: texts.log_call(log_text),
         ..Exports::default()
     };
-    one_slot(name, write_module(name, &exports.into_wat(&texts.data)))
+    one_slot_plugin(
+        name,
+        write_module(name, &exports.into_wat(&texts.data_segments)),
+    )
 }
 
 /// Build the configuration of a guest that sends a callout from the request headers and
 /// continues, holds its context in `proxy_on_done`, calls `proxy_done` for it when any callout
 /// result arrives, and logs `log_text` from `proxy_on_log`.
-pub fn held_context_with_an_earlier_callout(name: &str, log_text: &str) -> WasmPluginConf {
-    let mut texts = Texts::new();
+pub fn context_holder_with_an_earlier_callout(name: &str, log_text: &str) -> WasmPluginConf {
+    let mut texts = MemoryTexts::new();
     let exports = Exports {
         request_headers: "(call $call_without_pause)".to_string(),
         done: "(i32.store (i32.const 608) (local.get 0)) i32.const 0".to_string(),
         http_call_response: DONE_FOR_THE_HELD_CONTEXT.to_string(),
-        log: texts.log(log_text),
+        log: texts.log_call(log_text),
         ..Exports::default()
     };
-    one_slot(name, write_module(name, &exports.into_wat(&texts.data)))
+    one_slot_plugin(
+        name,
+        write_module(name, &exports.into_wat(&texts.data_segments)),
+    )
 }

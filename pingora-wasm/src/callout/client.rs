@@ -68,24 +68,30 @@ impl ConnectorSender {
 #[async_trait]
 impl CalloutSender for ConnectorSender {
     async fn send(&self, callout: AcceptedCallout) -> CalloutResult {
-        let plugin = &callout.plugin_conf.plugin_name;
-        let fail = |failure: CalloutFailure, result: CalloutResult| {
-            self.metric_sink.callout_failed(plugin, failure);
+        let plugin_name = &callout.plugin_conf.plugin_name;
+        let report_failure = |failure: CalloutFailure, result: CalloutResult| {
+            self.metric_sink.callout_failed(plugin_name, failure);
             result
         };
         let deadline = Instant::now() + callout.timeout;
         let mut response = match timeout(callout.timeout, self.send_to_peer(&callout)).await {
             Ok(Ok(response)) => response,
-            Ok(Err((failure, synthetic_response))) => return fail(failure, synthetic_response),
-            Err(_) => return fail(CalloutFailure::Timeout, CalloutResult::timeout_response()),
+            Ok(Err((failure, synthetic_response))) => {
+                return report_failure(failure, synthetic_response)
+            }
+            Err(_) => {
+                return report_failure(CalloutFailure::Timeout, CalloutResult::timeout_response())
+            }
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
         let limit = callout.plugin_conf.response_limit;
         let body_and_trailers = read_body_and_trailers(&mut response.session, limit);
         let (body, trailers) = match timeout(remaining, body_and_trailers).await {
             Ok(Ok(Some(body_and_trailers))) => body_and_trailers,
-            Ok(Ok(None)) => return fail(CalloutFailure::ResponseTooLarge, CalloutResult::Failed),
-            _ => return fail(CalloutFailure::FailedAfterHeader, CalloutResult::Failed),
+            Ok(Ok(None)) => {
+                return report_failure(CalloutFailure::ResponseTooLarge, CalloutResult::Failed)
+            }
+            _ => return report_failure(CalloutFailure::FailedAfterHeader, CalloutResult::Failed),
         };
         let idle_timeout = response.peer.idle_timeout();
         self.connector

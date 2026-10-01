@@ -205,10 +205,10 @@ fn main() {
         pingora_proxy::http_proxy_service(&my_server.configuration, PluginProxy { chain });
     my_proxy.add_tcp("127.0.0.1:6190");
 
-    let mut metrics = pingora_prometheus::prometheus_http_service();
-    metrics.add_tcp("127.0.0.1:6192");
+    let mut metrics_service = pingora_prometheus::prometheus_http_service();
+    metrics_service.add_tcp("127.0.0.1:6192");
 
     my_server.add_service(my_proxy);
-    my_server.add_service(metrics);
+    my_server.add_service(metrics_service);
     my_server.run_forever();
 }

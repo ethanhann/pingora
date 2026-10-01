@@ -70,7 +70,7 @@ impl RootCallbackThread {
     /// start, this returns an error, and the events stay in the channel for the next call.
     pub(crate) fn start(&self, runtime: Weak<RuntimeInner>) -> Result<()> {
         let receiver = self.receiver.clone();
-        let (built, build_result) = mpsc::channel();
+        let (build_result_sender, build_result_receiver) = mpsc::channel();
         #[cfg(test)]
         let running = self.running.clone();
         thread::Builder::new()
@@ -85,18 +85,18 @@ impl RootCallbackThread {
                 {
                     Ok(tokio_runtime) => tokio_runtime,
                     Err(e) => {
-                        let _ = built.send(Err(e));
+                        let _ = build_result_sender.send(Err(e));
                         return;
                     }
                 };
                 let Some(events) = receiver.lock().take() else {
-                    let _ = built.send(Ok(()));
+                    let _ = build_result_sender.send(Ok(()));
                     return;
                 };
-                let _ = built.send(Ok(()));
+                let _ = build_result_sender.send(Ok(()));
                 #[cfg(test)]
                 running.store(true, std::sync::atomic::Ordering::Relaxed);
-                run(&tokio_runtime, &runtime, events);
+                run_root_callback_loop(&tokio_runtime, &runtime, events);
                 #[cfg(test)]
                 running.store(false, std::sync::atomic::Ordering::Relaxed);
             })
@@ -104,11 +104,11 @@ impl RootCallbackThread {
                 ERR_PLUGIN_FAILED,
                 "failed to start the wasm root callback thread",
             )?;
-        let build = build_result.recv().or_err(
+        let build_result = build_result_receiver.recv().or_err(
             ERR_PLUGIN_FAILED,
             "the wasm root callback thread stopped before it built its runtime",
         )?;
-        build.or_err(
+        build_result.or_err(
             ERR_PLUGIN_FAILED,
             "failed to build the runtime of the wasm root callback thread",
         )
@@ -120,18 +120,18 @@ impl RootCallbackThread {
 /// The thread waits for work inside `block_on` and runs the work outside it. When the thread
 /// holds the last reference to the `WasmRuntime`, the runtime drops outside `block_on`, where
 /// a connector that owns a tokio runtime can drop without a panic.
-fn run(
+fn run_root_callback_loop(
     tokio_runtime: &Runtime,
     runtime: &Weak<RuntimeInner>,
     mut events: UnboundedReceiver<RootCallbackEvent>,
 ) {
-    let mut state = RootCallbackLoop::default();
-    while tokio_runtime.block_on(state.wait_for_work(&mut events)) {
+    let mut callback_loop = RootCallbackLoop::default();
+    while tokio_runtime.block_on(callback_loop.wait_for_work(&mut events)) {
         let Some(runtime) = runtime.upgrade() else {
             return;
         };
         let entered = tokio_runtime.enter();
-        state.run_due_work(&runtime);
+        callback_loop.run_due_work(&runtime);
         drop(entered);
         drop(runtime);
     }
@@ -183,8 +183,8 @@ mod tests {
             log_sink: logs.clone(),
             ..WasmServices::default()
         };
-        let conf = plugin(label, wat_guest(label, wat), slots);
-        let runtime = WasmRuntime::new_with_services(vec![conf], services).unwrap();
+        let plugin_conf = plugin(label, wat_guest(label, wat), slots);
+        let runtime = WasmRuntime::new_with_services(vec![plugin_conf], services).unwrap();
         (runtime, logs)
     }
 
@@ -236,14 +236,16 @@ mod tests {
         runtime.inner.start_threads().unwrap();
         wait_until(|| count_lines_with(&logs, "tick") > 0);
         let guard = runtime.inner.pools[0].lock_slot(0);
-        let when_locked = count_lines_with(&logs, "tick");
+        let ticks_when_locked = count_lines_with(&logs, "tick");
         thread::sleep(Duration::from_millis(100));
-        let after_100_ms_locked = count_lines_with(&logs, "tick");
+        let ticks_after_100_ms_locked = count_lines_with(&logs, "tick");
 
         drop(guard);
 
-        assert_eq!(after_100_ms_locked, when_locked);
-        assert!(wait_until(|| count_lines_with(&logs, "tick") > when_locked));
+        assert_eq!(ticks_after_100_ms_locked, ticks_when_locked);
+        assert!(wait_until(
+            || count_lines_with(&logs, "tick") > ticks_when_locked
+        ));
     }
 
     #[test]
@@ -265,10 +267,10 @@ mod tests {
     #[test]
     fn a_tick_reads_empty_header_pairs_and_proxy_continue_stream_returns_ok() {
         let wat = Wat {
-            data: r#"(data (i32.const 700) "pairs ok") (data (i32.const 710) "continue ok")"#,
+            data_segments: r#"(data (i32.const 700) "pairs ok") (data (i32.const 710) "continue ok")"#,
             configure: TICK_EVERY_20_MS,
             tick: Some(
-                "(if (i32.eqz (call $get_pairs (i32.const 0) (i32.const 512) (i32.const 516)))
+                "(if (i32.eqz (call $get_header_pairs (i32.const 0) (i32.const 512) (i32.const 516)))
                     (then (drop (call $log (i32.const 2) (i32.const 700) (i32.const 8)))))
                 (if (i32.eqz (call $continue_stream (i32.const 0)))
                     (then (drop (call $log (i32.const 2) (i32.const 710) (i32.const 11)))))",
@@ -289,7 +291,7 @@ mod tests {
         let (runtime, _logs) =
             runtime_with_logs::<RecordedGuestLogs>("thread-end", Wat::default(), 1);
         runtime.inner.start_threads().unwrap();
-        let running = runtime.inner.root_callbacks.running.clone();
+        let running = runtime.inner.root_callback_thread.running.clone();
         assert!(wait_until(|| running.load(Ordering::Relaxed)));
 
         drop(runtime);
@@ -300,13 +302,13 @@ mod tests {
     #[tokio::test]
     async fn a_held_context_whose_ctx_drops_gets_proxy_on_delete_and_no_proxy_on_log() {
         let wat = Wat {
-            data: r#"(data (i32.const 700) "logged") (data (i32.const 710) "deleted")"#,
+            data_segments: r#"(data (i32.const 700) "logged") (data (i32.const 710) "deleted")"#,
             configure: TICK_EVERY_20_MS,
             done: "(i32.store (i32.const 608) (local.get 0)) i32.const 0",
             tick: Some(
                 "(if (i32.load (i32.const 608)) (then
                     (drop (call $set_effective_context (i32.load (i32.const 608))))
-                    (drop (call $done))
+                    (drop (call $proxy_done))
                     (i32.store (i32.const 608) (i32.const 0))))",
             ),
             log: Some("(drop (call $log (i32.const 2) (i32.const 700) (i32.const 6)))"),
@@ -337,8 +339,9 @@ mod tests {
         let logs = Arc::new(RecordedGuestLogs::default());
         let mut services = authz_services();
         services.log_sink = logs.clone();
-        let conf = plugin("replaced", wat_guest("replaced", wat), 1);
-        let (runtime, _ctx) = callout_ctx_with_services(vec![conf], sender.clone(), services);
+        let plugin_conf = plugin("replaced", wat_guest("replaced", wat), 1);
+        let (runtime, _ctx) =
+            callout_ctx_with_services(vec![plugin_conf], sender.clone(), services);
         runtime.inner.start_threads().unwrap();
         wait_until(|| sender.sent_count() == 1);
         runtime.inner.pools[0].replace_slot(0);
@@ -356,10 +359,10 @@ mod tests {
         let configure = "(drop (call $register_queue (i32.const 700) (i32.const 1) (i32.const 640)))
             (drop (call $define_metric (i32.const 0) (i32.const 720) (i32.const 14) (i32.const 644)))
             i32.const 1";
-        let data = r#"(data (i32.const 700) "q") (data (i32.const 720) "shared_counter")
+        let data_segments = r#"(data (i32.const 700) "q") (data (i32.const 720) "shared_counter")
             (data (i32.const 740) "first ready") (data (i32.const 760) "second ready")"#;
         let first = Wat {
-            data,
+            data_segments,
             configure,
             request_headers:
                 "(drop (call $increment_metric (i32.load (i32.const 644)) (i64.const 1)))
@@ -384,8 +387,8 @@ mod tests {
             plugin("first", wat_guest("shared-first", first), 1),
             plugin("second", wat_guest("shared-second", second), 1),
         ];
-        for conf in &mut plugins {
-            conf.vm_id = "shared".to_string();
+        for plugin_conf in &mut plugins {
+            plugin_conf.vm_id = "shared".to_string();
         }
         let runtime = WasmRuntime::new_with_services(plugins, services).unwrap();
         let mut ctx = runtime.chain(&["first", "second"]).unwrap().new_ctx();
@@ -417,7 +420,10 @@ mod tests {
         };
         let finished = super::root_callouts::FinishedCallout {
             address: GuestAddress {
-                slot: SlotIndex { pool: 0, slot: 0 },
+                slot: SlotIndex {
+                    pool_index: 0,
+                    slot_index: 0,
+                },
                 guest,
             },
             context: root,
@@ -425,8 +431,11 @@ mod tests {
             result: CalloutResult::Failed,
         };
 
-        let mut state = super::callback_loop::RootCallbackLoop::default();
-        state.run_work(&runtime.inner, &super::work::Work::Delivery(finished));
+        let mut callback_loop = super::callback_loop::RootCallbackLoop::default();
+        callback_loop.run_work(
+            &runtime.inner,
+            &super::work::Work::DeliverCalloutResult(finished),
+        );
 
         let warnings = crate_log_lines_with("closed-callout failed in proxy_on_http_call_response");
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -459,8 +468,8 @@ mod tests {
             log_sink: logs.clone(),
             ..WasmServices::default()
         };
-        let conf = plugin("a", crate::test_support::fixture("http-example"), 2);
-        let runtime = WasmRuntime::new_with_services(vec![conf], services).unwrap();
+        let plugin_conf = plugin("a", crate::test_support::fixture("http-example"), 2);
+        let runtime = WasmRuntime::new_with_services(vec![plugin_conf], services).unwrap();
         runtime.inner.pools[0].fail_slot(1);
         let mut ctx = runtime.chain(&["a"]).unwrap().new_ctx();
         let (mut session, _client) = session(GET).await;

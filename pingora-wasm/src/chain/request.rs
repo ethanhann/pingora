@@ -153,14 +153,14 @@ impl WasmCtx {
 impl WasmCtx {
     /// Record the facts of the request that the headers do not have, for the properties.
     fn record_request_facts<DS: DownstreamSession>(&mut self, session: &Session<DS>) {
-        let facts = &mut self.stream().facts;
+        let facts = &mut self.stream().request_facts;
         facts.client_address = session.client_addr().and_then(|a| a.as_inet()).copied();
         facts.server_address = session.server_addr().and_then(|a| a.as_inet()).copied();
         let tls = session.digest().and_then(|d| d.ssl_digest.as_deref());
         facts.tls = tls.map(TlsFacts::new);
         facts.start = Some(RequestStart {
-            wall: SystemTime::now(),
-            monotonic: Instant::now(),
+            wall_time: SystemTime::now(),
+            monotonic_time: Instant::now(),
         });
     }
 }

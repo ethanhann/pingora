@@ -32,11 +32,11 @@ pub(super) struct FinishedCallout {
 
 /// The callouts in flight whose results go to a root, or to a context that the guest held.
 #[derive(Default)]
-pub(super) struct RootCallouts {
+pub(super) struct RootCallbackCallouts {
     results: FuturesUnordered<BoxFuture<'static, FinishedCallout>>,
 }
 
-impl RootCallouts {
+impl RootCallbackCallouts {
     /// Start `callout` on the connector of the root callback thread.
     pub(super) fn start(
         &mut self,
@@ -46,7 +46,7 @@ impl RootCallouts {
         callout: AcceptedCallout,
     ) {
         let id = callout.id;
-        let Some(pending) = runtime.callout_launcher.spawn_root(callout) else {
+        let Some(pending) = runtime.callout_launcher.spawn_for_root_callback(callout) else {
             return;
         };
         self.results.push(
