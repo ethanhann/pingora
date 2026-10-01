@@ -93,6 +93,7 @@ impl RuntimePlan {
             services.callout_upstreams = CALLOUT_ORIGINS.clone();
         }
         with_metrics_and_node_name(&mut services);
+        services.log_sink = Arc::new(super::RecordedGuestMessages);
         WasmRuntime::new_with_services(self.plugins, services).unwrap()
     }
 }
@@ -195,33 +196,39 @@ pub fn services() -> Vec<(u16, WasmRuntime, Vec<&'static str>, Option<usize>)> {
     plans.service(6405, vec![counter], None);
     let request_properties = guests::property_reader(
         "request-properties",
-        &[
-            ("request/path", "x-path"),
-            ("request/method", "x-method"),
-            ("request/protocol", "x-protocol"),
-            ("request/scheme", "x-scheme"),
-            ("request/host", "x-host"),
-            ("source/address", "x-source"),
-            ("destination/address", "x-destination"),
-            ("xds/route_name", "x-route"),
-            ("node/name", "x-node"),
-        ],
-        &[],
-        &[],
+        guests::PropertyReads {
+            request_headers: &[
+                ("request/path", "x-path"),
+                ("request/url_path", "x-url-path"),
+                ("request/method", "x-method"),
+                ("request/protocol", "x-protocol"),
+                ("request/scheme", "x-scheme"),
+                ("request/host", "x-host"),
+                ("source/address", "x-source"),
+                ("destination/address", "x-destination"),
+                ("xds/route_name", "x-route"),
+                ("node/name", "x-node"),
+            ],
+            logged_at_the_end: &["destination/port", "request/time"],
+            ..guests::PropertyReads::default()
+        },
     );
     plans.service(6406, vec![request_properties], None);
     let response_properties = guests::property_reader(
         "response-properties",
-        &[],
-        &[("upstream/address", "x-upstream")],
-        &["response/code"],
+        guests::PropertyReads {
+            response_headers: &[("upstream/address", "x-upstream")],
+            logged_with_the_response: &["response/code", "upstream/port"],
+            ..guests::PropertyReads::default()
+        },
     );
     plans.service(6407, vec![response_properties], None);
     let logging_properties = guests::property_reader(
         "logging-properties",
-        &[],
-        &[],
-        &["request/size", "response/size"],
+        guests::PropertyReads {
+            logged_at_the_end: &["request/size", "response/size", "request/duration"],
+            ..guests::PropertyReads::default()
+        },
     );
     plans.service(6408, vec![logging_properties], None);
     let root_callout = guests::root_callout("root-callout", "root callout response of 6409");

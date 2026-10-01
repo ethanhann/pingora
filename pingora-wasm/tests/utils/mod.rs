@@ -26,7 +26,7 @@ use once_cell::sync::{Lazy, OnceCell};
 use pingora_core::apps::HttpServerOptions;
 use pingora_core::server::Server;
 use pingora_test_utils::http_origin::HttpOrigin;
-use pingora_wasm::WasmRuntime;
+use pingora_wasm::{LogContext, LogLevel, LogSink, WasmRuntime};
 use proxy::TestProxy;
 use services::services;
 use std::collections::HashMap;
@@ -45,27 +45,40 @@ pub fn fixture(name: &str) -> PathBuf {
         .join(format!("{name}.wasm"))
 }
 
-static GUEST_LINES: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
+/// Each guest log message so far, with the name of its plugin.
+static GUEST_MESSAGES: Lazy<Mutex<Vec<(String, Vec<u8>)>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
-struct Capture;
+/// The log sink of every runtime of the test server.
+pub struct RecordedGuestMessages;
 
-impl log::Log for Capture {
-    fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.target() == "pingora_wasm::guest"
+impl LogSink for RecordedGuestMessages {
+    fn log(&self, context: LogContext<'_>, _level: LogLevel, message: &[u8]) {
+        let plugin = context.plugin_name.as_deref().unwrap_or(&context.vm_id);
+        let plugin = String::from_utf8_lossy(plugin).into_owned();
+        GUEST_MESSAGES
+            .lock()
+            .unwrap()
+            .push((plugin, message.to_vec()));
     }
-
-    fn log(&self, record: &log::Record) {
-        if self.enabled(record.metadata()) {
-            GUEST_LINES.lock().unwrap().push(record.args().to_string());
-        }
-    }
-
-    fn flush(&self) {}
 }
 
-/// Return every guest log line so far.
+/// Return every guest log line so far, as `plugin: message`.
 pub fn guest_lines() -> Vec<String> {
-    GUEST_LINES.lock().unwrap().clone()
+    let messages = GUEST_MESSAGES.lock().unwrap();
+    messages
+        .iter()
+        .map(|(plugin, message)| format!("{plugin}: {}", String::from_utf8_lossy(message)))
+        .collect()
+}
+
+/// Return the log messages of `plugin` so far, as the bytes that the guest wrote.
+pub fn guest_messages(plugin: &str) -> Vec<Vec<u8>> {
+    let messages = GUEST_MESSAGES.lock().unwrap();
+    messages
+        .iter()
+        .filter(|(name, _)| name == plugin)
+        .map(|(_, message)| message.clone())
+        .collect()
 }
 
 static RUNTIMES: OnceCell<HashMap<u16, WasmRuntime>> = OnceCell::new();
@@ -79,8 +92,6 @@ pub struct TestServer;
 
 impl TestServer {
     fn start() -> Self {
-        log::set_boxed_logger(Box::new(Capture)).unwrap();
-        log::set_max_level(log::LevelFilter::Info);
         let services = services();
         RUNTIMES
             .set(

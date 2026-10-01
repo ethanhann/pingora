@@ -32,6 +32,12 @@
   (import "env" "proxy_set_effective_context"
     (func $set_effective_context (param i32) (result i32)))
   (import "env" "proxy_done" (func $done (result i32)))
+  (import "env" "proxy_get_header_map_pairs"
+    (func $get_pairs (param i32 i32 i32) (result i32)))
+  (import "env" "proxy_register_shared_queue"
+    (func $register_queue (param i32 i32 i32) (result i32)))
+  (import "env" "proxy_enqueue_shared_queue"
+    (func $enqueue (param i32 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 16) "replaced")
   (data (i32.const 32) "teapot")
@@ -175,6 +181,5 @@
 
   (func (export "proxy_on_memory_allocate") (param i32) (result i32) i32.const 1024)
   (func (export "proxy_on_context_create") (param i32 i32))
-  (func (export "proxy_on_delete") (param i32))
 CALLBACKS
 )

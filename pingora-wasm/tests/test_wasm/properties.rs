@@ -15,7 +15,12 @@
 //! The properties that plugins read.
 
 use super::{get, header};
-use crate::utils::{echo_origin, eventually, guest_lines, init};
+use crate::utils::{echo_origin, eventually, guest_messages, init};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+fn int(bytes: &[u8]) -> Option<i64> {
+    Some(i64::from_le_bytes(bytes.try_into().ok()?))
+}
 
 #[tokio::test]
 async fn a_plugin_reads_the_request_properties() {
@@ -26,24 +31,31 @@ async fn a_plugin_reads_the_request_properties() {
 
     let echoed = |name: &str| header(&res, &format!("x-echo-{name}"));
     let cases = [
-        ("x-path", "/a/b?c=d".to_string()),
-        ("x-method", "GET".to_string()),
-        ("x-protocol", "HTTP/1.1".to_string()),
-        ("x-scheme", "http".to_string()),
-        ("x-host", "127.0.0.1:6406".to_string()),
-        ("x-destination", "127.0.0.1:6406".to_string()),
-        ("x-route", "test-route".to_string()),
-        ("x-node", "test-node".to_string()),
+        ("x-path", "/a/b?c=d"),
+        ("x-url-path", "/a/b"),
+        ("x-method", "GET"),
+        ("x-protocol", "HTTP/1.1"),
+        ("x-scheme", "http"),
+        ("x-host", "127.0.0.1:6406"),
+        ("x-destination", "127.0.0.1:6406"),
+        ("x-route", "test-route"),
+        ("x-node", "test-node"),
     ];
     for (name, expected) in cases {
-        assert_eq!(echoed(name), Some(expected), "{name}");
+        assert_eq!(echoed(name).as_deref(), Some(expected), "{name}");
     }
     let source = echoed("x-source").unwrap();
     assert!(source.starts_with("127.0.0.1:"), "{source}");
+    assert!(eventually(|| guest_messages("request-properties").len() >= 2).await);
+    let logged = guest_messages("request-properties");
+    let time = Duration::from_nanos(int(&logged[logged.len() - 1]).unwrap().try_into().unwrap());
+    let age = SystemTime::now().duration_since(UNIX_EPOCH).unwrap() - time;
+    assert_eq!(int(&logged[logged.len() - 2]), Some(6406));
+    assert!(age < Duration::from_secs(5), "{age:?}");
 }
 
 #[tokio::test]
-async fn a_plugin_reads_the_upstream_address_and_the_response_code() {
+async fn a_plugin_reads_the_upstream_and_the_response_code_in_the_response_phase() {
     init().await;
     let (origin, _) = echo_origin().await;
     let port = origin.addr().port();
@@ -54,26 +66,28 @@ async fn a_plugin_reads_the_upstream_address_and_the_response_code() {
         header(&res, "x-upstream"),
         Some(format!("127.0.0.1:{port}"))
     );
-    let code = String::from_utf8_lossy(&200_i64.to_le_bytes()).into_owned();
-    let logged = |line: &String| line.starts_with("response-properties ") && line.ends_with(&code);
-    assert!(eventually(|| guest_lines().iter().any(logged)).await);
+    let logged = guest_messages("response-properties");
+    let logged: Vec<_> = logged.iter().map(|value| int(value)).collect();
+    assert_eq!(
+        logged[logged.len() - 2..],
+        [Some(200), Some(i64::from(port))]
+    );
 }
 
 #[tokio::test]
-async fn a_plugin_reads_the_sizes_in_proxy_on_log() {
+async fn a_plugin_reads_the_sizes_and_the_duration_in_proxy_on_log() {
     init().await;
     let (origin, _) = echo_origin().await;
 
     let res = get(6408, "/", origin.addr().port(), &[]).await;
-    let body_size = res.bytes().await.unwrap().len();
+    let body_size = i64::try_from(res.bytes().await.unwrap().len()).unwrap();
 
-    let request_size = String::from_utf8_lossy(&0_i64.to_le_bytes()).into_owned();
-    let response_size = String::from_utf8_lossy(&(body_size as i64).to_le_bytes()).into_owned();
-    let logged = |size: &str| {
-        let lines = guest_lines();
-        lines
-            .iter()
-            .any(|line| line.starts_with("logging-properties ") && line.ends_with(size))
+    assert!(eventually(|| guest_messages("logging-properties").len() >= 3).await);
+    let logged = guest_messages("logging-properties");
+    let logged: Vec<_> = logged.iter().map(|value| int(value)).collect();
+    let [request_size, response_size, duration] = logged[logged.len() - 3..] else {
+        unreachable!("three values were logged");
     };
-    assert!(eventually(|| logged(&request_size) && logged(&response_size)).await);
+    assert_eq!((request_size, response_size), (Some(0), Some(body_size)));
+    assert!(duration.is_some_and(|nanos| nanos > 0), "{duration:?}");
 }

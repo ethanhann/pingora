@@ -26,7 +26,7 @@ fn count_lines(text: &str) -> usize {
 }
 
 #[tokio::test]
-async fn a_plugin_logs_once_for_each_tick_period() {
+async fn a_plugin_logs_3_to_8_ticks_in_6_periods() {
     init().await;
     let (origin, _) = echo_origin().await;
     get(6403, "/", origin.addr().port(), &[]).await;
