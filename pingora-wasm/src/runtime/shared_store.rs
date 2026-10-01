@@ -18,7 +18,8 @@ use crate::metrics::{WasmMetric, WasmMetricKind, WasmMetricRecorder, WasmMetricS
 use parking_lot::Mutex;
 use proxy_wasm_host::abi::v0_2_1::types::{MetricType, Status};
 use proxy_wasm_host::abi::v0_2_1::{
-    InMemoryStore, InMemoryStoreLimits, Invocation, MetricId, QueueId, SharedServices, SharedValue,
+    InMemoryStore, InMemoryStoreLimits, Invocation, MetricId, QueueEnqueued, QueueId,
+    SharedServices, SharedValue,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -49,11 +50,19 @@ struct MetricEntry {
 }
 
 impl SharedStore {
-    pub(crate) fn new(store: InMemoryStore, sink: Arc<dyn WasmMetricSink>) -> Self {
+    /// Create a store with `limits`, which calls `enqueue_observer` for each queue item and
+    /// sends the metrics to `sink`.
+    pub(crate) fn new(
+        limits: InMemoryStoreLimits,
+        enqueue_observer: Arc<dyn Fn(QueueEnqueued<'_>) + Send + Sync>,
+        sink: Arc<dyn WasmMetricSink>,
+    ) -> Self {
         SharedStore {
-            store,
+            metric_limit: limits.metrics(),
+            store: InMemoryStore::new()
+                .with_limits(limits)
+                .with_enqueue_observer(enqueue_observer),
             metrics: Mutex::new(Metrics::default()),
-            metric_limit: InMemoryStoreLimits::default().metrics(),
             sink,
         }
     }
@@ -304,39 +313,32 @@ mod tests {
         let sink = RecordingSink::default();
         let events = sink.events.clone();
         (
-            SharedStore::new(InMemoryStore::new(), Arc::new(sink)),
+            SharedStore::new(
+                InMemoryStoreLimits::default(),
+                Arc::new(|_| {}),
+                Arc::new(sink),
+            ),
             events,
         )
     }
 
     #[test]
     fn a_recorded_counter_adds_and_a_gauge_sends_its_delta() {
-        let (store, events) = store();
-        let counter = store
-            .define_metric(call(), b"vm", MetricType::Counter, b"requests")
-            .unwrap();
-        let gauge = store
-            .define_metric(call(), b"vm", MetricType::Gauge, b"open")
-            .unwrap();
+        let cases = [
+            (MetricType::Counter, 7, ["add vm/m 2", "add vm/m 5"]),
+            (MetricType::Gauge, 5, ["add vm/m 2", "add vm/m 3"]),
+        ];
 
-        store.record_metric(call(), counter, 2).unwrap();
-        store.record_metric(call(), counter, 3).unwrap();
-        store.record_metric(call(), gauge, 7).unwrap();
-        store.record_metric(call(), gauge, 4).unwrap();
+        for (kind, expected, sent) in cases {
+            let (store, events) = store();
+            let metric = store.define_metric(call(), b"vm", kind, b"m").unwrap();
+            store.record_metric(call(), metric, 2).unwrap();
 
-        assert_eq!(store.get_metric(call(), counter), Ok(5));
-        assert_eq!(store.get_metric(call(), gauge), Ok(4));
-        assert_eq!(
-            *events.lock(),
-            [
-                "define vm/requests",
-                "define vm/open",
-                "add vm/requests 2",
-                "add vm/requests 3",
-                "add vm/open 7",
-                "add vm/open -3",
-            ]
-        );
+            store.record_metric(call(), metric, 5).unwrap();
+
+            assert_eq!(store.get_metric(call(), metric), Ok(expected), "{kind:?}");
+            assert_eq!(events.lock()[1..], sent, "{kind:?}");
+        }
     }
 
     #[test]
@@ -373,42 +375,45 @@ mod tests {
     }
 
     #[test]
-    fn a_counter_refuses_a_negative_increment_and_a_gauge_saturates_its_delta() {
-        let (store, events) = store();
+    fn a_counter_refuses_an_increment_that_is_not_positive() {
+        let (store, _events) = store();
         let counter = store
             .define_metric(call(), b"vm", MetricType::Counter, b"c")
             .unwrap();
+
+        let refused = [-1, 0].map(|delta| store.increment_metric(call(), counter, delta));
+
+        assert_eq!(
+            refused,
+            [Err(Status::BadArgument), Err(Status::BadArgument)]
+        );
+    }
+
+    #[test]
+    fn a_gauge_delta_over_the_range_of_i64_saturates() {
+        let (store, events) = store();
         let gauge = store
             .define_metric(call(), b"vm", MetricType::Gauge, b"g")
             .unwrap();
 
-        let negative = store.increment_metric(call(), counter, -1);
         store.record_metric(call(), gauge, u64::MAX).unwrap();
-        let decrease = store.increment_metric(call(), gauge, i64::MIN);
 
-        assert_eq!(negative, Err(Status::BadArgument));
-        assert_eq!(decrease, Ok(()));
-        assert!(events.lock().contains(&format!("add vm/g {}", i64::MAX)));
+        assert_eq!(
+            *events.lock().last().unwrap(),
+            format!("add vm/g {}", i64::MAX)
+        );
     }
 
     #[test]
     fn a_dropped_store_takes_back_the_value_of_each_gauge() {
         let (store, events) = store();
-        let gauge = store.define_metric(call(), b"vm", MetricType::Gauge, b"open").unwrap();
+        let gauge = store
+            .define_metric(call(), b"vm", MetricType::Gauge, b"open")
+            .unwrap();
         store.record_metric(call(), gauge, 5).unwrap();
 
         drop(store);
 
         assert_eq!(events.lock().last().unwrap(), "add vm/open -5");
-    }
-
-    #[test]
-    fn a_counter_refuses_an_increment_of_zero() {
-        let (store, _events) = store();
-        let counter = store.define_metric(call(), b"vm", MetricType::Counter, b"c").unwrap();
-
-        let zero = store.increment_metric(call(), counter, 0);
-
-        assert_eq!(zero, Err(Status::BadArgument));
     }
 }

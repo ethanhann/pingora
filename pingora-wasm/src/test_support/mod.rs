@@ -60,6 +60,8 @@ pub(crate) struct Wat {
     pub(crate) http_call_response: Option<&'static str>,
     pub(crate) log: Option<&'static str>,
     pub(crate) tick: Option<&'static str>,
+    pub(crate) queue_ready: Option<&'static str>,
+    pub(crate) delete: &'static str,
     /// Text for the callbacks, such as `(data (i32.const 700) "text")`.
     pub(crate) data: &'static str,
 }
@@ -106,6 +108,8 @@ impl Default for Wat {
             http_call_response: None,
             log: None,
             tick: None,
+            queue_ready: None,
+            delete: "",
             data: "",
         }
     }
@@ -194,6 +198,11 @@ pub(crate) fn wat_guest(label: &str, guest: Wat) -> PathBuf {
             Some(body) => export_with_no_result("proxy_on_tick", "i32", Some(body)),
             None => String::new(),
         },
+        match guest.queue_ready {
+            Some(body) => export_with_no_result("proxy_on_queue_ready", "i32 i32", Some(body)),
+            None => String::new(),
+        },
+        export_with_no_result("proxy_on_delete", "i32", Some(guest.delete)),
     ]
     .join("\n");
     let wat = TEMPLATE.replace("\nCALLBACKS\n", &format!("\n{callbacks}\n"));

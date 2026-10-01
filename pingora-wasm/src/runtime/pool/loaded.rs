@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! A started guest in its slot, and what it reports to the root callback thread after each
 //! call.
 

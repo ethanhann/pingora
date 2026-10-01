@@ -107,19 +107,30 @@ mod tests {
     }
 
     #[test]
-    fn a_period_of_zero_stops_the_ticks_of_its_guest_only() {
+    fn a_period_of_zero_stops_the_ticks() {
         let mut schedule = TickSchedule::default();
         let start = Instant::now();
-        let old = address(0, GuestId::next());
+        let slot = address(0, GuestId::next());
+        schedule.set_period(slot, Some(Duration::from_millis(100)), start);
+
+        schedule.set_period(slot, None, start);
+
+        assert_eq!(schedule.next_due(), None);
+    }
+
+    #[test]
+    fn a_period_of_zero_from_a_replaced_guest_keeps_the_ticks_of_the_new_guest() {
+        let mut schedule = TickSchedule::default();
+        let start = Instant::now();
         let new = address(0, GuestId::next());
         schedule.set_period(new, Some(Duration::from_millis(100)), start);
 
-        schedule.set_period(old, None, start);
-        let kept = schedule.next_due();
-        schedule.set_period(new, None, start);
+        schedule.set_period(address(0, GuestId::next()), None, start);
 
-        assert_eq!(kept, Some(start + Duration::from_millis(100)));
-        assert_eq!(schedule.next_due(), None);
+        assert_eq!(
+            schedule.next_due(),
+            Some(start + Duration::from_millis(100))
+        );
     }
 
     #[test]

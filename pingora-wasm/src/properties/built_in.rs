@@ -28,14 +28,22 @@ pub(crate) struct RequestFacts {
     pub(crate) client_address: Option<SocketAddr>,
     pub(crate) server_address: Option<SocketAddr>,
     pub(crate) tls: Option<TlsFacts>,
-    /// The time that `request_filter` started, as a wall time and as a monotonic time.
-    pub(crate) start: Option<(SystemTime, Instant)>,
+    pub(crate) start: Option<RequestStart>,
     pub(crate) request_body_bytes: usize,
     pub(crate) upstream_address: Option<SocketAddr>,
     /// The status of the response, which `response_filter` records.
     pub(crate) response_code: Option<u16>,
     /// Facts that are known only in `logging`.
     pub(crate) logging: Option<LoggingFacts>,
+}
+
+/// The time that `request_filter` started.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RequestStart {
+    /// The wall time, for `request.time`.
+    pub(crate) wall: SystemTime,
+    /// The monotonic time, for `request.duration`.
+    pub(crate) monotonic: Instant,
 }
 
 #[derive(Debug)]
@@ -102,7 +110,7 @@ pub(crate) fn read_built_in(
         b"request\0time" => {
             let since_epoch = facts
                 .start
-                .and_then(|(wall, _)| wall.duration_since(SystemTime::UNIX_EPOCH).ok());
+                .and_then(|start| start.wall.duration_since(SystemTime::UNIX_EPOCH).ok());
             write_int(since_epoch.map(duration_nanos), out)
         }
         b"request\0size" => {
@@ -111,7 +119,11 @@ pub(crate) fn read_built_in(
             write_int(size, out)
         }
         b"request\0duration" => write_int(
-            facts.logging.as_ref().and_then(|l| l.duration).map(duration_nanos),
+            facts
+                .logging
+                .as_ref()
+                .and_then(|l| l.duration)
+                .map(duration_nanos),
             out,
         ),
         b"response\0code" => {
@@ -267,11 +279,8 @@ mod tests {
     }
 
     #[test]
-    fn a_property_with_no_value_now_is_not_found() {
-        let facts = RequestFacts {
-            client_address: None,
-            ..RequestFacts::default()
-        };
+    fn a_property_with_no_value_yet_is_not_found() {
+        let facts = RequestFacts::default();
 
         for key in [
             &b"source\0address"[..],

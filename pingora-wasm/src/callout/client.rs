@@ -17,6 +17,7 @@
 use super::result::{connect_failure, session_failure, OwnedHeaderPairs, PSEUDO_STATUS};
 use super::{AcceptedCallout, CalloutResult, CalloutTarget, CalloutUpstreams};
 use crate::metrics::{CalloutFailure, WasmMetricSink};
+use crate::WasmServices;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use http::StatusCode;
@@ -52,6 +53,16 @@ struct ResponseInProgress {
     session: HttpSession,
     peer: Box<HttpPeer>,
     headers: OwnedHeaderPairs,
+}
+
+impl ConnectorSender {
+    pub(crate) fn new(connector: Arc<Connector>, services: &WasmServices) -> Self {
+        ConnectorSender {
+            connector,
+            upstreams: services.callout_upstreams.clone(),
+            metric_sink: services.metric_sink.clone(),
+        }
+    }
 }
 
 #[async_trait]

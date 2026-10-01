@@ -16,7 +16,7 @@ use super::ctx::PluginRecord;
 use super::slot::LockedSlot;
 use super::wait::{CalloutWaitOutcome, PausedPhase};
 use super::{RequestOutcome, ResponseProgress, WasmCtx};
-use crate::properties::built_in::TlsFacts;
+use crate::properties::built_in::{RequestStart, TlsFacts};
 use crate::stream::PluginResponse;
 use http::uri::Scheme;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
@@ -158,7 +158,10 @@ impl WasmCtx {
         facts.server_address = session.server_addr().and_then(|a| a.as_inet()).copied();
         let tls = session.digest().and_then(|d| d.ssl_digest.as_deref());
         facts.tls = tls.map(TlsFacts::new);
-        facts.start = Some((SystemTime::now(), Instant::now()));
+        facts.start = Some(RequestStart {
+            wall: SystemTime::now(),
+            monotonic: Instant::now(),
+        });
     }
 }
 

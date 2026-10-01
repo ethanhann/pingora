@@ -290,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn two_runtimes_on_one_sink_share_a_metric_with_their_vm_id_as_label() {
+    fn two_vm_ids_on_one_sink_share_a_family_with_the_vm_id_as_label() {
         let registry = Registry::new();
         let sink = PrometheusMetricSink::new(registry.clone()).unwrap();
         let first = sink.metric_defined(&metric("a", "requests", WasmMetricKind::Counter));
@@ -305,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn a_name_with_another_type_or_another_plugin_name_is_not_published() {
+    fn a_name_with_another_type_or_the_same_prometheus_name_is_not_published() {
         let sink = PrometheusMetricSink::new(Registry::new()).unwrap();
         sink.metric_defined(&metric("a", "a.b", WasmMetricKind::Counter));
 

@@ -31,15 +31,17 @@ use crate::callout::ConnectorSender;
 use crate::chain::WasmChain;
 use crate::properties::WasmProperties;
 use crate::root_callbacks::RootCallbackThread;
-use pool::events::RootCallbackEvent;
 use crate::stream::RootCallbackConf;
+use once_cell::sync::OnceCell;
 use pingora_core::connectors::http::Connector;
 use pingora_error::{Error, ErrorType, OrErr, Result};
+use pool::events::RootCallbackEvent;
 use pool::{GuestPool, GuestPoolConf};
-use proxy_wasm_host::abi::v0_2_1::{GuestSpec, Host, InMemoryStore, SharedServices};
+use proxy_wasm_host::abi::v0_2_1::{
+    GuestSpec, Host, InMemoryStoreLimits, QueueEnqueued, SharedServices,
+};
 use proxy_wasm_host::{Engine, EngineConfig, Module};
 use shared_store::SharedStore;
-use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -100,16 +102,11 @@ impl WasmRuntime {
             .callout_connector
             .clone()
             .unwrap_or_else(|| Arc::new(Connector::new(None)));
-        let request = Arc::new(ConnectorSender {
-            connector,
-            upstreams: services.callout_upstreams.clone(),
-            metric_sink: services.metric_sink.clone(),
-        });
-        let root = Arc::new(ConnectorSender {
-            connector: Arc::new(Connector::new(None)),
-            upstreams: services.callout_upstreams.clone(),
-            metric_sink: services.metric_sink.clone(),
-        });
+        let request = Arc::new(ConnectorSender::new(connector, &services));
+        // A callout from the root callback thread opens its connections on the tokio runtime of
+        // that thread, which stops with this runtime, so it has a connector of its own
+        let root_connector = Arc::new(Connector::new(None));
+        let root = Arc::new(ConnectorSender::new(root_connector, &services));
         Self::new_with_callout_senders(plugins, services, CalloutSenders { request, root })
     }
 
@@ -159,11 +156,15 @@ impl WasmRuntime {
             Host::new(&engine).or_err(ErrorType::InternalError, "failed to link the host")?;
         let root_callbacks = RootCallbackThread::new();
         let queue_items = root_callbacks.sender();
-        let store = InMemoryStore::new().with_enqueue_observer(Arc::new(move |item| {
+        let enqueue_observer = Arc::new(move |item: QueueEnqueued<'_>| {
             let _ = queue_items.send(RootCallbackEvent::QueueItem(item.queue));
-        }));
-        let shared: Arc<dyn SharedServices> =
-            Arc::new(SharedStore::new(store, services.metric_sink));
+        });
+        let limits = InMemoryStoreLimits::default();
+        let shared: Arc<dyn SharedServices> = Arc::new(SharedStore::new(
+            limits,
+            enqueue_observer,
+            services.metric_sink.clone(),
+        ));
         let fixed_properties = Arc::new(services.fixed_properties);
         let pools = with_ticker(&engine, || {
             plugins

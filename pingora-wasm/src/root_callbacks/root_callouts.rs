@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! The callouts that no request waits for.
 
 use crate::callout::{AcceptedCallout, CalloutResult, PendingResult};
@@ -86,7 +85,9 @@ impl RootCallouts {
     /// `address`. Only the callouts that are in flight here are recorded, because a callout of
     /// a request sends its result nowhere.
     pub(super) fn end(&mut self, address: GuestAddress, ids: &[CalloutId]) {
-        let in_flight = ids.iter().filter(|id| self.in_flight.contains(&(address, **id)));
+        let in_flight = ids
+            .iter()
+            .filter(|id| self.in_flight.contains(&(address, **id)));
         let ended: Vec<_> = in_flight.map(|id| (address, *id)).collect();
         self.ended.extend(ended);
     }

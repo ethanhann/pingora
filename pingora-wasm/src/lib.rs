@@ -299,10 +299,10 @@ pub use metrics::{
     CalloutFailure, PrometheusMetricSink, WasmMetric, WasmMetricKind, WasmMetricRecorder,
     WasmMetricSink,
 };
-pub use properties::{WasmProperties, WasmPropertyValue};
 /// The `prometheus` crate that [PrometheusMetricSink] uses, so that you pass a registry of the
 /// same version.
 pub use prometheus;
+pub use properties::{WasmProperties, WasmPropertyValue};
 pub use proxy_wasm_host::abi::v0_2_1::types::LogLevel;
 pub use proxy_wasm_host::abi::v0_2_1::{LogContext, LogSink};
 pub use proxy_wasm_host::Limits;

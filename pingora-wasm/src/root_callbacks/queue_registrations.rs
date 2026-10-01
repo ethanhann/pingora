@@ -115,10 +115,11 @@ mod tests {
         let slot_1 = registrant(0, 1);
         register(&mut registrations, slot_0);
         register(&mut registrations, slot_1);
+
         register(&mut registrations, slot_0);
 
+        assert_eq!(registrations.last_registrant(queue()), Some(slot_0));
         registrations.remove(queue(), slot_0);
-
         assert_eq!(registrations.last_registrant(queue()), Some(slot_1));
     }
 

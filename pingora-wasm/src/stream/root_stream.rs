@@ -166,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fixed_property_reads_and_others_are_not_found() {
+    fn a_fixed_property_is_found_and_another_path_is_not() {
         let mut fixed = WasmProperties::new();
         fixed.insert(&["node", "name"], "edge-1");
         let mut stream = root_stream("fixed", fixed);

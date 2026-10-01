@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! The state of the root callback thread: what it waits for, and what is due.
 
 use super::queue_registrations::QueueRegistrations;

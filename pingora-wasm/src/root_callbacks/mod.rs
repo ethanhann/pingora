@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! The thread that calls the guests when no request runs: ticks, queue wakes, the results of
 //! the callouts that no request waits for, and the end of the contexts that guests held.
 //!
@@ -126,40 +125,51 @@ fn run(
 
 #[cfg(test)]
 mod tests {
+    use crate::metrics::PrometheusMetricSink;
+    use crate::test_support::callouts::{authz_services, callout_ctx_with_services, FixedSender};
     use crate::test_support::{
-        crate_log_lines_with, plugin, record_crate_logs, wat_guest, RecordedGuestLogs, Wat,
+        crate_log_lines_with, plugin, record_crate_logs, session, wat_guest, RecordedGuestLogs,
+        Wat, GET,
     };
-    use crate::{WasmProperties, WasmRuntime, WasmServices};
+    use crate::{WasmRuntime, WasmServices};
+    use parking_lot::Mutex;
+    use proxy_wasm_host::abi::v0_2_1::types::LogLevel;
+    use proxy_wasm_host::abi::v0_2_1::{GuestId, LogContext, LogSink};
+    use std::collections::HashSet;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
+    use tokio::sync::Notify;
 
-    const TICK_EVERY_200_MS: &str = "(drop (call $set_tick_period (i32.const 200))) i32.const 1";
     const TICK_EVERY_20_MS: &str = "(drop (call $set_tick_period (i32.const 20))) i32.const 1";
+    const LOG_TICK: &str = "(call $log_tick)";
 
-    fn runtime_with_logs(
-        label: &str,
-        wat: Wat,
-        slots: usize,
-    ) -> (WasmRuntime, Arc<RecordedGuestLogs>) {
-        runtime_with_services(label, wat, slots, WasmServices::default())
+    /// The guest log lines, with the guest that wrote each one.
+    #[derive(Default)]
+    struct LinesByGuest(Mutex<Vec<(GuestId, String)>>);
+
+    impl LogSink for LinesByGuest {
+        fn log(&self, context: LogContext<'_>, _level: LogLevel, message: &[u8]) {
+            let line = String::from_utf8_lossy(message).into_owned();
+            self.0.lock().push((context.guest, line));
+        }
     }
 
-    fn runtime_with_services(
+    fn runtime_with_logs<S: LogSink + Default + 'static>(
         label: &str,
         wat: Wat,
         slots: usize,
-        mut services: WasmServices,
-    ) -> (WasmRuntime, Arc<RecordedGuestLogs>) {
-        let logs = Arc::new(RecordedGuestLogs::default());
+    ) -> (WasmRuntime, Arc<S>) {
+        let logs = Arc::new(S::default());
+        let mut services = WasmServices::default();
         services.log_sink = logs.clone();
         let conf = plugin(label, wat_guest(label, wat), slots);
         let runtime = WasmRuntime::new_with_services(vec![conf], services).unwrap();
         (runtime, logs)
     }
 
-    fn lines(logs: &RecordedGuestLogs, text: &str) -> usize {
+    fn count_lines_with(logs: &RecordedGuestLogs, text: &str) -> usize {
         logs.0
             .lock()
             .iter()
@@ -176,18 +186,45 @@ mod tests {
     }
 
     #[test]
-    fn each_slot_gets_its_own_tick_in_each_period() {
+    fn each_slot_gets_its_own_ticks() {
         let wat = Wat {
-            configure: TICK_EVERY_200_MS,
-            tick: Some("(call $log_tick)"),
+            configure: TICK_EVERY_20_MS,
+            tick: Some(LOG_TICK),
             ..Wat::default()
         };
-        let (runtime, logs) = runtime_with_logs("two-slot-ticks", wat, 2);
+        let (runtime, logs) = runtime_with_logs::<LinesByGuest>("two-slot-ticks", wat, 2);
 
         runtime.inner.start_threads().unwrap();
-        thread::sleep(Duration::from_millis(300));
 
-        assert_eq!(lines(&logs, "tick"), 2);
+        let guests_that_ticked = || {
+            logs.0
+                .lock()
+                .iter()
+                .map(|(guest, _)| *guest)
+                .collect::<HashSet<_>>()
+        };
+        assert!(wait_until(|| guests_that_ticked().len() == 2));
+    }
+
+    #[test]
+    fn a_tick_waits_for_a_slot_that_a_request_holds() {
+        let wat = Wat {
+            configure: TICK_EVERY_20_MS,
+            tick: Some(LOG_TICK),
+            ..Wat::default()
+        };
+        let (runtime, logs) = runtime_with_logs::<RecordedGuestLogs>("busy-slot", wat, 1);
+        runtime.inner.start_threads().unwrap();
+        assert!(wait_until(|| count_lines_with(&logs, "tick") > 0));
+        let pool = &runtime.inner.pools[0];
+        let guard = pool.lock_slot(0);
+        let while_locked = count_lines_with(&logs, "tick");
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(count_lines_with(&logs, "tick"), while_locked);
+
+        drop(guard);
+
+        assert!(wait_until(|| count_lines_with(&logs, "tick") > while_locked));
     }
 
     #[test]
@@ -198,7 +235,7 @@ mod tests {
             tick: Some("unreachable"),
             ..Wat::default()
         };
-        let (runtime, _logs) = runtime_with_logs("trap-in-tick", wat, 1);
+        let (runtime, _logs) = runtime_with_logs::<RecordedGuestLogs>("trap-in-tick", wat, 1);
 
         runtime.inner.start_threads().unwrap();
 
@@ -207,8 +244,31 @@ mod tests {
     }
 
     #[test]
+    fn a_tick_reads_empty_header_pairs_and_continues_with_ok() {
+        let wat = Wat {
+            data: r#"(data (i32.const 700) "pairs ok") (data (i32.const 710) "continue ok")"#,
+            configure: TICK_EVERY_20_MS,
+            tick: Some(
+                "(if (i32.eqz (call $get_pairs (i32.const 0) (i32.const 512) (i32.const 516)))
+                    (then (drop (call $log (i32.const 2) (i32.const 700) (i32.const 8)))))
+                (if (i32.eqz (call $continue_stream (i32.const 0)))
+                    (then (drop (call $log (i32.const 2) (i32.const 710) (i32.const 11)))))",
+            ),
+            ..Wat::default()
+        };
+        let (runtime, logs) =
+            runtime_with_logs::<RecordedGuestLogs>("tick-with-no-request", wat, 1);
+
+        runtime.inner.start_threads().unwrap();
+
+        assert!(wait_until(|| count_lines_with(&logs, "pairs ok") > 0));
+        assert!(wait_until(|| count_lines_with(&logs, "continue ok") > 0));
+    }
+
+    #[test]
     fn the_thread_ends_when_the_runtime_drops() {
-        let (runtime, _logs) = runtime_with_logs("thread-end", Wat::default(), 1);
+        let (runtime, _logs) =
+            runtime_with_logs::<RecordedGuestLogs>("thread-end", Wat::default(), 1);
         runtime.inner.start_threads().unwrap();
         let running = runtime.inner.root_callbacks.running.clone();
         assert!(wait_until(|| running.load(Ordering::Relaxed)));
@@ -218,20 +278,109 @@ mod tests {
         assert!(wait_until(|| !running.load(Ordering::Relaxed)));
     }
 
-    #[test]
-    fn a_plugin_reads_a_fixed_property_when_it_is_configured() {
+    #[tokio::test]
+    async fn a_context_held_after_a_drop_ends_with_no_proxy_on_log() {
         let wat = Wat {
-            data: r#"(data (i32.const 700) "node\00name")"#,
-            configure: "(call $log_property (i32.const 700) (i32.const 9)) i32.const 1",
+            data: r#"(data (i32.const 700) "logged") (data (i32.const 710) "deleted")"#,
+            configure: TICK_EVERY_20_MS,
+            done: "(i32.store (i32.const 608) (local.get 0)) i32.const 0",
+            tick: Some(
+                "(if (i32.load (i32.const 608)) (then
+                    (drop (call $set_effective_context (i32.load (i32.const 608))))
+                    (drop (call $done))
+                    (i32.store (i32.const 608) (i32.const 0))))",
+            ),
+            log: Some("(drop (call $log (i32.const 2) (i32.const 700) (i32.const 6)))"),
+            delete: "(drop (call $log (i32.const 2) (i32.const 710) (i32.const 7)))",
             ..Wat::default()
         };
+        let (runtime, logs) = runtime_with_logs::<RecordedGuestLogs>("a", wat, 1);
+        let mut ctx = runtime.chain(&["a"]).unwrap().new_ctx();
+        let (mut session, _client) = session(GET).await;
+        ctx.request_filter(&mut session).await.unwrap();
+
+        drop(ctx);
+
+        assert!(wait_until(|| count_lines_with(&logs, "deleted") == 1));
+        assert_eq!(runtime.held_contexts(), 0);
+        assert_eq!(count_lines_with(&logs, "logged"), 0);
+    }
+
+    #[test]
+    fn a_root_callout_result_for_a_replaced_guest_is_dropped() {
+        let gate = Arc::new(Notify::new());
+        let sender = FixedSender::responds_after("ok", gate.clone());
+        let wat = Wat {
+            configure: "(call $call_and_log_status) i32.const 1",
+            http_call_response: Some("(call $log_result (local.get 2))"),
+            ..Wat::default()
+        };
+        let logs = Arc::new(RecordedGuestLogs::default());
+        let mut services = authz_services();
+        services.log_sink = logs.clone();
+        let conf = plugin("replaced", wat_guest("replaced", wat), 1);
+        let (runtime, _ctx) = callout_ctx_with_services(vec![conf], sender.clone(), services);
+        runtime.inner.start_threads().unwrap();
+        assert!(wait_until(|| sender.sent_count() == 1));
+        runtime.inner.pools[0].replace_slot(0);
+        assert!(wait_until(|| sender.sent_count() == 2));
+
+        gate.notify_waiters();
+
+        assert!(wait_until(|| count_lines_with(&logs, "response") == 1));
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(count_lines_with(&logs, "response"), 1);
+    }
+
+    #[tokio::test]
+    async fn plugins_with_one_vm_id_share_a_queue_and_a_counter() {
+        let configure = "(drop (call $register_queue (i32.const 700) (i32.const 1) (i32.const 640)))
+            (drop (call $define_metric (i32.const 0) (i32.const 720) (i32.const 14) (i32.const 644)))
+            i32.const 1";
+        let data = r#"(data (i32.const 700) "q") (data (i32.const 720) "shared_counter")
+            (data (i32.const 740) "first ready") (data (i32.const 760) "second ready")"#;
+        let first = Wat {
+            data,
+            configure,
+            request_headers:
+                "(drop (call $increment_metric (i32.load (i32.const 644)) (i64.const 1)))
+                (drop (call $enqueue (i32.load (i32.const 640)) (i32.const 700) (i32.const 1)))
+                i32.const 0",
+            queue_ready: Some("(drop (call $log (i32.const 2) (i32.const 740) (i32.const 11)))"),
+            ..Wat::default()
+        };
+        let second = Wat {
+            request_headers: "(drop (call $increment_metric (i32.load (i32.const 644)) (i64.const 1))) i32.const 0",
+            queue_ready: Some("(drop (call $log (i32.const 2) (i32.const 760) (i32.const 12)))"),
+            ..first
+        };
+        let registry = prometheus::Registry::new();
+        let logs = Arc::new(RecordedGuestLogs::default());
         let mut services = WasmServices::default();
-        let mut fixed = WasmProperties::new();
-        fixed.insert(&["node", "name"], "edge-1");
-        services.fixed_properties = fixed;
+        services.log_sink = logs.clone();
+        services.metric_sink = Arc::new(PrometheusMetricSink::new(registry.clone()).unwrap());
+        let mut plugins = vec![
+            plugin("first", wat_guest("shared-first", first), 1),
+            plugin("second", wat_guest("shared-second", second), 1),
+        ];
+        for conf in &mut plugins {
+            conf.vm_id = "shared".to_string();
+        }
+        let runtime = WasmRuntime::new_with_services(plugins, services).unwrap();
+        let mut ctx = runtime.chain(&["first", "second"]).unwrap().new_ctx();
+        let (mut session, _client) = session(GET).await;
 
-        let (_runtime, logs) = runtime_with_services("fixed-in-configure", wat, 1, services);
+        ctx.request_filter(&mut session).await.unwrap();
 
-        assert_eq!(lines(&logs, "edge-1"), 1);
+        assert!(wait_until(|| count_lines_with(&logs, "second ready") == 1));
+        assert_eq!(count_lines_with(&logs, "first ready"), 0);
+        let mut output = Vec::new();
+        let encoder = prometheus::TextEncoder::new();
+        prometheus::Encoder::encode(&encoder, &registry.gather(), &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("shared_counter{vm_id=\"shared\"} 2"),
+            "{output}"
+        );
     }
 }

@@ -33,7 +33,7 @@ impl WasmCtx {
         let mut response = session.response_written().cloned();
         let facts = &mut self.stream().facts;
         facts.request_body_bytes = session.body_bytes_read();
-        let start = facts.start.map(|(_, at)| at);
+        let start = facts.start.map(|start| start.monotonic);
         facts.logging = Some(LoggingFacts {
             duration: start.map(|at| at.elapsed()),
             response_body_bytes: session.body_bytes_sent(),

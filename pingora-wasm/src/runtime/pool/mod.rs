@@ -25,8 +25,8 @@ pub(crate) use loaded::Loaded;
 
 use crate::callout::PluginCalloutConf;
 use crate::plugin_unavailable;
-use events::RootCallbackSender;
 use crate::stream::RootCallbackConf;
+use events::RootCallbackSender;
 use guest_start::StartedGuest;
 use log::{error, info, warn};
 use parking_lot::{Mutex, MutexGuard};
@@ -410,5 +410,29 @@ mod tests {
 
         assert_eq!(picked, Some(1));
         assert!(pool.lock_slot(0).is_none());
+    }
+
+    #[test]
+    fn a_plugin_reads_a_fixed_property_when_it_is_configured() {
+        let wat = Wat {
+            data: r#"(data (i32.const 700) "node\00name")"#,
+            configure: "(call $log_property (i32.const 700) (i32.const 9)) i32.const 1",
+            ..Wat::default()
+        };
+        let logs = Arc::new(crate::test_support::RecordedGuestLogs::default());
+        let mut services = crate::WasmServices::default();
+        services.log_sink = logs.clone();
+        services
+            .fixed_properties
+            .insert(&["node", "name"], "edge-1");
+        let conf = plugin(
+            "fixed-in-configure",
+            crate::test_support::wat_guest("fixed", wat),
+            1,
+        );
+
+        let _runtime = WasmRuntime::new_with_services(vec![conf], services).unwrap();
+
+        assert_eq!(*logs.0.lock(), ["edge-1"]);
     }
 }

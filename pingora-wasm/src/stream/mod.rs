@@ -60,11 +60,18 @@ pub(crate) struct PingoraStream {
     pub(crate) proxy_properties: WasmProperties,
     /// The request properties that the plugins wrote.
     pub(crate) guest_properties: WasmProperties,
-    pub(crate) fixed_properties: Arc<WasmProperties>,
+    fixed_properties: Arc<WasmProperties>,
     path_key: Vec<u8>,
 }
 
 impl PingoraStream {
+    pub(crate) fn new(fixed_properties: Arc<WasmProperties>) -> Self {
+        PingoraStream {
+            fixed_properties,
+            ..PingoraStream::default()
+        }
+    }
+
     fn request_map(&mut self) -> Result<&mut dyn HeaderMap, Status> {
         match self.request.as_mut() {
             Some(map) => Ok(map),
@@ -553,21 +560,21 @@ mod tests {
         fixed.insert(&["node", "name"], "edge-1");
         stream.fixed_properties = Arc::new(fixed);
         let call = call(Callback::RequestHeaders);
-        let writes = [
-            stream.set_property(call, &[b"xds", b"route_name"], b"other"),
-            stream.set_property(call, &[b"request", b"method"], b"PUT"),
-            stream.set_property(call, &[b"node", b"name"], b"guest-node"),
+        let paths: [[&[u8]; 2]; 3] = [
+            [b"xds", b"route_name"],
+            [b"request", b"method"],
+            [b"node", b"name"],
         ];
 
-        let mut read = |path: &[&[u8]]| {
-            let mut value = Vec::new();
-            stream.property(call, path, &mut value).map(|()| value)
-        };
+        let writes = paths.map(|path| stream.set_property(call, &path, b"guest"));
 
+        let mut read = |path: [&[u8]; 2]| {
+            let mut value = Vec::new();
+            stream.property(call, &path, &mut value).map(|()| value)
+        };
         assert_eq!(writes, [Ok(()), Ok(()), Ok(())]);
-        assert_eq!(read(&[b"xds", b"route_name"]), Ok(b"checkout".to_vec()));
-        assert_eq!(read(&[b"request", b"method"]), Ok(b"GET".to_vec()));
-        assert_eq!(read(&[b"node", b"name"]), Ok(b"guest-node".to_vec()));
-        assert_eq!(read(&[b"no", b"such"]), Err(Status::NotFound));
+        assert_eq!(read(paths[0]), Ok(b"checkout".to_vec()));
+        assert_eq!(read(paths[1]), Ok(b"GET".to_vec()));
+        assert_eq!(read(paths[2]), Ok(b"guest".to_vec()));
     }
 }

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! The work of the root callback thread, and the guest call that each piece of work makes.
 
 use super::callback_loop::RootCallbackLoop;

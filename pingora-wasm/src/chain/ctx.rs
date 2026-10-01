@@ -85,8 +85,7 @@ impl fmt::Debug for WasmCtx {
 impl WasmCtx {
     pub(crate) fn new(chain: WasmChain) -> Self {
         let records = vec![None; chain.plugins.len()];
-        let mut stream = PingoraStream::default();
-        stream.fixed_properties = chain.runtime.fixed_properties.clone();
+        let stream = PingoraStream::new(chain.runtime.fixed_properties.clone());
         WasmCtx {
             response_progress: ResponseProgress::NotStarted,
             request_body: RequestBodyState::new(),
@@ -250,6 +249,7 @@ mod tests {
         add_request_header, fixture, one_plugin, plugin, session, wat_guest, Wat, GET,
     };
     use crate::WasmRuntime;
+    use proxy_wasm_host::abi::v0_2_1::{Invocation, StreamState};
     use std::sync::Arc;
 
     fn open_context(runtime: &WasmRuntime, ctx: &mut WasmCtx) {
@@ -339,5 +339,27 @@ mod tests {
         drop(ctx);
 
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn a_later_upstream_replaces_the_upstream_properties() {
+        let (_runtime, mut ctx) = one_plugin(add_request_header());
+        let first = HttpPeer::new("10.0.0.1:8080", false, String::new());
+        let retry = HttpPeer::new("10.0.0.2:9090", false, String::new());
+        ctx.upstream_connected(&first);
+
+        ctx.upstream_connected(&retry);
+
+        let call = Invocation::new(GuestId::next(), ContextId::try_from(1).unwrap());
+        let mut address = Vec::new();
+        let mut port = Vec::new();
+        let address_path: [&[u8]; 2] = [b"upstream", b"address"];
+        let port_path: [&[u8]; 2] = [b"upstream", b"port"];
+        ctx.stream()
+            .property(call, &address_path, &mut address)
+            .unwrap();
+        ctx.stream().property(call, &port_path, &mut port).unwrap();
+        assert_eq!(address, b"10.0.0.2:9090");
+        assert_eq!(port, 9090_i64.to_le_bytes());
     }
 }
