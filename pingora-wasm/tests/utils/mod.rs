@@ -45,8 +45,11 @@ pub fn fixture(name: &str) -> PathBuf {
         .join(format!("{name}.wasm"))
 }
 
-/// Each guest log message so far, with the name of its plugin.
-static GUEST_MESSAGES: Lazy<Mutex<Vec<(String, Vec<u8>)>>> = Lazy::new(|| Mutex::new(Vec::new()));
+/// A guest log message, with the name of its plugin.
+type GuestMessage = (String, Vec<u8>);
+
+/// Each guest log message so far.
+static GUEST_MESSAGES: Lazy<Mutex<Vec<GuestMessage>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 /// The log sink of every runtime of the test server.
 pub struct RecordedGuestMessages;

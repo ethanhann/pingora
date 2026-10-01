@@ -420,11 +420,13 @@ mod tests {
             ..Wat::default()
         };
         let logs = Arc::new(crate::test_support::RecordedGuestLogs::default());
-        let mut services = crate::WasmServices::default();
-        services.log_sink = logs.clone();
-        services
-            .fixed_properties
-            .insert(&["node", "name"], "edge-1");
+        let mut fixed_properties = crate::WasmProperties::new();
+        fixed_properties.insert(&["node", "name"], "edge-1");
+        let services = crate::WasmServices {
+            log_sink: logs.clone(),
+            fixed_properties,
+            ..crate::WasmServices::default()
+        };
         let conf = plugin(
             "fixed-in-configure",
             crate::test_support::wat_guest("fixed", wat),
