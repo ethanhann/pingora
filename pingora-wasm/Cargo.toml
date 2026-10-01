@@ -29,15 +29,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
 parking_lot = "0.12"
-tokio = { workspace = true, features = ["rt", "sync"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "net", "macros"] }
 tracing = { version = "0.1", features = ["log"] }
+futures = { workspace = true }
+once_cell = { workspace = true }
+prometheus = "0.14"
 
 [dev-dependencies]
 pingora-load-balancing = { version = "0.9.0", path = "../pingora-load-balancing", default-features = false }
 pingora-test-utils = { version = "0.9.0", path = "../pingora-test-utils" }
+pingora-prometheus = { version = "0.9.0", path = "../pingora-prometheus" }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
-once_cell = { workspace = true }
-futures = { workspace = true }
 h2 = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["http2"] }
 wat = "1"

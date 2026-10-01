@@ -18,7 +18,7 @@ mod proxy;
 pub mod raw;
 mod services;
 
-pub use services::callout_origin;
+pub use services::{callout_origin, metrics_output};
 
 use bytes::Bytes;
 use http::{Request, Response};
@@ -37,7 +37,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const FIRST_PORT: u16 = 6380;
-pub const LAST_PORT: u16 = 6402;
+pub const LAST_PORT: u16 = 6412;
 
 pub fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

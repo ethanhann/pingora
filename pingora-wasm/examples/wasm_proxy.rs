@@ -14,14 +14,15 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use pingora_core::protocols::Digest;
 use pingora_core::server::Server;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{Error, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use pingora_wasm::{
-    write_plugin_response, RequestOutcome, StaticCalloutUpstreams, WasmChain, WasmCtx,
-    WasmPluginConf, WasmRuntime, WasmServices,
+    write_plugin_response, PrometheusMetricSink, RequestOutcome, StaticCalloutUpstreams, WasmChain,
+    WasmCtx, WasmPluginConf, WasmRuntime, WasmServices,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -65,6 +66,20 @@ impl ProxyHttp for PluginProxy {
         ctx.upstream_attempt();
         let peer = HttpPeer::new(("httpbin.org", 80), false, "httpbin.org".into());
         Ok(Box::new(peer))
+    }
+
+    async fn connected_to_upstream(
+        &self,
+        _session: &mut Session,
+        _reused: bool,
+        peer: &HttpPeer,
+        #[cfg(unix)] _fd: std::os::unix::io::RawFd,
+        #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
+        _digest: Option<&Digest>,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        ctx.upstream_connected(peer);
+        Ok(())
     }
 
     async fn upstream_request_filter(
@@ -140,6 +155,8 @@ impl ProxyHttp for PluginProxy {
 //
 // When a plugin fails, the host crate logs a warning too. To hide it, use
 // RUST_LOG=info,proxy_wasm_host=error
+//
+// The metrics of the plugins are at 127.0.0.1:6192/metrics
 fn main() {
     env_logger::init();
 
@@ -179,6 +196,8 @@ fn main() {
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let mut services = WasmServices::default();
     services.callout_upstreams = Arc::new(upstreams);
+    let registry = pingora_prometheus::prometheus::default_registry().clone();
+    services.metric_sink = Arc::new(PrometheusMetricSink::new(registry).unwrap());
     let runtime = WasmRuntime::new_with_services(plugins, services).unwrap();
     let chain = runtime.chain(&names).unwrap();
 
@@ -186,6 +205,10 @@ fn main() {
         pingora_proxy::http_proxy_service(&my_server.configuration, PluginProxy { chain });
     my_proxy.add_tcp("127.0.0.1:6190");
 
+    let mut metrics = pingora_prometheus::prometheus_http_service();
+    metrics.add_tcp("127.0.0.1:6192");
+
     my_server.add_service(my_proxy);
+    my_server.add_service(metrics);
     my_server.run_forever();
 }

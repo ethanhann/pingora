@@ -65,7 +65,7 @@ impl WasmCtx {
         if !end_of_stream && body.as_ref().is_none_or(Bytes::is_empty) {
             return Ok(());
         }
-        self.chain.runtime.start_ticker()?;
+        self.chain.runtime.start_threads()?;
         let chunk = body.take().unwrap_or_default();
         let outcome = self
             .run_body_callbacks(session, BodyDirection::Response, chunk, end_of_stream)

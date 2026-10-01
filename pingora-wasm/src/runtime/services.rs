@@ -19,11 +19,15 @@ use crate::callout::{
     AcceptedCallout, CalloutResult, CalloutSender, CalloutUpstreams, PendingResult,
     StaticCalloutUpstreams,
 };
+use crate::metrics::{CalloutFailure, NoMetricSink, WasmMetricSink};
+use crate::properties::WasmProperties;
+use futures::FutureExt;
 use log::warn;
 use pingora_core::connectors::http::Connector;
 use pingora_error::{Error, ErrorType, Result};
 use proxy_wasm_host::abi::v0_2_1::LogSink;
 use std::fmt;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
@@ -47,12 +51,23 @@ pub struct WasmServices {
     ///
     /// When you replace a runtime to reload plugins, pass the connector of the old runtime to
     /// the new one to keep the connections.
+    ///
+    /// Callouts from ticks and other root callbacks use a connector of their own with the default
+    /// options, because they run on a thread that stops with the runtime.
     pub callout_connector: Option<Arc<Connector>>,
     /// The maximum number of callouts that the runtime sends at the same time. Default 1024.
     ///
     /// A callout over this limit is not sent, and its plugin receives a 503 response. The
     /// limit cannot be zero or more than `tokio::sync::Semaphore::MAX_PERMITS`.
     pub max_callouts_in_flight: usize,
+    /// The destination of the metrics that plugins define, and of the callouts that fail. The
+    /// default publishes nothing.
+    ///
+    /// When you replace a runtime to reload plugins, pass the same sink to the new one.
+    pub metric_sink: Arc<dyn WasmMetricSink>,
+    /// The properties of your proxy that do not change, such as `node.metadata.NAME`, which
+    /// every plugin reads. Default empty.
+    pub fixed_properties: WasmProperties,
 }
 
 impl Default for WasmServices {
@@ -62,6 +77,8 @@ impl Default for WasmServices {
             callout_upstreams: Arc::new(StaticCalloutUpstreams::new()),
             callout_connector: None,
             max_callouts_in_flight: MAX_CALLOUTS_IN_FLIGHT,
+            metric_sink: Arc::new(NoMetricSink),
+            fixed_properties: WasmProperties::new(),
         }
     }
 }
@@ -74,15 +91,30 @@ impl fmt::Debug for WasmServices {
     }
 }
 
+/// The senders of the callouts of a runtime.
+pub(crate) struct CalloutSenders {
+    /// The sender of the callouts that requests wait for.
+    pub(crate) request: Arc<dyn CalloutSender>,
+    /// The sender of the callouts that the root callback thread delivers. It has a connector
+    /// of its own, because a connection belongs to the tokio runtime that opened it, and the
+    /// runtime of that thread stops when the `WasmRuntime` drops.
+    pub(crate) root: Arc<dyn CalloutSender>,
+}
+
 /// The launcher of callout tasks for a runtime, with the limit on how many are in flight.
 pub(crate) struct CalloutLauncher {
-    sender: Arc<dyn CalloutSender>,
+    senders: CalloutSenders,
+    metric_sink: Arc<dyn WasmMetricSink>,
     in_flight_permits: Arc<Semaphore>,
     limit: usize,
 }
 
 impl CalloutLauncher {
-    pub(crate) fn new(sender: Arc<dyn CalloutSender>, limit: usize) -> Result<Self> {
+    pub(crate) fn new(
+        senders: CalloutSenders,
+        metric_sink: Arc<dyn WasmMetricSink>,
+        limit: usize,
+    ) -> Result<Self> {
         if limit == 0 || limit > Semaphore::MAX_PERMITS {
             return Error::e_explain(
                 ErrorType::InternalError,
@@ -90,7 +122,8 @@ impl CalloutLauncher {
             );
         }
         Ok(CalloutLauncher {
-            sender,
+            senders,
+            metric_sink,
             in_flight_permits: Arc::new(Semaphore::new(limit)),
             limit,
         })
@@ -101,27 +134,48 @@ impl CalloutLauncher {
         self.limit - self.in_flight_permits.available_permits()
     }
 
-    /// Start the task that sends `callout`.
+    /// Start the task that sends `callout` for a request.
     ///
     /// Return a response in place of the task for a callout over the limit, and `None` when no
     /// tokio runtime is running, so the callout cannot be sent.
     pub(crate) fn spawn(&self, callout: AcceptedCallout) -> Option<PendingResult> {
+        self.spawn_with(&self.senders.request, callout)
+    }
+
+    /// Start the task that sends `callout` for the root callback thread.
+    pub(crate) fn spawn_root(&self, callout: AcceptedCallout) -> Option<PendingResult> {
+        self.spawn_with(&self.senders.root, callout)
+    }
+
+    fn spawn_with(
+        &self,
+        sender: &Arc<dyn CalloutSender>,
+        callout: AcceptedCallout,
+    ) -> Option<PendingResult> {
+        let plugin = callout.plugin_conf.plugin_name.clone();
         let Ok(permit) = self.in_flight_permits.clone().try_acquire_owned() else {
             callout.plugin_conf.warn_of_overflow_once();
+            self.metric_sink
+                .callout_failed(&plugin, CalloutFailure::Overflow);
             return Some(PendingResult::Known(CalloutResult::overflow_response()));
         };
         let Ok(tokio_runtime) = Handle::try_current() else {
             warn!(
-                "wasm plugin {} sent a callout with no tokio runtime running, and the callout is dropped",
-                callout.plugin_conf.plugin_name
+                "wasm plugin {plugin} sent a callout with no tokio runtime running, and the callout is dropped"
             );
+            self.metric_sink
+                .callout_failed(&plugin, CalloutFailure::TaskFailed);
             return None;
         };
-        let sender = self.sender.clone();
+        let sender = sender.clone();
+        let metric_sink = self.metric_sink.clone();
         let task = tokio_runtime.spawn(async move {
-            let result = sender.send(callout).await;
+            let sent = AssertUnwindSafe(sender.send(callout)).catch_unwind().await;
             drop(permit);
-            result
+            sent.unwrap_or_else(|_| {
+                metric_sink.callout_failed(&plugin, CalloutFailure::TaskFailed);
+                CalloutResult::Failed
+            })
         });
         Some(PendingResult::FromTask(task))
     }

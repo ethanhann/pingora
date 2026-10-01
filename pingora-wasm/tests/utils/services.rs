@@ -17,7 +17,10 @@
 use super::callout_origins::{CalloutOrigin, CalloutOriginPerPlugin};
 use super::{fixture, guests};
 use once_cell::sync::Lazy;
-use pingora_wasm::{WasmPluginConf, WasmRuntime, WasmServices};
+use pingora_wasm::{
+    PrometheusMetricSink, WasmPluginConf, WasmProperties, WasmRuntime, WasmServices,
+};
+use prometheus::{Encoder, Registry, TextEncoder};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -40,8 +43,36 @@ static CALLOUT_ORIGINS: Lazy<Arc<CalloutOriginPerPlugin>> = Lazy::new(|| {
         ("relay-limit", None),
         ("relay-h1-close", None),
         ("relay-h2-close", None),
+        ("root-callout", Some("0")),
+        ("held-context", Some("0")),
+        ("relay-metric", None),
+        ("held-earlier", None),
     ])
 });
+
+/// The registry of the services that publish metrics, with the one sink that all of them use.
+static METRICS: Lazy<(Registry, Arc<PrometheusMetricSink>)> = Lazy::new(|| {
+    let registry = Registry::new();
+    let sink = Arc::new(PrometheusMetricSink::new(registry.clone()).unwrap());
+    (registry, sink)
+});
+
+/// Return the text that a Prometheus scrape of the test metrics returns.
+pub fn metrics_output() -> String {
+    let mut buffer = Vec::new();
+    TextEncoder::new()
+        .encode(&METRICS.0.gather(), &mut buffer)
+        .unwrap();
+    String::from_utf8(buffer).unwrap()
+}
+
+/// Publish the metrics of a runtime, and give it the fixed property `node.name`.
+fn with_metrics_and_node_name(services: &mut WasmServices) {
+    services.metric_sink = METRICS.1.clone();
+    let mut fixed = WasmProperties::new();
+    fixed.insert(&["node", "name"], "test-node");
+    services.fixed_properties = fixed;
+}
 
 /// Return the origin that receives the callouts of `plugin`.
 pub fn callout_origin(plugin: &str) -> Arc<CalloutOrigin> {
@@ -61,6 +92,7 @@ impl RuntimePlan {
         if self.has_callout_origins {
             services.callout_upstreams = CALLOUT_ORIGINS.clone();
         }
+        with_metrics_and_node_name(&mut services);
         WasmRuntime::new_with_services(self.plugins, services).unwrap()
     }
 }
@@ -153,6 +185,53 @@ pub fn services() -> Vec<(u16, WasmRuntime, Vec<&'static str>, Option<usize>)> {
     plans.service_with_callout_origin(6400, relay("relay-limit", limit));
     plans.service_with_callout_origin(6401, relay("relay-h1-close", limit));
     plans.service_with_callout_origin(6402, relay("relay-h2-close", None));
+    plans.service(
+        6403,
+        vec![guests::tick_logger("ticks", "tick of 6403")],
+        None,
+    );
+    plans.service(6404, vec![example(2)], None);
+    let counter = guests::request_counter("counter", "wasm_test_requests");
+    plans.service(6405, vec![counter], None);
+    let request_properties = guests::property_reader(
+        "request-properties",
+        &[
+            ("request/path", "x-path"),
+            ("request/method", "x-method"),
+            ("request/protocol", "x-protocol"),
+            ("request/scheme", "x-scheme"),
+            ("request/host", "x-host"),
+            ("source/address", "x-source"),
+            ("destination/address", "x-destination"),
+            ("xds/route_name", "x-route"),
+            ("node/name", "x-node"),
+        ],
+        &[],
+        &[],
+    );
+    plans.service(6406, vec![request_properties], None);
+    let response_properties = guests::property_reader(
+        "response-properties",
+        &[],
+        &[("upstream/address", "x-upstream")],
+        &["response/code"],
+    );
+    plans.service(6407, vec![response_properties], None);
+    let logging_properties = guests::property_reader(
+        "logging-properties",
+        &[],
+        &[],
+        &["request/size", "response/size"],
+    );
+    plans.service(6408, vec![logging_properties], None);
+    let root_callout = guests::root_callout("root-callout", "root callout response of 6409");
+    plans.service_with_callout_origin(6409, root_callout);
+    let held_context = guests::held_context("held-context", "held context of 6410 logged");
+    plans.service_with_callout_origin(6410, held_context);
+    plans.service_with_callout_origin(6411, relay("relay-metric", limit));
+    let held_earlier =
+        guests::held_context_with_an_earlier_callout("held-earlier", "held context of 6412 logged");
+    plans.service_with_callout_origin(6412, held_earlier);
 
     let runtimes: Vec<WasmRuntime> = thread::scope(|scope| {
         let builds: Vec<_> = plans

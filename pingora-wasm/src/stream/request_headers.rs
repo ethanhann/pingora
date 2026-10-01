@@ -38,7 +38,11 @@ impl RequestHeaders {
         RequestHeaders { header, scheme }
     }
 
-    fn authority(&self) -> Option<&[u8]> {
+    pub(crate) fn scheme(&self) -> &Scheme {
+        &self.scheme
+    }
+
+    pub(crate) fn authority(&self) -> Option<&[u8]> {
         let from_uri = self.header.uri.authority().map(|a| a.as_str().as_bytes());
         let from_host = self.header.headers.get(HOST).map(HeaderValue::as_bytes);
         if self.header.version == Version::HTTP_2 {

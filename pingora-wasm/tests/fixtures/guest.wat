@@ -19,6 +19,19 @@
   (import "env" "proxy_get_header_map_value"
     (func $get_header (param i32 i32 i32 i32 i32) (result i32)))
   (import "env" "proxy_log" (func $log (param i32 i32 i32) (result i32)))
+  (import "env" "proxy_set_tick_period_milliseconds"
+    (func $set_tick_period (param i32) (result i32)))
+  (import "env" "proxy_define_metric"
+    (func $define_metric (param i32 i32 i32 i32) (result i32)))
+  (import "env" "proxy_increment_metric"
+    (func $increment_metric (param i32 i64) (result i32)))
+  (import "env" "proxy_get_property"
+    (func $get_property (param i32 i32 i32 i32) (result i32)))
+  (import "env" "proxy_set_property"
+    (func $set_property (param i32 i32 i32 i32) (result i32)))
+  (import "env" "proxy_set_effective_context"
+    (func $set_effective_context (param i32) (result i32)))
+  (import "env" "proxy_done" (func $done (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 16) "replaced")
   (data (i32.const 32) "teapot")
@@ -36,6 +49,9 @@
   (data (i32.const 280) "response")
   (data (i32.const 288) "accepted")
   (data (i32.const 296) "refused")
+  (data (i32.const 304) "missing")
+  (data (i32.const 312) "tick")
+  ;; Addresses from 700 hold the text that a test adds in its callbacks.
 
   ;; Write one letter in front of the body. The buffer is 0 for a request and 1 for a response.
   (func $mark (param $buffer i32) (param $letter i32) (result i32)
@@ -136,9 +152,29 @@
       (then (drop (call $log (i32.const 2) (i32.const 272) (i32.const 6))))
       (else (drop (call $log (i32.const 2) (i32.const 280) (i32.const 8))))))
 
+  ;; Write the value of the property at the path in memory as a log line, or "missing".
+  (func $log_property (param $path i32) (param $size i32)
+    (if (call $get_property (local.get $path) (local.get $size) (i32.const 512) (i32.const 516))
+      (then (drop (call $log (i32.const 2) (i32.const 304) (i32.const 7))))
+      (else (drop (call $log
+        (i32.const 2) (i32.load (i32.const 512)) (i32.load (i32.const 516)))))))
+
+  ;; Add the value of the property at the path as a request header, or a response header when
+  ;; the map is 2.
+  (func $property_to_header
+    (param $map i32) (param $path i32) (param $size i32) (param $name i32) (param $name_size i32)
+    (if (i32.eqz (call $get_property
+      (local.get $path) (local.get $size) (i32.const 512) (i32.const 516)))
+      (then (drop (call $add_header
+        (local.get $map) (local.get $name) (local.get $name_size)
+        (i32.load (i32.const 512)) (i32.load (i32.const 516)))))))
+
+  ;; Write the log line "tick".
+  (func $log_tick
+    (drop (call $log (i32.const 2) (i32.const 312) (i32.const 4))))
+
   (func (export "proxy_on_memory_allocate") (param i32) (result i32) i32.const 1024)
   (func (export "proxy_on_context_create") (param i32 i32))
-  (func (export "proxy_on_configure") (param i32 i32) (result i32) i32.const 1)
   (func (export "proxy_on_delete") (param i32))
 CALLBACKS
 )

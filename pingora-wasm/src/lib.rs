@@ -21,6 +21,7 @@
 //!
 //! - [WasmCtx::request_filter] from `request_filter`, after the checks your proxy runs itself
 //! - [WasmCtx::upstream_attempt] from `upstream_peer`
+//! - [WasmCtx::upstream_connected] from `connected_to_upstream`
 //! - [WasmCtx::request_body_filter] from `request_body_filter`
 //! - [WasmCtx::response_filter] from `response_filter`
 //! - [WasmCtx::response_body_filter] from `response_body_filter`
@@ -97,15 +98,74 @@
 //! failed result for the callout when its context ends. A callout from `proxy_on_log` may not
 //! be sent when the server stops.
 //!
-//! A plugin cannot send a callout from its root context, for example from `proxy_on_vm_start`
-//! or `proxy_on_configure`. `proxy_http_call` returns `INTERNAL_FAILURE` for it, and a plugin
-//! that does not handle that status fails to start.
+//! A plugin can send a callout from its root context too, for example from a tick, and the
+//! runtime delivers the response on the thread that runs the ticks. A callout from
+//! `proxy_on_vm_start` or `proxy_on_configure` is sent once the first request arrives.
 //!
 //! The runtime sends at most [WasmServices::max_callouts_in_flight] callouts at the same time.
 //! Each guest can have at most `max_open_callouts` callouts open, which is one of the
 //! [limits](WasmPluginConf::limits) of its plugin. A plugin can therefore have that number of
 //! waiting requests in each of its [slots](WasmPluginConf::slots). If you expect more, raise
 //! the number of slots or that limit.
+//!
+//! # Periodic work and shared queues
+//!
+//! Some plugins do work on a timer, such as refilling a rate limit bucket or sending a batch of
+//! log entries, and some wait for items on a shared queue. The runtime runs this work on a
+//! thread of its own, named `wasm-root-calls`, so it never runs on the threads of your Pingora
+//! services. The thread starts with the first request and stops when the runtime is dropped.
+//!
+//! Each slot of a plugin is a separate guest, so each slot gets its own ticks, as each worker
+//! of Envoy does. A tick waits while a request runs in the same slot, and a request waits while
+//! a tick runs. When a queue gets an item, the guest that registered the queue last receives
+//! `proxy_on_queue_ready`.
+//!
+//! Plugins with the same [VM id](WasmPluginConf::vm_id) share data, queues, and metrics, and
+//! each plugin still has its own guests.
+//!
+//! # Metrics
+//!
+//! Plugins define counters, gauges, and histograms. To publish them, pass a [WasmMetricSink] in
+//! [WasmServices::metric_sink]. [PrometheusMetricSink] registers them in a Prometheus registry,
+//! for example the default registry that `pingora-prometheus` serves:
+//!
+//! ```no_run
+//! use pingora_wasm::{PrometheusMetricSink, WasmPluginConf, WasmRuntime, WasmServices};
+//! use std::sync::Arc;
+//!
+//! # fn main() -> pingora_core::Result<()> {
+//! let registry = pingora_wasm::prometheus::default_registry().clone();
+//! let sink = PrometheusMetricSink::new(registry).expect("a registry with no wasm metrics");
+//! let mut services = WasmServices::default();
+//! services.metric_sink = Arc::new(sink);
+//! let plugins = vec![WasmPluginConf::new("stats", "stats.wasm")];
+//! let runtime = WasmRuntime::new_with_services(plugins, services)?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The sink also counts the callouts that fail, by plugin and by reason, in
+//! `wasm_callout_failures_total`. A registry accepts each name once, so when you reload plugins,
+//! pass the same sink to the new runtime.
+//!
+//! # Properties
+//!
+//! A plugin reads facts about its request with `proxy_get_property`, such as `source.address`
+//! or `request.path`, and the runtime provides the ones that Pingora knows. For a fact that only
+//! your proxy knows, such as the route it chose, set a property on the request before the phase
+//! in which a plugin reads it:
+//!
+//! ```
+//! use pingora_wasm::WasmCtx;
+//!
+//! fn after_routing(ctx: &mut WasmCtx, route: &str) {
+//!     ctx.set_property(&["xds", "route_name"], route);
+//! }
+//! ```
+//!
+//! For facts that do not change, such as the name of the node, use
+//! [WasmServices::fixed_properties]. A plugin cannot change a property that your proxy set or
+//! one that the runtime provides.
 //!
 //! # When a plugin fails
 //!
@@ -225,6 +285,9 @@
 
 mod callout;
 mod chain;
+mod metrics;
+mod properties;
+mod root_callbacks;
 mod runtime;
 mod stream;
 #[cfg(test)]
@@ -232,6 +295,14 @@ mod test_support;
 
 pub use callout::{CalloutTarget, CalloutUpstreams, StaticCalloutUpstreams};
 pub use chain::{RequestOutcome, WasmChain, WasmCtx};
+pub use metrics::{
+    CalloutFailure, PrometheusMetricSink, WasmMetric, WasmMetricKind, WasmMetricRecorder,
+    WasmMetricSink,
+};
+pub use properties::{WasmProperties, WasmPropertyValue};
+/// The `prometheus` crate that [PrometheusMetricSink] uses, so that you pass a registry of the
+/// same version.
+pub use prometheus;
 pub use proxy_wasm_host::abi::v0_2_1::types::LogLevel;
 pub use proxy_wasm_host::abi::v0_2_1::{LogContext, LogSink};
 pub use proxy_wasm_host::Limits;

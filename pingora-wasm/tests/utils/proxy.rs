@@ -16,6 +16,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use pingora_core::protocols::Digest;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{Error, ErrorType, Result};
 use pingora_http::ResponseHeader;
@@ -49,6 +50,7 @@ impl ProxyHttp for TestProxy {
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         let wasm = ctx.wasm.insert(self.chain.new_ctx());
+        wasm.set_property(&["xds", "route_name"], "test-route");
         match wasm.request_filter(session).await? {
             RequestOutcome::Respond(header, body) => {
                 write_plugin_response(session, header, body).await?;
@@ -76,6 +78,22 @@ impl ProxyHttp for TestProxy {
             .ok_or_else(|| Error::explain(ErrorType::HTTPStatus(400), "no x-test-origin"))?;
         let peer = HttpPeer::new(("127.0.0.1", port), false, String::new());
         Ok(Box::new(peer))
+    }
+
+    async fn connected_to_upstream(
+        &self,
+        _session: &mut Session,
+        _reused: bool,
+        peer: &HttpPeer,
+        #[cfg(unix)] _fd: std::os::unix::io::RawFd,
+        #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
+        _digest: Option<&Digest>,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        if let Some(wasm) = ctx.wasm.as_mut() {
+            wasm.upstream_connected(peer);
+        }
+        Ok(())
     }
 
     fn error_while_proxy(

@@ -15,8 +15,9 @@
 //! HTTP callouts from plugins.
 //!
 //! A plugin sends a callout with `proxy_http_call`. The callout service of its guest accepts
-//! the callout, a task sends it to a peer, and the phase that ran the plugin delivers the result
-//! to the plugin.
+//! the callout, and a task sends it to a peer. The phase that ran the plugin delivers the result
+//! to the plugin, and the root callback thread delivers the result of a callout that a root
+//! context sent.
 
 mod client;
 pub(crate) mod headers;

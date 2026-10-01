@@ -13,15 +13,17 @@
 // limitations under the License.
 
 use super::body::{HeldBodies, RequestBodyState};
-use super::logging::{finish, finished};
+use super::logging::finish;
 use super::slot::LockedSlot;
 use super::WasmChain;
 use crate::callout::RequestCallouts;
 use crate::plugin_unavailable;
+use crate::properties::WasmPropertyValue;
 use crate::runtime::pool::{GuestPool, Loaded};
 use crate::stream::{PingoraStream, RequestHeaders, ResponseHeaders};
 use http::uri::Scheme;
 use http::{Method, StatusCode};
+use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::Error;
 use pingora_http::{RequestHeader, ResponseHeader};
 use proxy_wasm_host::abi::v0_2_1::{CallScope, ContextId, Guest, GuestId};
@@ -83,6 +85,8 @@ impl fmt::Debug for WasmCtx {
 impl WasmCtx {
     pub(crate) fn new(chain: WasmChain) -> Self {
         let records = vec![None; chain.plugins.len()];
+        let mut stream = PingoraStream::default();
+        stream.fixed_properties = chain.runtime.fixed_properties.clone();
         WasmCtx {
             response_progress: ResponseProgress::NotStarted,
             request_body: RequestBodyState::new(),
@@ -91,7 +95,7 @@ impl WasmCtx {
             chain,
             records,
             scheme: Scheme::HTTP,
-            stream: PingoraStream::default(),
+            stream,
             spare_request: None,
             spare_response: None,
         }
@@ -123,7 +127,31 @@ impl WasmCtx {
         let guest_call = || self.run(&mut loaded.guest, body);
         let (result, accepted) = service.record_callouts(context, guest_call);
         self.callouts.set_accepted(accepted);
+        loaded.report_to_root_thread();
         result
+    }
+
+    /// Set a property of this request, for example the name of the route that your proxy
+    /// chose.
+    ///
+    /// Plugins read it with `proxy_get_property`, and a plugin cannot change it. Set it before
+    /// the phase in which a plugin reads it.
+    pub fn set_property(&mut self, path: &[&str], value: impl Into<WasmPropertyValue>) {
+        self.stream.proxy_properties.insert(path, value);
+    }
+
+    /// Return a property of this request that a plugin wrote with `proxy_set_property`.
+    pub fn guest_property(&self, path: &[&str]) -> Option<&[u8]> {
+        self.stream.guest_properties.get(path)
+    }
+
+    /// Record the upstream peer that the request connected to, for the properties
+    /// `upstream.address` and `upstream.port`.
+    ///
+    /// Call it from `connected_to_upstream`. It runs no plugin. A later call, for example on a
+    /// retry, replaces the peer.
+    pub fn upstream_connected(&mut self, peer: &HttpPeer) {
+        self.stream.facts.upstream_address = peer.address().as_inet().copied();
     }
 
     /// Return the pool of the plugin at `position` of the chain.
@@ -202,8 +230,7 @@ impl Drop for WasmCtx {
             let result = self.run_for_context(loaded, record.context, |scope| {
                 finish(scope, record.context, false)
             });
-            finished(locked, result);
-            self.start_callouts(position, false);
+            self.after_finish(position, locked, record.context, result, false);
         }
     }
 }

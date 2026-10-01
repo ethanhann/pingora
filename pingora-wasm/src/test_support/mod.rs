@@ -49,6 +49,7 @@ pub(crate) fn plugin(name: &str, path: PathBuf, slots: usize) -> WasmPluginConf 
 pub(crate) struct Wat {
     pub(crate) abi: bool,
     pub(crate) vm_start: &'static str,
+    pub(crate) configure: &'static str,
     pub(crate) request_headers: &'static str,
     pub(crate) done: &'static str,
     /// The callbacks below are exported only when they have a body.
@@ -58,6 +59,9 @@ pub(crate) struct Wat {
     pub(crate) response_trailers: Option<&'static str>,
     pub(crate) http_call_response: Option<&'static str>,
     pub(crate) log: Option<&'static str>,
+    pub(crate) tick: Option<&'static str>,
+    /// Text for the callbacks, such as `(data (i32.const 700) "text")`.
+    pub(crate) data: &'static str,
 }
 
 pub(crate) const CONTINUE: &str = "i32.const 0";
@@ -92,6 +96,7 @@ impl Default for Wat {
         Wat {
             abi: true,
             vm_start: "i32.const 1",
+            configure: "i32.const 1",
             request_headers: CONTINUE,
             done: "i32.const 1",
             request_body: None,
@@ -100,6 +105,8 @@ impl Default for Wat {
             response_trailers: None,
             http_call_response: None,
             log: None,
+            tick: None,
+            data: "",
         }
     }
 }
@@ -156,7 +163,9 @@ pub(crate) fn wat_guest(label: &str, guest: Wat) -> PathBuf {
     };
     let callbacks = [
         abi,
+        guest.data.to_string(),
         export("proxy_on_vm_start", "i32 i32", Some(guest.vm_start)),
+        export("proxy_on_configure", "i32 i32", Some(guest.configure)),
         export(
             "proxy_on_request_headers",
             "i32 i32 i32",
@@ -181,6 +190,10 @@ pub(crate) fn wat_guest(label: &str, guest: Wat) -> PathBuf {
             guest.http_call_response,
         ),
         export_with_no_result("proxy_on_log", "i32", guest.log),
+        match guest.tick {
+            Some(body) => export_with_no_result("proxy_on_tick", "i32", Some(body)),
+            None => String::new(),
+        },
     ]
     .join("\n");
     let wat = TEMPLATE.replace("\nCALLBACKS\n", &format!("\n{callbacks}\n"));

@@ -18,19 +18,28 @@ mod log_sink;
 mod plugin;
 pub(crate) mod pool;
 mod services;
+mod shared_store;
 mod ticker;
 
 pub use plugin::WasmPluginConf;
-pub(crate) use services::CalloutLauncher;
 pub use services::WasmServices;
+pub(crate) use services::{CalloutLauncher, CalloutSenders};
 
-use crate::callout::{CalloutSender, ConnectorSender};
+#[cfg(test)]
+use crate::callout::CalloutSender;
+use crate::callout::ConnectorSender;
 use crate::chain::WasmChain;
+use crate::properties::WasmProperties;
+use crate::root_callbacks::RootCallbackThread;
+use pool::events::RootCallbackEvent;
+use crate::stream::RootCallbackConf;
 use pingora_core::connectors::http::Connector;
 use pingora_error::{Error, ErrorType, OrErr, Result};
-use pool::GuestPool;
+use pool::{GuestPool, GuestPoolConf};
 use proxy_wasm_host::abi::v0_2_1::{GuestSpec, Host, InMemoryStore, SharedServices};
 use proxy_wasm_host::{Engine, EngineConfig, Module};
+use shared_store::SharedStore;
+use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -52,8 +61,11 @@ pub struct WasmRuntime {
 pub(crate) struct RuntimeInner {
     engine: Engine,
     ticker: Ticker,
+    threads_started: OnceCell<()>,
     pub(crate) pools: Vec<GuestPool>,
     pub(crate) callout_launcher: CalloutLauncher,
+    pub(crate) root_callbacks: RootCallbackThread,
+    pub(crate) fixed_properties: Arc<WasmProperties>,
     names: HashMap<String, usize>,
 }
 
@@ -88,21 +100,44 @@ impl WasmRuntime {
             .callout_connector
             .clone()
             .unwrap_or_else(|| Arc::new(Connector::new(None)));
-        let sender = Arc::new(ConnectorSender {
+        let request = Arc::new(ConnectorSender {
             connector,
             upstreams: services.callout_upstreams.clone(),
+            metric_sink: services.metric_sink.clone(),
         });
-        Self::new_with_callout_sender(plugins, services, sender)
+        let root = Arc::new(ConnectorSender {
+            connector: Arc::new(Connector::new(None)),
+            upstreams: services.callout_upstreams.clone(),
+            metric_sink: services.metric_sink.clone(),
+        });
+        Self::new_with_callout_senders(plugins, services, CalloutSenders { request, root })
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_callout_sender(
         plugins: Vec<WasmPluginConf>,
         services: WasmServices,
         sender: Arc<dyn CalloutSender>,
     ) -> Result<Self> {
+        let senders = CalloutSenders {
+            request: sender.clone(),
+            root: sender,
+        };
+        Self::new_with_callout_senders(plugins, services, senders)
+    }
+
+    fn new_with_callout_senders(
+        plugins: Vec<WasmPluginConf>,
+        services: WasmServices,
+        senders: CalloutSenders,
+    ) -> Result<Self> {
         let sink = services.log_sink;
         let upstreams = services.callout_upstreams;
-        let callout_launcher = CalloutLauncher::new(sender, services.max_callouts_in_flight)?;
+        let callout_launcher = CalloutLauncher::new(
+            senders,
+            services.metric_sink.clone(),
+            services.max_callouts_in_flight,
+        )?;
         if plugins.is_empty() {
             return Error::e_explain(ErrorType::InternalError, "no wasm plugin to run");
         }
@@ -122,11 +157,19 @@ impl WasmRuntime {
             .or_err(ErrorType::InternalError, "failed to build the wasm engine")?;
         let host =
             Host::new(&engine).or_err(ErrorType::InternalError, "failed to link the host")?;
-        let shared: Arc<dyn SharedServices> = Arc::new(InMemoryStore::new());
+        let root_callbacks = RootCallbackThread::new();
+        let queue_items = root_callbacks.sender();
+        let store = InMemoryStore::new().with_enqueue_observer(Arc::new(move |item| {
+            let _ = queue_items.send(RootCallbackEvent::QueueItem(item.queue));
+        }));
+        let shared: Arc<dyn SharedServices> =
+            Arc::new(SharedStore::new(store, services.metric_sink));
+        let fixed_properties = Arc::new(services.fixed_properties);
         let pools = with_ticker(&engine, || {
             plugins
                 .iter()
-                .map(|plugin| {
+                .enumerate()
+                .map(|(index, plugin)| {
                     let bytes =
                         std::fs::read(&plugin.path).or_err_with(ErrorType::ReadError, || {
                             format!(
@@ -144,14 +187,20 @@ impl WasmRuntime {
                         .or_err_with(ErrorType::InternalError, || {
                             format!("wasm plugin {} is not a supported module", plugin.name)
                         })?;
-                    GuestPool::new(
-                        plugin.name.clone(),
+                    GuestPool::new(GuestPoolConf {
+                        pool_index: index,
+                        name: plugin.name.clone(),
                         spec,
-                        plugin.plugin_config(),
-                        plugin.slots,
-                        plugin.phase_conf(),
-                        plugin.callout_conf(upstreams.clone()),
-                    )
+                        plugin: plugin.plugin_config(),
+                        slots: plugin.slots,
+                        phases: plugin.phase_conf(),
+                        callout_conf: plugin.callout_conf(upstreams.clone()),
+                        root_callback_conf: Arc::new(RootCallbackConf::new(
+                            &plugin.name,
+                            fixed_properties.clone(),
+                        )),
+                        root_callback_sender: root_callbacks.sender(),
+                    })
                 })
                 .collect::<Result<Vec<_>>>()
         })?;
@@ -159,8 +208,11 @@ impl WasmRuntime {
             inner: Arc::new(RuntimeInner {
                 engine,
                 ticker: Ticker::new(),
+                threads_started: OnceCell::new(),
                 pools,
                 callout_launcher,
+                root_callbacks,
+                fixed_properties,
                 names,
             }),
         })
@@ -205,10 +257,10 @@ impl WasmRuntime {
         self.inner.pools.iter().map(GuestPool::open_contexts).sum()
     }
 
-    /// Return the number of plugin contexts that a guest keeps after its request ended.
+    /// Return the number of plugin contexts that a guest holds after its request ended.
     ///
-    /// A guest keeps a context when its `proxy_on_done` returns `false`. The context stays until
-    /// that guest is replaced.
+    /// A guest holds a context when its `proxy_on_done` returns `false`, and it releases the
+    /// context later with `proxy_done`, for example when the response to a callout arrives.
     pub fn held_contexts(&self) -> usize {
         self.inner.pools.iter().map(GuestPool::held_contexts).sum()
     }
@@ -231,9 +283,17 @@ impl fmt::Debug for WasmRuntime {
 }
 
 impl RuntimeInner {
-    /// Start the epoch ticker on the first call, as [Ticker::start] describes.
-    pub(crate) fn start_ticker(self: &Arc<Self>) -> Result<()> {
-        self.ticker.start(self)
+    /// Start the root callback thread and the epoch ticker on the first call.
+    ///
+    /// The threads do not start in [WasmRuntime::new], because in daemon mode Pingora forks
+    /// after the runtime is built, and the forked process has no threads of its parent. If a
+    /// thread cannot start, this returns an error and the next call tries again.
+    pub(crate) fn start_threads(self: &Arc<Self>) -> Result<()> {
+        self.threads_started.get_or_try_init(|| {
+            self.root_callbacks.start(Arc::downgrade(self))?;
+            self.ticker.start(self)
+        })?;
+        Ok(())
     }
 
     pub(crate) fn plugin_names(&self) -> Vec<&str> {

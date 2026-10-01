@@ -18,10 +18,13 @@
 //! The status codes and the bodies match those of Envoy, because plugins are written against
 //! them.
 
+use crate::metrics::CalloutFailure;
 use bytes::Bytes;
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::StatusCode;
 use pingora_error::{Error, ErrorType};
+use proxy_wasm_host::abi::v0_2_1::{HeaderPairs, HttpCallResponse};
+use std::borrow::Cow;
 
 pub(super) const PSEUDO_STATUS: &[u8] = b":status";
 const TEXT_PLAIN: &[u8] = b"text/plain";
@@ -54,6 +57,20 @@ pub(crate) enum CalloutResult {
 }
 
 impl CalloutResult {
+    /// Return the result as the response that the host gives to `proxy_on_http_call_response`.
+    pub(crate) fn as_http_call_response(&self) -> HttpCallResponse<'_> {
+        match self {
+            CalloutResult::Response {
+                headers,
+                body,
+                trailers,
+            } => HttpCallResponse::received(borrowed_header_pairs(headers))
+                .with_body(Cow::Borrowed(&body[..]))
+                .with_trailers(borrowed_header_pairs(trailers)),
+            CalloutResult::Failed => HttpCallResponse::failed(),
+        }
+    }
+
     /// Create the response for a callout that received no response header.
     fn synthetic_response(status: StatusCode, body: String) -> Self {
         let length = body.len().to_string().into_bytes();
@@ -116,5 +133,35 @@ impl CalloutResult {
             }
             _ => Self::reset_response(StatusCode::SERVICE_UNAVAILABLE, RESET_REASON_TERMINATION),
         }
+    }
+}
+
+fn borrowed_header_pairs(pairs: &[(Vec<u8>, Vec<u8>)]) -> HeaderPairs<'_> {
+    pairs
+        .iter()
+        .map(|(name, value)| (Cow::Borrowed(&name[..]), Cow::Borrowed(&value[..])))
+        .collect()
+}
+
+/// Return the failure of a connection that failed with `e`.
+pub(crate) fn connect_failure(e: &Error) -> CalloutFailure {
+    match e.etype() {
+        ErrorType::ConnectTimedout | ErrorType::TLSHandshakeTimedout => {
+            CalloutFailure::ConnectTimeout
+        }
+        _ => CalloutFailure::ConnectFailed,
+    }
+}
+
+/// Return the failure of a session that failed with `e` before its response header.
+pub(crate) fn session_failure(e: &Error) -> CalloutFailure {
+    match e.etype() {
+        ErrorType::ReadTimedout | ErrorType::WriteTimedout => CalloutFailure::Timeout,
+        ErrorType::InvalidHTTPHeader
+        | ErrorType::H1Error
+        | ErrorType::H2Error
+        | ErrorType::InvalidH2
+        | ErrorType::H2Downgrade => CalloutFailure::ProtocolError,
+        _ => CalloutFailure::ConnectionClosed,
     }
 }

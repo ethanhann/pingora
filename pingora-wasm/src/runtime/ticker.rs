@@ -19,7 +19,6 @@
 
 use super::RuntimeInner;
 use crate::ERR_PLUGIN_FAILED;
-use parking_lot::Mutex;
 use pingora_error::{OrErr, Result};
 use proxy_wasm_host::Engine;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,11 +26,10 @@ use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::Duration;
 
-const THREAD_NAME: &str = "pingora-wasm-epoch";
+// Linux keeps 15 bytes of a thread name
+const THREAD_NAME: &str = "wasm-epoch";
 
 pub(crate) struct Ticker {
-    started: AtomicBool,
-    lock: Mutex<()>,
     #[cfg(test)]
     pub(crate) ticking: Arc<AtomicBool>,
 }
@@ -39,27 +37,13 @@ pub(crate) struct Ticker {
 impl Ticker {
     pub(crate) fn new() -> Self {
         Ticker {
-            started: AtomicBool::new(false),
-            lock: Mutex::new(()),
             #[cfg(test)]
             ticking: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Start the ticker thread on the first call.
-    ///
-    /// The thread does not start in [WasmRuntime::new](crate::WasmRuntime::new), because in
-    /// daemon mode Pingora forks after the runtime is built, and the forked process has no
-    /// threads of its parent. The thread stops when the runtime is dropped. If the thread cannot
-    /// start, this returns an error and the next call tries again.
+    /// Start the ticker thread. It stops when the runtime is dropped.
     pub(crate) fn start(&self, runtime: &Arc<RuntimeInner>) -> Result<()> {
-        if self.started.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let _lock = self.lock.lock();
-        if self.started.load(Ordering::Acquire) {
-            return Ok(());
-        }
         let weak = Arc::downgrade(runtime);
         let period = runtime.engine.epoch_period();
         #[cfg(test)]
@@ -74,7 +58,6 @@ impl Ticker {
                 ticking.store(false, Ordering::Relaxed);
             })
             .or_err(ERR_PLUGIN_FAILED, "failed to start the wasm epoch ticker")?;
-        self.started.store(true, Ordering::Release);
         Ok(())
     }
 }
@@ -128,7 +111,7 @@ mod tests {
         let ticking = runtime.inner.ticker.ticking.clone();
         let before = ticking.load(Ordering::Relaxed);
 
-        runtime.inner.start_ticker().unwrap();
+        runtime.inner.start_threads().unwrap();
 
         assert!(!before);
         assert!(ticking.load(Ordering::Relaxed));
@@ -138,7 +121,7 @@ mod tests {
     fn the_ticker_stops_when_the_runtime_drops() {
         let runtime =
             WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 1)]).unwrap();
-        runtime.inner.start_ticker().unwrap();
+        runtime.inner.start_threads().unwrap();
         let ticking = runtime.inner.ticker.ticking.clone();
 
         drop(runtime);

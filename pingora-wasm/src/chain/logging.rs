@@ -14,6 +14,7 @@
 
 use super::slot::LockedSlot;
 use super::WasmCtx;
+use crate::properties::built_in::LoggingFacts;
 use log::{debug, error, warn};
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_proxy::Session;
@@ -30,6 +31,13 @@ impl WasmCtx {
         let runtime = self.chain.runtime.clone();
         self.callouts.clear();
         let mut response = session.response_written().cloned();
+        let facts = &mut self.stream().facts;
+        facts.request_body_bytes = session.body_bytes_read();
+        let start = facts.start.map(|(_, at)| at);
+        facts.logging = Some(LoggingFacts {
+            duration: start.map(|at| at.elapsed()),
+            response_body_bytes: session.body_bytes_sent(),
+        });
         let held = self.held.request_len();
         if held > 0 {
             debug!("the request ended while wasm plugins held {held} request body bytes");
@@ -60,8 +68,39 @@ impl WasmCtx {
                 self.response_out(header);
             }
             self.request_out(session.req_header_mut());
-            finished(locked, result);
-            self.start_callouts(position, false);
+            self.after_finish(position, locked, record.context, result, true);
+        }
+    }
+
+    /// Record how the context of the plugin at `position` ended, and start the callouts that
+    /// the plugin sent while it ended.
+    ///
+    /// A context that the guest holds gets the results of its callouts on the root callback
+    /// thread, and it still owes `proxy_on_log` when `log_owed` is `true`.
+    pub(super) fn after_finish(
+        &mut self,
+        position: usize,
+        mut locked: LockedSlot<'_>,
+        context: ContextId,
+        result: Result<bool, GuestError>,
+        log_owed: bool,
+    ) {
+        match result {
+            Ok(true) => {
+                locked.pool.deleted(locked.slot);
+                self.start_callouts(position, false);
+            }
+            Ok(false) => {
+                debug!(
+                    "wasm plugin {} holds a context after the request ended, until it calls proxy_done",
+                    locked.pool.name
+                );
+                locked.pool.deleted(locked.slot);
+                if let Ok(loaded) = locked.loaded() {
+                    loaded.hold_context(context, log_owed, self.callouts.take_accepted());
+                }
+            }
+            Err(e) => error!("{}", locked.guest_failure("failed to end a context", e)),
         }
     }
 }
@@ -82,20 +121,6 @@ pub(super) fn finish<H: StreamState>(
     }
     scope.on_delete(context)?;
     Ok(true)
-}
-
-pub(super) fn finished(locked: LockedSlot<'_>, result: Result<bool, GuestError>) {
-    match result {
-        Ok(true) => locked.pool.deleted(locked.slot),
-        Ok(false) => {
-            warn!(
-                "wasm plugin {} holds a context after the request ended",
-                locked.pool.name
-            );
-            locked.pool.held(locked.slot);
-        }
-        Err(e) => error!("{}", locked.guest_failure("failed to end a context", e)),
-    }
 }
 
 #[cfg(test)]

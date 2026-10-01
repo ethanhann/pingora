@@ -66,6 +66,7 @@ impl WasmCtx {
         session: &mut Session<DS>,
         resp: &mut ResponseHeader,
     ) -> Result<()> {
+        self.stream().facts.response_code = Some(resp.status.as_u16());
         if session.subrequest_ctx.is_some()
             || skips_response(resp.status)
             || self.response_progress == ResponseProgress::FromPlugin
@@ -73,7 +74,7 @@ impl WasmCtx {
             return Ok(());
         }
         self.refuse_after_cancelled_wait()?;
-        self.chain.runtime.start_ticker()?;
+        self.chain.runtime.start_threads()?;
         self.response_progress = ResponseProgress::FromUpstream;
         let end_of_stream = response_ends(&session.req_header().method, resp);
         let had_length = resp.headers.contains_key(CONTENT_LENGTH);

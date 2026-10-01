@@ -17,14 +17,21 @@
 //! A guest runs one callback at a time, so a plugin keeps several guests, one in each slot. A
 //! request stays on the slot it started on, because its plugin context is in that guest.
 
-use crate::callout::{GuestCalloutService, PluginCalloutConf};
-use crate::{plugin_failure, plugin_unavailable};
+pub(crate) mod events;
+mod guest_start;
+mod loaded;
+
+pub(crate) use loaded::Loaded;
+
+use crate::callout::PluginCalloutConf;
+use crate::plugin_unavailable;
+use events::RootCallbackSender;
+use crate::stream::RootCallbackConf;
+use guest_start::StartedGuest;
 use log::{error, info, warn};
 use parking_lot::{Mutex, MutexGuard};
 use pingora_error::Result;
-use proxy_wasm_host::abi::v0_2_1::{
-    Callback, ContextId, Guest, GuestError, GuestId, GuestSpec, PluginConfig, Started,
-};
+use proxy_wasm_host::abi::v0_2_1::{Callback, GuestError, GuestId, GuestSpec, PluginConfig};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -58,53 +65,70 @@ impl PluginPhases {
     }
 }
 
-/// A started guest, the root context of its plugin, and its callout service.
-pub(crate) struct Loaded {
-    pub(crate) guest: Guest,
-    pub(crate) root: ContextId,
-    pub(crate) callout_service: Arc<GuestCalloutService>,
-}
-
 pub(crate) type SlotGuard<'a> = MutexGuard<'a, Option<Loaded>>;
 
 #[derive(Default)]
 struct Slot {
     guest: Mutex<Option<Loaded>>,
     open: AtomicUsize,
-    held: AtomicUsize,
+    held: Arc<AtomicUsize>,
     failed_at: Mutex<Option<Instant>>,
+}
+
+/// The result of an attempt to lock the slot of a guest.
+pub(crate) enum SlotLockAttempt<'a> {
+    Locked(SlotGuard<'a>),
+    /// Another thread holds the slot.
+    Busy,
+    /// The slot has another guest, or none.
+    GuestGone,
+}
+
+/// The settings of a pool and of the guests that it starts.
+pub(crate) struct GuestPoolConf {
+    pub(crate) pool_index: usize,
+    pub(crate) name: String,
+    pub(crate) spec: GuestSpec,
+    pub(crate) plugin: PluginConfig,
+    pub(crate) slots: usize,
+    pub(crate) phases: PluginPhases,
+    pub(crate) callout_conf: PluginCalloutConf,
+    pub(crate) root_callback_conf: Arc<RootCallbackConf>,
+    pub(crate) root_callback_sender: RootCallbackSender,
 }
 
 pub(crate) struct GuestPool {
     pub(crate) name: String,
     pub(crate) phases: PluginPhases,
     pub(crate) callout_conf: Arc<PluginCalloutConf>,
+    pool_index: usize,
     spec: GuestSpec,
     plugin: PluginConfig,
+    root_callback_conf: Arc<RootCallbackConf>,
+    root_callback_sender: RootCallbackSender,
     next: AtomicUsize,
     slots: Vec<Slot>,
 }
 
 impl GuestPool {
-    pub(crate) fn new(
-        name: String,
-        spec: GuestSpec,
-        plugin: PluginConfig,
-        slots: usize,
-        mut phases: PluginPhases,
-        callout_conf: PluginCalloutConf,
-    ) -> Result<Self> {
+    pub(crate) fn new(conf: GuestPoolConf) -> Result<Self> {
+        let mut phases = conf.phases;
         let mut pool = GuestPool {
-            name,
+            name: conf.name,
             phases,
-            callout_conf: Arc::new(callout_conf),
-            spec,
-            plugin,
+            callout_conf: Arc::new(conf.callout_conf),
+            pool_index: conf.pool_index,
+            spec: conf.spec,
+            plugin: conf.plugin,
+            root_callback_conf: conf.root_callback_conf,
+            root_callback_sender: conf.root_callback_sender,
             next: AtomicUsize::new(0),
-            slots: (0..slots).map(|_| Slot::default()).collect(),
+            slots: (0..conf.slots).map(|_| Slot::default()).collect(),
         };
-        for slot in &pool.slots {
-            *slot.guest.lock() = Some(pool.start()?);
+        for index in 0..pool.slots.len() {
+            let started = pool.start(index)?;
+            let mut guard = pool.slots[index].guest.lock();
+            install(&mut guard, started);
         }
         // A guest that does not export the callback of a phase has nothing to run in it
         if let Some(loaded) = pool.slots[0].guest.lock().as_ref() {
@@ -116,32 +140,6 @@ impl GuestPool {
         pool.phases = phases;
         info!("wasm plugin {} runs on {}", pool.name, phases.list());
         Ok(pool)
-    }
-
-    fn start(&self) -> Result<Loaded> {
-        let mut guest = self
-            .spec
-            .build()
-            .map_err(|e| plugin_failure(&self.name, "could not be built", e))?;
-        // Callout ids are unique only within one guest, so each guest needs its own service
-        let callout_service = Arc::new(GuestCalloutService::new(self.callout_conf.clone()));
-        let services = guest
-            .services()
-            .clone()
-            .with_callouts(callout_service.clone());
-        *guest.services_mut() = services;
-        match guest.start(self.plugin.clone()) {
-            Ok(Started::Serving(root)) => Ok(Loaded {
-                guest,
-                root,
-                callout_service,
-            }),
-            Ok(Started::Refused { callback, .. }) => Err(plugin_unavailable(
-                &self.name,
-                &format!("refused its start in {callback}"),
-            )),
-            Err(e) => Err(plugin_failure(&self.name, "failed to start", e)),
-        }
     }
 
     /// Pick a slot for a new request and lock it.
@@ -176,6 +174,17 @@ impl GuestPool {
         Err(plugin_unavailable(&self.name, "has no guest"))
     }
 
+    /// Try to lock the slot of `guest` with no wait.
+    pub(crate) fn try_lock_guest(&self, index: usize, guest: GuestId) -> SlotLockAttempt<'_> {
+        let Some(guard) = self.slots[index].guest.try_lock() else {
+            return SlotLockAttempt::Busy;
+        };
+        match guard.as_ref() {
+            Some(loaded) if loaded.guest.id() == guest => SlotLockAttempt::Locked(guard),
+            _ => SlotLockAttempt::GuestGone,
+        }
+    }
+
     /// Lock the slot of a request. Return `None` when a new guest replaced the one that holds
     /// the context of the request.
     pub(crate) fn lock(&self, index: usize, guest: GuestId) -> Option<SlotGuard<'_>> {
@@ -187,8 +196,8 @@ impl GuestPool {
     }
 
     /// Replace the guest of a slot when `err` leaves it unusable, which happens after a trap or
-    /// when the guest has no context ids left.
-    pub(crate) fn check(&self, index: usize, mut guard: SlotGuard<'_>, err: &GuestError) {
+    /// when the guest has no context ids left. Return whether the guest was replaced.
+    pub(crate) fn check(&self, index: usize, mut guard: SlotGuard<'_>, err: &GuestError) -> bool {
         let lost = match guard.as_ref() {
             Some(loaded) => {
                 !loaded.guest.is_serving() || matches!(err, GuestError::ContextIdsExhausted)
@@ -196,13 +205,14 @@ impl GuestPool {
             None => false,
         };
         if !lost {
-            return;
+            return false;
         }
         guard.take();
         self.slots[index].open.store(0, Ordering::Relaxed);
         self.slots[index].held.store(0, Ordering::Relaxed);
         drop(guard);
         self.rebuild(index, Some(err));
+        true
     }
 
     fn rebuild_due(&self, index: usize) -> bool {
@@ -221,13 +231,13 @@ impl GuestPool {
     fn rebuild(&self, index: usize, failure: Option<&GuestError>) {
         let slot = &self.slots[index];
         let name = &self.name;
-        match self.start() {
-            Ok(loaded) => {
+        match self.start(index) {
+            Ok(started) => {
                 let mut guard = slot.guest.lock();
                 if guard.is_none() {
-                    *guard = Some(loaded);
                     slot.open.store(0, Ordering::Relaxed);
                     slot.held.store(0, Ordering::Relaxed);
+                    install(&mut guard, started);
                     *slot.failed_at.lock() = None;
                     match failure {
                         Some(failure) => warn!(
@@ -259,11 +269,6 @@ impl GuestPool {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
     }
 
-    pub(crate) fn held(&self, index: usize) {
-        self.deleted(index);
-        self.slots[index].held.fetch_add(1, Ordering::Relaxed);
-    }
-
     pub(crate) fn open_contexts(&self) -> usize {
         self.slots
             .iter()
@@ -277,6 +282,15 @@ impl GuestPool {
             .map(|s| s.held.load(Ordering::Relaxed))
             .sum()
     }
+}
+
+/// Put a started guest in its slot, and send what its start changed to the root callback
+/// thread.
+fn install(guard: &mut SlotGuard<'_>, started: StartedGuest) {
+    let mut loaded = started.loaded;
+    loaded.report_to_root_thread();
+    loaded.send_callouts_to_root_thread(loaded.root, started.root_callouts);
+    **guard = Some(loaded);
 }
 
 #[cfg(test)]

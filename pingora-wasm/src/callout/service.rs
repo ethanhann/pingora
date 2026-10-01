@@ -36,9 +36,10 @@ struct GuestCallState {
 /// The service that accepts the callouts of one guest.
 ///
 /// Callout ids are unique only within one guest, so each guest has its own service. During a
-/// guest call, the service accepts callouts only from the stream context that the call is for.
-/// A plugin cannot send a callout from its root context, because no phase can deliver the
-/// result.
+/// guest call, the service accepts callouts only from the context that the call is for, which
+/// is the root context for a tick or a queue wake. A stream callback that switches to its root
+/// context cannot send a callout, because the root receives the result on another thread while
+/// the request goes on.
 pub(crate) struct GuestCalloutService {
     conf: Arc<PluginCalloutConf>,
     call_in_progress: Mutex<GuestCallState>,

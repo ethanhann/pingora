@@ -21,6 +21,7 @@ mod plugin_response;
 mod request_headers;
 mod response_headers;
 mod response_trailers;
+mod root_stream;
 
 pub(crate) use body::BodyBuffer;
 pub use plugin_response::write_plugin_response;
@@ -28,11 +29,15 @@ pub(crate) use plugin_response::PluginResponse;
 pub(crate) use request_headers::RequestHeaders;
 pub(crate) use response_headers::ResponseHeaders;
 pub(crate) use response_trailers::ResponseTrailers;
+pub(crate) use root_stream::{RootCallbackConf, RootStream};
 
+use crate::properties::built_in::{read_built_in, HeadersInStream, RequestFacts};
+use crate::properties::{join_path, WasmProperties};
 use log::{debug, warn};
 use proxy_wasm_host::abi::v0_2_1::types::{BufferType, MapType, Status, StreamType};
 use proxy_wasm_host::abi::v0_2_1::{Access, Callback, Invocation, LocalResponse, StreamState};
 use proxy_wasm_host::{Buffer, HeaderMap, VecHeaderMap};
+use std::sync::Arc;
 
 /// The state that a guest can read and write during one callback.
 ///
@@ -50,6 +55,13 @@ pub(crate) struct PingoraStream {
     /// The callback whose access applies while the plugin receives the result of a callout.
     pub(crate) delivery_callback: Option<Callback>,
     empty: VecHeaderMap,
+    pub(crate) facts: RequestFacts,
+    /// The request properties that the proxy set, which a plugin cannot change.
+    pub(crate) proxy_properties: WasmProperties,
+    /// The request properties that the plugins wrote.
+    pub(crate) guest_properties: WasmProperties,
+    pub(crate) fixed_properties: Arc<WasmProperties>,
+    path_key: Vec<u8>,
 }
 
 impl PingoraStream {
@@ -182,6 +194,48 @@ impl StreamState for PingoraStream {
             warn!("plugin response gRPC status {grpc_status} is not sent");
         }
         self.plugin_response = Some(plugin_response);
+        Ok(())
+    }
+
+    fn property(
+        &mut self,
+        _call: Invocation,
+        path: &[&[u8]],
+        out: &mut Vec<u8>,
+    ) -> Result<(), Status> {
+        join_path(path.iter().copied(), &mut self.path_key);
+        let key = &self.path_key;
+        let headers = HeadersInStream {
+            request: self.request.as_ref(),
+            response: self.response.as_ref().map(|r| &r.header),
+        };
+        if let Some(value) = self.proxy_properties.get_joined(key) {
+            out.extend_from_slice(value);
+            return Ok(());
+        }
+        if read_built_in(key, &self.facts, &headers, out) {
+            return Ok(());
+        }
+        let stored = self.guest_properties.get_joined(key);
+        match stored.or_else(|| self.fixed_properties.get_joined(key)) {
+            Some(value) => {
+                out.extend_from_slice(value);
+                Ok(())
+            }
+            None => Err(Status::NotFound),
+        }
+    }
+
+    // A guest built with the Rust SDK panics on a status other than `Ok`, so a write that a
+    // value of the proxy or a built-in value hides still returns `Ok`, as in Envoy
+    fn set_property(
+        &mut self,
+        _call: Invocation,
+        path: &[&[u8]],
+        value: &[u8],
+    ) -> Result<(), Status> {
+        join_path(path.iter().copied(), &mut self.path_key);
+        self.guest_properties.insert_joined(&self.path_key, value);
         Ok(())
     }
 
@@ -487,5 +541,33 @@ mod tests {
             assert_eq!(result, expected, "{callback:?}");
             assert_eq!(s.plugin_response.is_some(), expected.is_ok());
         }
+    }
+
+    #[test]
+    fn a_guest_write_returns_ok_and_does_not_hide_a_value_of_the_proxy_or_the_session() {
+        let mut stream = stream(false);
+        stream
+            .proxy_properties
+            .insert(&["xds", "route_name"], "checkout");
+        let mut fixed = WasmProperties::new();
+        fixed.insert(&["node", "name"], "edge-1");
+        stream.fixed_properties = Arc::new(fixed);
+        let call = call(Callback::RequestHeaders);
+        let writes = [
+            stream.set_property(call, &[b"xds", b"route_name"], b"other"),
+            stream.set_property(call, &[b"request", b"method"], b"PUT"),
+            stream.set_property(call, &[b"node", b"name"], b"guest-node"),
+        ];
+
+        let mut read = |path: &[&[u8]]| {
+            let mut value = Vec::new();
+            stream.property(call, path, &mut value).map(|()| value)
+        };
+
+        assert_eq!(writes, [Ok(()), Ok(()), Ok(())]);
+        assert_eq!(read(&[b"xds", b"route_name"]), Ok(b"checkout".to_vec()));
+        assert_eq!(read(&[b"request", b"method"]), Ok(b"GET".to_vec()));
+        assert_eq!(read(&[b"node", b"name"]), Ok(b"guest-node".to_vec()));
+        assert_eq!(read(&[b"no", b"such"]), Err(Status::NotFound));
     }
 }

@@ -14,6 +14,11 @@
 
 mod utils;
 
+#[path = "test_wasm/properties.rs"]
+mod properties;
+#[path = "test_wasm/root_callbacks.rs"]
+mod root_callbacks;
+
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use utils::raw::{

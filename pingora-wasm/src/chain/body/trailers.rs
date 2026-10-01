@@ -63,7 +63,7 @@ impl WasmCtx {
         }
         let mut passed = self.refuse_after_cancelled_wait();
         if passed.is_ok() && self.chain.phases.response_trailers {
-            self.chain.runtime.start_ticker()?;
+            self.chain.runtime.start_threads()?;
             passed = self.run_trailer_callbacks(session, trailers).await;
         }
         match (passed, self.release_held()) {

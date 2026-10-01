@@ -14,8 +14,9 @@
 
 //! The client that sends a callout to its peer.
 
-use super::result::{OwnedHeaderPairs, PSEUDO_STATUS};
+use super::result::{connect_failure, session_failure, OwnedHeaderPairs, PSEUDO_STATUS};
 use super::{AcceptedCallout, CalloutResult, CalloutTarget, CalloutUpstreams};
+use crate::metrics::{CalloutFailure, WasmMetricSink};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use http::StatusCode;
@@ -38,9 +39,12 @@ pub(crate) trait CalloutSender: Send + Sync {
 }
 
 /// A sender that sends each callout through a Pingora connector.
+///
+/// It reports each failure to the metric sink.
 pub(crate) struct ConnectorSender {
     pub(crate) connector: Arc<Connector>,
     pub(crate) upstreams: Arc<dyn CalloutUpstreams>,
+    pub(crate) metric_sink: Arc<dyn WasmMetricSink>,
 }
 
 /// A session whose response header arrived.
@@ -53,17 +57,24 @@ struct ResponseInProgress {
 #[async_trait]
 impl CalloutSender for ConnectorSender {
     async fn send(&self, callout: AcceptedCallout) -> CalloutResult {
+        let plugin = &callout.plugin_conf.plugin_name;
+        let fail = |failure: CalloutFailure, result: CalloutResult| {
+            self.metric_sink.callout_failed(plugin, failure);
+            result
+        };
         let deadline = Instant::now() + callout.timeout;
         let mut response = match timeout(callout.timeout, self.send_to_peer(&callout)).await {
             Ok(Ok(response)) => response,
-            Ok(Err(synthetic_response)) => return synthetic_response,
-            Err(_) => return CalloutResult::timeout_response(),
+            Ok(Err((failure, synthetic_response))) => return fail(failure, synthetic_response),
+            Err(_) => return fail(CalloutFailure::Timeout, CalloutResult::timeout_response()),
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
         let limit = callout.plugin_conf.response_limit;
         let body_and_trailers = read_body_and_trailers(&mut response.session, limit);
-        let Ok(Ok(Some((body, trailers)))) = timeout(remaining, body_and_trailers).await else {
-            return CalloutResult::Failed;
+        let (body, trailers) = match timeout(remaining, body_and_trailers).await {
+            Ok(Ok(Some(body_and_trailers))) => body_and_trailers,
+            Ok(Ok(None)) => return fail(CalloutFailure::ResponseTooLarge, CalloutResult::Failed),
+            _ => return fail(CalloutFailure::FailedAfterHeader, CalloutResult::Failed),
         };
         let idle_timeout = response.peer.idle_timeout();
         self.connector
@@ -80,11 +91,12 @@ impl CalloutSender for ConnectorSender {
 impl ConnectorSender {
     /// Send the request of `callout` to a peer of its upstream, and read the response header.
     ///
-    /// Return the response to give to the plugin when no response header arrives.
+    /// Return the failure, and the response to give to the plugin, when no response header
+    /// arrives.
     async fn send_to_peer(
         &self,
         callout: &AcceptedCallout,
-    ) -> Result<ResponseInProgress, CalloutResult> {
+    ) -> Result<ResponseInProgress, (CalloutFailure, CalloutResult)> {
         let plugin = &callout.plugin_conf.plugin_name;
         let upstream = &callout.upstream;
         let target = CalloutTarget::new(plugin, upstream, &callout.request);
@@ -92,7 +104,8 @@ impl ConnectorSender {
             Ok(peer) => peer,
             Err(e) => {
                 debug!("wasm plugin {plugin} has no peer for the callout upstream {upstream}: {e}");
-                return Err(CalloutResult::no_healthy_upstream_response());
+                let response = CalloutResult::no_healthy_upstream_response();
+                return Err((CalloutFailure::NoPeer, response));
             }
         };
         let mut may_retry = true;
@@ -101,7 +114,8 @@ impl ConnectorSender {
                 Ok(connected) => connected,
                 Err(e) => {
                     debug!("wasm plugin {plugin} cannot connect to the callout upstream {upstream}: {e}");
-                    return Err(CalloutResult::connect_failure_response(&e));
+                    let response = CalloutResult::connect_failure_response(&e);
+                    return Err((connect_failure(&e), response));
                 }
             };
             session.set_write_timeout(peer.options.write_timeout);
@@ -123,7 +137,8 @@ impl ConnectorSender {
                 continue;
             }
             debug!("the callout of wasm plugin {plugin} to the upstream {upstream} failed: {e}");
-            return Err(CalloutResult::response_for_session_error(&e));
+            let response = CalloutResult::response_for_session_error(&e);
+            return Err((session_failure(&e), response));
         }
     }
 }
@@ -194,6 +209,7 @@ mod tests {
     use super::*;
     use crate::callout::headers::tests::{pairs, post_to_authz};
     use crate::callout::{PluginCalloutConf, StaticCalloutUpstreams};
+    use crate::metrics::NoMetricSink;
     use parking_lot::Mutex;
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -261,6 +277,7 @@ mod tests {
         ConnectorSender {
             connector: Arc::new(Connector::new(None)),
             upstreams: Arc::new(upstreams),
+            metric_sink: Arc::new(NoMetricSink),
         }
     }
 
@@ -491,6 +508,7 @@ mod tests {
         let sender = ConnectorSender {
             connector: Arc::new(Connector::new(None)),
             upstreams: Arc::new(NoHealthyPeer),
+            metric_sink: Arc::new(NoMetricSink),
         };
 
         let result = sender.send(post_callout("", NO_TIMEOUT_EXPECTED)).await;

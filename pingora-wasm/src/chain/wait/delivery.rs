@@ -25,8 +25,7 @@ use pingora_error::Result;
 use pingora_http::ResponseHeader;
 use pingora_proxy::Session;
 use proxy_wasm_host::abi::v0_2_1::types::StreamType;
-use proxy_wasm_host::abi::v0_2_1::{Callback, CalloutId, HeaderPairs, HttpCallResponse};
-use std::borrow::Cow;
+use proxy_wasm_host::abi::v0_2_1::{Callback, CalloutId};
 use std::mem;
 
 /// The phase that a plugin paused in.
@@ -71,27 +70,6 @@ impl PausedPhase<'_> {
     }
 }
 
-fn borrowed_header_pairs(pairs: &[(Vec<u8>, Vec<u8>)]) -> HeaderPairs<'_> {
-    pairs
-        .iter()
-        .map(|(name, value)| (Cow::Borrowed(&name[..]), Cow::Borrowed(&value[..])))
-        .collect()
-}
-
-/// Return `result` as the response that the host gives to `proxy_on_http_call_response`.
-fn http_call_response(result: &CalloutResult) -> HttpCallResponse<'_> {
-    match result {
-        CalloutResult::Response {
-            headers,
-            body,
-            trailers,
-        } => HttpCallResponse::received(borrowed_header_pairs(headers))
-            .with_body(Cow::Borrowed(&body[..]))
-            .with_trailers(borrowed_header_pairs(trailers)),
-        CalloutResult::Failed => HttpCallResponse::failed(),
-    }
-}
-
 impl WasmCtx {
     /// Run `proxy_on_http_call_response` of the plugin at `position` with the result of callout
     /// `id`.
@@ -112,7 +90,7 @@ impl WasmCtx {
         let loaded = locked.loaded()?;
         let delivery = self.with_phase_in_stream(session, position, phase, |ctx| {
             ctx.run_for_context(loaded, record.context, |scope| {
-                scope.on_http_call_response(record.context, id, http_call_response(result))
+                scope.on_http_call_response(record.context, id, result.as_http_call_response())
             })
         });
         match delivery {

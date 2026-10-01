@@ -37,6 +37,7 @@ fn wat_guest(label: &str, callback: &str, body: &str, delivery: &str) -> PathBuf
     let callbacks = format!(
         r#"(func (export "proxy_abi_version_0_2_1"))
   (func (export "proxy_on_vm_start") (param i32 i32) (result i32) i32.const 1)
+  (func (export "proxy_on_configure") (param i32 i32) (result i32) i32.const 1)
   (func (export "proxy_on_done") (param i32) (result i32) i32.const 1)
   (func (export "proxy_on_log") (param i32))
   (func (export "proxy_on_http_call_response") (param i32 i32 i32 i32 i32) {delivery})
@@ -91,4 +92,226 @@ pub fn relay_callout_body_plugin(name: &str, timeout_limit: Option<Duration>) ->
         conf.callout_timeout_limit = limit;
     }
     conf
+}
+
+/// Build a guest from the template with `callbacks`, which export every callback that the
+/// template does not export, and return its path.
+fn module(label: &str, callbacks: &str) -> PathBuf {
+    let wat = TEMPLATE.replace(
+        "\nCALLBACKS\n",
+        &format!("\n(func (export \"proxy_abi_version_0_2_1\"))\n{callbacks}\n"),
+    );
+    let path = std::env::temp_dir().join(format!(
+        "pingora-wasm-test-{label}-{}.wasm",
+        std::process::id()
+    ));
+    std::fs::write(&path, wat::parse_str(wat).unwrap()).unwrap();
+    path
+}
+
+/// The exports of a guest that a test does not change.
+struct Exports {
+    configure: &'static str,
+    request_headers: String,
+    response_headers: String,
+    done: &'static str,
+    log: String,
+    tick: &'static str,
+    http_call_response: &'static str,
+}
+
+impl Default for Exports {
+    fn default() -> Self {
+        Exports {
+            configure: "i32.const 1",
+            request_headers: "i32.const 0".to_string(),
+            response_headers: "i32.const 0".to_string(),
+            done: "i32.const 1",
+            log: String::new(),
+            tick: "",
+            http_call_response: "",
+        }
+    }
+}
+
+impl Exports {
+    fn into_wat(self, data: &str) -> String {
+        format!(
+            r#"{data}
+  (func (export "proxy_on_vm_start") (param i32 i32) (result i32) i32.const 1)
+  (func (export "proxy_on_configure") (param i32 i32) (result i32) {})
+  (func (export "proxy_on_request_headers") (param i32 i32 i32) (result i32) {})
+  (func (export "proxy_on_response_headers") (param i32 i32 i32) (result i32) {})
+  (func (export "proxy_on_done") (param i32) (result i32) {})
+  (func (export "proxy_on_log") (param i32) {})
+  (func (export "proxy_on_tick") (param i32) {})
+  (func (export "proxy_on_http_call_response") (param i32 i32 i32 i32 i32) {})"#,
+            self.configure,
+            self.request_headers,
+            self.response_headers,
+            self.done,
+            self.log,
+            self.tick,
+            self.http_call_response,
+        )
+    }
+}
+
+/// Text at address 700 and up, with the address and the length of each text.
+struct Texts {
+    data: String,
+    next: usize,
+}
+
+impl Texts {
+    fn new() -> Self {
+        Texts {
+            data: String::new(),
+            next: 700,
+        }
+    }
+
+    /// Add `text`, where `/` separates the segments of a property path.
+    fn add(&mut self, text: &str) -> (usize, usize) {
+        let at = self.next;
+        let escaped = text.replace('/', "\\00");
+        self.data += &format!("(data (i32.const {at}) \"{escaped}\")\n");
+        self.next += text.len() + 1;
+        (at, text.len())
+    }
+
+    fn log(&mut self, text: &str) -> String {
+        let (at, len) = self.add(text);
+        format!("(drop (call $log (i32.const 2) (i32.const {at}) (i32.const {len})))")
+    }
+
+    fn log_property(&mut self, path: &str) -> String {
+        let (at, len) = self.add(path);
+        format!("(call $log_property (i32.const {at}) (i32.const {len}))")
+    }
+
+    fn property_to_header(&mut self, map: u32, path: &str, header: &str) -> String {
+        let (path_at, path_len) = self.add(path);
+        let (name_at, name_len) = self.add(header);
+        format!(
+            "(call $property_to_header (i32.const {map}) (i32.const {path_at}) (i32.const {path_len}) (i32.const {name_at}) (i32.const {name_len}))"
+        )
+    }
+}
+
+fn one_slot(name: &str, path: PathBuf) -> WasmPluginConf {
+    let mut conf = WasmPluginConf::new(name, path);
+    conf.slots = 1;
+    conf
+}
+
+/// Build the configuration of a guest that logs `text` on each tick, every 100 ms.
+pub fn tick_logger(name: &str, text: &str) -> WasmPluginConf {
+    let mut texts = Texts::new();
+    let log = texts.log(text).leak();
+    let exports = Exports {
+        configure: "(drop (call $set_tick_period (i32.const 100))) i32.const 1",
+        tick: log,
+        ..Exports::default()
+    };
+    let path = module(name, &exports.into_wat(&texts.data));
+    one_slot(name, path)
+}
+
+/// Build the configuration of a guest that defines the counter `name` and adds one to it for
+/// each request.
+pub fn request_counter(plugin: &str, name: &str) -> WasmPluginConf {
+    let mut texts = Texts::new();
+    let (at, len) = texts.add(name);
+    let define =
+        format!("(drop (call $define_metric (i32.const 0) (i32.const {at}) (i32.const {len}) (i32.const 620))) i32.const 1");
+    let exports = Exports {
+        configure: define.leak(),
+        request_headers:
+            "(drop (call $increment_metric (i32.load (i32.const 620)) (i64.const 1))) i32.const 0"
+                .to_string(),
+        ..Exports::default()
+    };
+    let path = module(plugin, &exports.into_wat(&texts.data));
+    one_slot(plugin, path)
+}
+
+/// Build the configuration of a guest that adds each property of `request` as a request
+/// header, each property of `response` as a response header, and logs each property of `log`
+/// in `proxy_on_log`. Each pair is a path and a header name.
+pub fn property_reader(
+    name: &str,
+    request: &[(&str, &str)],
+    response: &[(&str, &str)],
+    log: &[&str],
+) -> WasmPluginConf {
+    let mut texts = Texts::new();
+    let request: Vec<_> = request
+        .iter()
+        .map(|(path, header)| texts.property_to_header(0, path, header))
+        .collect();
+    let response: Vec<_> = response
+        .iter()
+        .map(|(path, header)| texts.property_to_header(2, path, header))
+        .collect();
+    let log: Vec<_> = log.iter().map(|path| texts.log_property(path)).collect();
+    let exports = Exports {
+        request_headers: format!("{} i32.const 0", request.join(" ")),
+        response_headers: format!("{} i32.const 0", response.join(" ")),
+        log: log.join(" "),
+        ..Exports::default()
+    };
+    let path = module(name, &exports.into_wat(&texts.data));
+    one_slot(name, path)
+}
+
+/// Build the configuration of a guest that sends a callout on its first tick, and logs
+/// `text` when the callout response arrives.
+pub fn root_callout(name: &str, text: &str) -> WasmPluginConf {
+    let mut texts = Texts::new();
+    let log = texts.log(text);
+    let exports = Exports {
+        configure: "(drop (call $set_tick_period (i32.const 50))) i32.const 1",
+        tick: "(if (i32.eqz (i32.load (i32.const 604)))
+            (then (i32.store (i32.const 604) (i32.const 1)) (call $call_and_log_status)))",
+        http_call_response: format!("(if (local.get 2) (then {log}))").leak(),
+        ..Exports::default()
+    };
+    let path = module(name, &exports.into_wat(&texts.data));
+    one_slot(name, path)
+}
+
+/// Build the configuration of a guest that sends a callout from `proxy_on_done` and holds its
+/// context, calls `proxy_done` for it when the response arrives, and logs `logged` from
+/// `proxy_on_log`.
+pub fn held_context(name: &str, logged: &str) -> WasmPluginConf {
+    let mut texts = Texts::new();
+    let log = texts.log(logged);
+    let exports = Exports {
+        done: "(i32.store (i32.const 608) (local.get 0)) (call $call_and_log_status) i32.const 0",
+        http_call_response: "(drop (call $set_effective_context (i32.load (i32.const 608))))
+            (drop (call $done))",
+        log,
+        ..Exports::default()
+    };
+    let path = module(name, &exports.into_wat(&texts.data));
+    one_slot(name, path)
+}
+
+/// Build the configuration of a guest that sends a callout from the request headers and
+/// continues, holds its context in `proxy_on_done`, calls `proxy_done` for it when any callout
+/// result arrives, and logs `logged` from `proxy_on_log`.
+pub fn held_context_with_an_earlier_callout(name: &str, logged: &str) -> WasmPluginConf {
+    let mut texts = Texts::new();
+    let log = texts.log(logged);
+    let exports = Exports {
+        request_headers: "(call $call_without_pause)".to_string(),
+        done: "(i32.store (i32.const 608) (local.get 0)) i32.const 0",
+        http_call_response: "(drop (call $set_effective_context (i32.load (i32.const 608))))
+            (drop (call $done))",
+        log,
+        ..Exports::default()
+    };
+    let path = module(name, &exports.into_wat(&texts.data));
+    one_slot(name, path)
 }

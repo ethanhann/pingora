@@ -16,6 +16,7 @@ use super::ctx::PluginRecord;
 use super::slot::LockedSlot;
 use super::wait::{CalloutWaitOutcome, PausedPhase};
 use super::{RequestOutcome, ResponseProgress, WasmCtx};
+use crate::properties::built_in::TlsFacts;
 use crate::stream::PluginResponse;
 use http::uri::Scheme;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
@@ -23,6 +24,7 @@ use pingora_error::Result;
 use pingora_proxy::Session;
 use proxy_wasm_host::abi::v0_2_1::types::{Action, StreamType};
 use proxy_wasm_host::abi::v0_2_1::StreamKind;
+use std::time::{Instant, SystemTime};
 
 const PAUSED_A_REQUEST: &str = "paused a request";
 
@@ -54,12 +56,13 @@ impl WasmCtx {
             return Ok(RequestOutcome::Continue);
         }
         self.refuse_after_cancelled_wait()?;
-        self.chain.runtime.start_ticker()?;
+        self.chain.runtime.start_threads()?;
         let end_of_stream = session.is_body_empty();
         if !end_of_stream {
             self.request_body.expect_body();
         }
         self.scheme = scheme_of(session);
+        self.record_request_facts(session);
         for position in 0..self.chain.plugins.len() {
             let action = self.run_request_headers_at(session, position, end_of_stream)?;
             let sent = self.stream().plugin_response.take();
@@ -144,6 +147,18 @@ impl WasmCtx {
         self.pass_plugin_response(session, position, &mut header, empty)?;
         self.response_progress = ResponseProgress::FromPlugin;
         Ok(RequestOutcome::Respond(Box::new(header), response.body))
+    }
+}
+
+impl WasmCtx {
+    /// Record the facts of the request that the headers do not have, for the properties.
+    fn record_request_facts<DS: DownstreamSession>(&mut self, session: &Session<DS>) {
+        let facts = &mut self.stream().facts;
+        facts.client_address = session.client_addr().and_then(|a| a.as_inet()).copied();
+        facts.server_address = session.server_addr().and_then(|a| a.as_inet()).copied();
+        let tls = session.digest().and_then(|d| d.ssl_digest.as_deref());
+        facts.tls = tls.map(TlsFacts::new);
+        facts.start = Some((SystemTime::now(), Instant::now()));
     }
 }
 
