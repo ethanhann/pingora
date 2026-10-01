@@ -119,7 +119,8 @@ impl RootCallbackThread {
 ///
 /// The thread waits for work inside `block_on` and runs the work outside it. When the thread
 /// holds the last reference to the `WasmRuntime`, the runtime drops outside `block_on`, where
-/// a connector that owns a tokio runtime can drop without a panic.
+/// a service of the proxy that owns a tokio runtime, such as a log sink, can drop without a
+/// panic.
 fn run_root_callback_loop(
     tokio_runtime: &Runtime,
     runtime: &Weak<RuntimeInner>,
@@ -153,7 +154,7 @@ mod tests {
     use proxy_wasm_host::abi::v0_2_1::CalloutId;
     use proxy_wasm_host::abi::v0_2_1::{GuestId, LogContext, LogSink};
     use std::collections::HashSet;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -295,6 +296,50 @@ mod tests {
         assert!(wait_until(|| running.load(Ordering::Relaxed)));
 
         drop(runtime);
+
+        assert!(wait_until(|| !running.load(Ordering::Relaxed)));
+    }
+
+    /// A log sink that owns a tokio runtime, and that keeps a guest call that logs from
+    /// returning until the test releases it.
+    struct BlockingSinkWithTokioRuntime {
+        _tokio_runtime: tokio::runtime::Runtime,
+        in_guest_call: Arc<AtomicBool>,
+        released: Arc<AtomicBool>,
+    }
+
+    impl LogSink for BlockingSinkWithTokioRuntime {
+        fn log(&self, _context: LogContext<'_>, _level: LogLevel, _message: &[u8]) {
+            self.in_guest_call.store(true, Ordering::Relaxed);
+            wait_until(|| self.released.load(Ordering::Relaxed));
+        }
+    }
+
+    #[test]
+    fn a_runtime_that_drops_during_a_tick_ends_the_thread_with_no_panic() {
+        let in_guest_call = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        let services = WasmServices {
+            log_sink: Arc::new(BlockingSinkWithTokioRuntime {
+                _tokio_runtime: tokio::runtime::Runtime::new().unwrap(),
+                in_guest_call: in_guest_call.clone(),
+                released: released.clone(),
+            }),
+            ..WasmServices::default()
+        };
+        let wat = Wat {
+            configure: TICK_EVERY_20_MS,
+            tick: Some(LOG_TICK),
+            ..Wat::default()
+        };
+        let plugin_conf = plugin("drop-in-tick", wat_guest("drop-in-tick", wat), 1);
+        let runtime = WasmRuntime::new_with_services(vec![plugin_conf], services).unwrap();
+        runtime.inner.start_threads().unwrap();
+        let running = runtime.inner.root_callback_thread.running.clone();
+        assert!(wait_until(|| in_guest_call.load(Ordering::Relaxed)));
+        drop(runtime);
+
+        released.store(true, Ordering::Relaxed);
 
         assert!(wait_until(|| !running.load(Ordering::Relaxed)));
     }
