@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! What a plugin can read and write during a callback: the headers, the body, the response
-//! trailers, and the response it can send in place of the upstream response.
+//! The stream state that a plugin reads and writes during a callback. It holds the headers,
+//! the body, the response trailers, and the response that a plugin can send in place of the
+//! upstream response.
 
 mod body;
 mod names;
@@ -41,7 +42,7 @@ use std::sync::Arc;
 
 /// The state that a guest can read and write during one callback.
 ///
-/// The phases move the Pingora headers, the body bytes, and the trailers into it before each
+/// Each filter moves the Pingora headers, the body bytes, and the trailers into it before each
 /// callback, and back after it.
 #[derive(Default)]
 pub(crate) struct PingoraStream {
@@ -198,7 +199,7 @@ impl StreamState for PingoraStream {
             );
         }
         if let Some(grpc_status) = response.grpc_status {
-            warn!("plugin response gRPC status {grpc_status} is not sent");
+            warn!("the gRPC status {grpc_status} of a wasm plugin response is not sent");
         }
         self.plugin_response = Some(plugin_response);
         Ok(())
@@ -283,7 +284,7 @@ mod tests {
         }
     }
 
-    fn served(
+    fn is_available(
         stream: &mut PingoraStream,
         callback: Callback,
         access: Access,
@@ -293,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn header_map_follows_the_table() {
+    fn header_map_allows_each_map_only_in_the_callbacks_that_can_use_it() {
         use Access::{Read, Write};
         use Callback::*;
         use MapType::{
@@ -344,7 +345,7 @@ mod tests {
 
         let got: Vec<_> = cases
             .iter()
-            .map(|(cb, access, map, _)| served(&mut s, *cb, *access, *map))
+            .map(|(cb, access, map, _)| is_available(&mut s, *cb, *access, *map))
             .collect();
 
         let want: Vec<_> = cases.iter().map(|c| c.3).collect();
@@ -441,10 +442,10 @@ mod tests {
     }
 
     #[test]
-    fn header_map_refuses_other_map_types() {
+    fn header_map_refuses_request_trailers_in_proxy_on_request_headers() {
         let mut s = stream(true);
 
-        let trailers = served(
+        let trailers = is_available(
             &mut s,
             Callback::RequestHeaders,
             Access::Read,
@@ -473,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn buffer_follows_the_table() {
+    fn buffer_allows_a_body_only_in_its_own_body_callback() {
         use BufferType::{HttpRequestBody as Req, HttpResponseBody as Resp};
         let cases = [
             (Callback::RequestBody, Req, true),
@@ -485,7 +486,7 @@ mod tests {
             (Callback::Log, Resp, false),
             (Callback::RequestBody, BufferType::DownstreamData, false),
         ];
-        for (callback, buffer, served) in cases {
+        for (callback, buffer, available) in cases {
             let mut s = stream(true);
 
             let status = s
@@ -493,7 +494,7 @@ mod tests {
                 .map(|_| ())
                 .err();
 
-            let expected = (!served).then_some(Status::NotFound);
+            let expected = (!available).then_some(Status::NotFound);
             assert_eq!(status, expected, "{callback:?}");
         }
     }
@@ -515,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn send_local_response_replaces_a_first_call() {
+    fn a_second_send_local_response_replaces_the_first_response() {
         let mut s = stream(false);
         s.send_local_response(call(Callback::RequestHeaders), local(403))
             .unwrap();
@@ -527,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn send_local_response_follows_the_table() {
+    fn send_local_response_is_allowed_only_in_the_request_and_response_callbacks() {
         let cases = [
             (Callback::RequestHeaders, 403, Ok(())),
             (Callback::RequestBody, 403, Ok(())),

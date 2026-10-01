@@ -31,7 +31,7 @@ pub(super) struct StartedGuest {
 
 /// How a start ended when the guest did not fail.
 enum StartOutcome {
-    Serving,
+    Started,
     Refused(Callback),
 }
 
@@ -65,15 +65,15 @@ impl GuestPool {
             if !scope.on_configure(root, plugin)? {
                 return Ok(StartOutcome::Refused(Callback::Configure));
             }
-            Ok(StartOutcome::Serving)
+            Ok(StartOutcome::Started)
         });
         let _root_stream = scope.finish();
         match outcome {
-            Ok(StartOutcome::Serving) => {}
+            Ok(StartOutcome::Started) => {}
             Ok(StartOutcome::Refused(callback)) => {
                 return Err(plugin_unavailable(
                     &self.name,
-                    &format!("refused its start in {callback}"),
+                    &format!("refused to start in {callback}"),
                 ))
             }
             Err(e) => return Err(plugin_failure(&self.name, "failed to start", e)),

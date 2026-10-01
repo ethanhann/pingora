@@ -84,7 +84,7 @@ pub(super) fn build_pool(
 ) -> Result<GuestPool> {
     let bytes = std::fs::read(&plugin.path).or_err_with(ErrorType::ReadError, || {
         format!(
-            "wasm plugin {} cannot read {}",
+            "failed to read wasm plugin {} from {}",
             plugin.name,
             plugin.path.display()
         )

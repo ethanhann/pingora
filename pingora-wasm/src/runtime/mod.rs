@@ -170,14 +170,15 @@ impl WasmRuntime {
         })
     }
 
-    /// Build a chain of the named plugins.
+    /// Build a chain of the plugins in `names`.
     ///
     /// The request phase runs the plugins in this order, and the response phase runs them in
     /// reverse. A plugin can be in several chains, and all of them use its guests.
     ///
     /// # Errors
     ///
-    /// An empty list, a name that is not in the runtime, or a name listed twice.
+    /// An error when `names` is empty, when a name is not in the runtime, or when a name is listed
+    /// twice.
     pub fn chain(&self, names: &[&str]) -> Result<WasmChain> {
         if names.is_empty() {
             return Error::e_explain(ErrorType::InternalError, "a wasm chain needs a plugin");
@@ -203,8 +204,9 @@ impl WasmRuntime {
 
     /// Return the number of plugin contexts that are open.
     ///
-    /// Each plugin of a chain opens one context for each request, and [WasmCtx::logging](crate::WasmCtx::logging) closes
-    /// it. The number returns to zero when no request is in progress.
+    /// Each plugin of a chain opens one context for each request, and
+    /// [WasmCtx::logging](crate::WasmCtx::logging) closes it. The number returns to zero when no
+    /// request is in progress.
     pub fn open_contexts(&self) -> usize {
         self.inner.pools.iter().map(GuestPool::open_contexts).sum()
     }
@@ -217,7 +219,7 @@ impl WasmRuntime {
         self.inner.pools.iter().map(GuestPool::held_contexts).sum()
     }
 
-    /// Return the number of callouts that the runtime is sending.
+    /// Return the number of callouts in flight.
     ///
     /// A callout counts until it receives its response or reaches its timeout, even when its
     /// request has already ended.
@@ -306,7 +308,7 @@ mod tests {
             (vec![fuel], "fuel sets a fuel limit"),
             (
                 vec![plugin("gone", "/no/such/file.wasm".into(), 1)],
-                "gone cannot read",
+                "failed to read wasm plugin gone",
             ),
             (vec![plugin("text", text, 1)], "text does not compile"),
             (
@@ -335,7 +337,7 @@ mod tests {
                     ),
                     1,
                 )],
-                "refused refused its start",
+                "refused refused to start",
             ),
             (
                 vec![plugin(

@@ -185,8 +185,9 @@ impl GuestPool {
         }
     }
 
-    /// Lock the slot of a request. Return `None` when a new guest replaced the one that holds
-    /// the context of the request.
+    /// Lock the slot of a request.
+    ///
+    /// Return `None` when a new guest replaced the guest that holds the context of the request.
     pub(crate) fn lock(&self, index: usize, guest: GuestId) -> Option<SlotGuard<'_>> {
         let guard = self.slots[index].guest.lock();
         match guard.as_ref() {
@@ -195,10 +196,10 @@ impl GuestPool {
         }
     }
 
-    /// Replace the guest of a slot when `err` leaves it unusable, which happens after a trap or
-    /// when the guest has no context ids left.
+    /// Replace the guest of a slot when `err` leaves it unusable.
     ///
-    /// Return whether the guest left its slot, which is also the case when the rebuild fails.
+    /// A trap leaves a guest unusable, and so does a guest with no context ids left. Return
+    /// whether the guest left its slot, which is also the case when the rebuild fails.
     pub(crate) fn check(&self, index: usize, mut guard: SlotGuard<'_>, err: &GuestError) -> bool {
         let lost = match guard.as_ref() {
             Some(loaded) => {
@@ -396,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn a_recent_failed_rebuild_waits_for_its_backoff() {
+    fn pick_waits_for_a_busy_slot_while_a_lost_guest_is_in_its_backoff() {
         let runtime =
             WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 2)]).unwrap();
         let pool = &runtime.inner.pools[0];
