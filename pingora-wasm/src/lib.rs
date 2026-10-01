@@ -123,6 +123,12 @@
 //! Plugins with the same [VM id](WasmPluginConf::vm_id) share data, queues, and metrics, and
 //! each plugin still has its own guests.
 //!
+//! A plugin can keep its context after the request ends, for example to wait for the response
+//! to a callout that it sent from `proxy_on_done`. Its `proxy_on_done` then returns `false`,
+//! and the plugin calls `proxy_done` later. The runtime delivers the results of the callouts of
+//! such a context on the same thread, and then runs its `proxy_on_log` and `proxy_on_delete`.
+//! [WasmRuntime::held_contexts] counts the contexts that plugins hold.
+//!
 //! # Metrics
 //!
 //! Plugins define counters, gauges, and histograms. To publish them, pass a [WasmMetricSink] in
@@ -165,7 +171,25 @@
 //!
 //! For facts that do not change, such as the name of the node, use
 //! [WasmServices::fixed_properties]. A plugin cannot change a property that your proxy set or
-//! one that the runtime provides.
+//! one that the runtime provides. Ticks and the other callbacks that run with no request read
+//! only the fixed properties.
+//!
+//! The runtime provides these properties, with the encoding of Envoy, where an integer is 8
+//! little-endian bytes and a bool is one byte:
+//!
+//! - `source.address`, `source.port`, `destination.address`, and `destination.port`
+//! - `request.path`, `request.url_path`, `request.host`, `request.scheme`, `request.method`,
+//!   and `request.protocol`
+//! - `request.time` in nanoseconds since the Unix epoch, and `request.size`
+//! - `response.code` in the response phases and in `logging`
+//! - `request.duration` and `response.size` in `logging`
+//! - `connection.mtls` and `connection.tls_version` for a TLS downstream
+//! - `upstream.address` and `upstream.port` after [WasmCtx::upstream_connected]
+//! - `plugin_name`, `plugin_root_id`, and `plugin_vm_id`
+//!
+//! Pingora does not count header bytes and does not keep the server name of a TLS connection,
+//! so `request.total_size`, `response.total_size`, and `connection.requested_server_name` are
+//! not provided.
 //!
 //! # When a plugin fails
 //!
