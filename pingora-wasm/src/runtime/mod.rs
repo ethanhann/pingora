@@ -17,6 +17,7 @@
 mod build;
 use build::{build_pool, checked_plugin_indexes, new_shared_store, PoolInputs};
 mod fail_policy;
+mod lifecycle;
 mod plugin;
 pub(crate) mod pool;
 mod services;
@@ -36,7 +37,7 @@ use crate::invalid_conf;
 use crate::observability::WasmMetricSink;
 use crate::properties::WasmProperties;
 use crate::root_callbacks::RootCallbackThread;
-use once_cell::sync::OnceCell;
+use lifecycle::Lifecycle;
 use pingora_core::connectors::http::Connector;
 use pingora_error::{ErrorType, OrErr, Result};
 use pool::GuestPool;
@@ -74,7 +75,7 @@ pub struct WasmRuntime {
 pub(crate) struct RuntimeInner {
     engine: Engine,
     ticker: Ticker,
-    threads_started: OnceCell<()>,
+    pub(crate) lifecycle: Lifecycle,
     pub(crate) pools: Vec<GuestPool>,
     pub(crate) callout_launcher: CalloutLauncher,
     pub(crate) root_callback_thread: RootCallbackThread,
@@ -185,7 +186,7 @@ impl WasmRuntime {
             inner: Arc::new(RuntimeInner {
                 engine,
                 ticker: Ticker::new(),
-                threads_started: OnceCell::new(),
+                lifecycle: Lifecycle::default(),
                 pools,
                 callout_launcher,
                 root_callback_thread,
@@ -263,11 +264,10 @@ impl RuntimeInner {
         // The threads cannot be started in `WasmRuntime::new`. When daemonizing, Pingora forks
         // after the runtime has been built, and threads do not survive a fork. This is called on
         // the request path instead, where only the first successful call does any work.
-        self.threads_started.get_or_try_init(|| {
+        self.lifecycle.start_threads_once(|| {
             self.root_callback_thread.start(Arc::downgrade(self))?;
             self.ticker.start(self)
-        })?;
-        Ok(())
+        })
     }
 
     pub(crate) fn plugin_names(&self) -> Vec<&str> {

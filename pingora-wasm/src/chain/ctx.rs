@@ -93,6 +93,7 @@ impl WasmCtx {
     pub(crate) fn new(chain: WasmChain) -> Self {
         let records = vec![None; chain.plugins.len()];
         let stream = PingoraStream::new(chain.runtime.fixed_properties.clone());
+        chain.runtime.lifecycle.ctx_created();
         WasmCtx {
             response_progress: ResponseProgress::NotStarted,
             request_body: RequestBodyState::new(),
@@ -246,6 +247,7 @@ impl Drop for WasmCtx {
             });
             self.end_or_hold_context(position, locked, record.context, result, false);
         }
+        runtime.lifecycle.ctx_dropped();
     }
 }
 
