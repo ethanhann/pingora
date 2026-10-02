@@ -153,13 +153,12 @@ impl WasmCtx {
             Some(cause) => format!("{}: {cause}", failure.detail),
             None => failure.detail.clone(),
         };
-        debug!("wasm plugin {plugin}: {detail}, continuing without the plugin");
         match pool.skipped_plugin_warnings.count_event(Instant::now()) {
             Some(1) => warn!("wasm plugin {plugin}: {detail}, continuing without the plugin"),
             Some(skips) => warn!(
                 "wasm plugin {plugin}: {detail}, continuing without the plugin, {skips} requests skipped it since the last warning"
             ),
-            None => {}
+            None => debug!("wasm plugin {plugin}: {detail}, continuing without the plugin"),
         }
     }
 
@@ -608,7 +607,7 @@ mod tests {
         for (phase, policy) in cases {
             let mut optional = plugin_with_callback_in("optional", phase, CALL_AND_PAUSE, "");
             optional.fail_policy = policy;
-            optional.callout_timeout_limit = Duration::from_millis(50);
+            optional.callout_timeout_limit = Duration::from_millis(40);
             optional.callout_wait_limit = Duration::from_millis(50);
             let never_responds = FixedSender::responds_after("late", Arc::new(Notify::new()));
             let plugins = chain_with_next(optional, phase);
@@ -651,7 +650,7 @@ mod tests {
             STORE_CONTEXT_AND_CALL,
             CALL_AGAIN,
         );
-        chained.callout_timeout_limit = Duration::from_millis(50);
+        chained.callout_timeout_limit = Duration::from_millis(40);
         chained.callout_wait_limit = Duration::from_millis(50);
         let (mut services, reports) = services_with_reports();
         services.max_callouts_in_flight = 1;
