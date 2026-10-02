@@ -118,7 +118,11 @@ impl WasmCtx {
             }
             Err((callback, e)) => {
                 error!("wasm plugin {}: {callback} failed: {e}", locked.pool.name);
-                locked.replace_guest_if_unusable(&e);
+                let (pool, slot) = (locked.pool, locked.slot);
+                // Replacing the guest already resets the slot's count of open contexts to zero
+                if !locked.replace_guest_if_unusable(&e) {
+                    pool.deleted(slot);
+                }
                 let (failure, outcome) = (PluginFailure::GuestError, PluginFailureOutcome::Failed);
                 self.report_failure(position, failure, outcome, Some(callback));
             }
@@ -147,7 +151,9 @@ pub(super) fn finish<H: StreamState>(
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support::{add_request_header, one_plugin, session, wat_plugin, GET};
+    use crate::test_support::{
+        add_request_header, one_plugin, plugin, session, wat_guest, wat_plugin, Wat, GET,
+    };
 
     #[tokio::test]
     async fn logging_skips_replaced_guest() {
@@ -180,5 +186,22 @@ mod tests {
 
         assert_eq!(open, 1);
         assert_eq!(runtime.open_contexts(), 0);
+    }
+
+    #[tokio::test]
+    async fn logging_closes_context_when_done_returns_unexpected_value() {
+        let done = Wat {
+            done: "i32.const 7",
+            ..Wat::default()
+        };
+        let (runtime, mut ctx) = one_plugin(plugin("a", wat_guest("bad-done", done), 1));
+        let (mut session, _client) = session(GET).await;
+        ctx.request_filter(&mut session).await.unwrap();
+
+        ctx.logging(&mut session).await;
+
+        assert_eq!(runtime.open_contexts(), 0);
+        let slot = runtime.inner.pools[0].lock_slot(0);
+        assert!(slot.as_ref().unwrap().guest.is_serving());
     }
 }

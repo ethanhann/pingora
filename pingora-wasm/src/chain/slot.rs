@@ -52,7 +52,7 @@ impl<'a> LockedSlot<'a> {
         }
     }
 
-    pub(super) fn replace_guest_if_unusable(self, cause: &GuestError) {
-        self.pool.replace_if_unusable(self.slot, self.guard, cause);
+    pub(super) fn replace_guest_if_unusable(self, cause: &GuestError) -> bool {
+        self.pool.replace_if_unusable(self.slot, self.guard, cause)
     }
 }
