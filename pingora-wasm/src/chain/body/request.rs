@@ -28,46 +28,18 @@ impl WasmCtx {
     /// Call this from your `request_body_filter` and pass its arguments through. Only plugins
     /// that have [request_body](crate::WasmPluginConf::request_body) enabled and export the
     /// callback are run. By default no plugin runs on request bodies and this filter does
-    /// nothing. It also does nothing for a request without a body, for a subrequest, after an
-    /// upgrade, and once a plugin has sent its own response.
+    /// nothing.
     ///
-    /// Plugins can read and replace the body, and can read the request headers. Pingora has
-    /// already sent the request header upstream by the time it reads the body, so a plugin that
-    /// changes the body length must remove `content-length` in `proxy_on_request_headers`.
+    /// A plugin may send its own response, e.g. to deny a request after inspecting the body.
+    /// This filter writes it to the downstream and then returns an error with the response
+    /// status to stop the request. It returns an
+    /// [ERR_REQUEST_BODY_TOO_LARGE](crate::ERR_REQUEST_BODY_TOO_LARGE) error if a plugin holds
+    /// more bytes than its [request_body_limit](crate::WasmPluginConf::request_body_limit).
     ///
-    /// A plugin may pause to buffer more of the body. Its bytes are then held back, up to
-    /// [request_body_limit](crate::WasmPluginConf::request_body_limit), and the filter leaves an
-    /// empty chunk in `body`, so nothing is sent upstream for it. With the next chunk the plugin
-    /// sees the held bytes followed by the new ones. A plugin may also pause while waiting for a
-    /// callout, in which case this filter waits with it, and the bytes it was holding move on to
-    /// the next plugin once it continues.
-    ///
-    /// A plugin may send its own response instead, e.g. to deny a request after inspecting the
-    /// body. That plugin and the plugins ahead of it in the chain run `proxy_on_response_headers`
-    /// on the response before it is written to the downstream. This filter then returns an error
-    /// with the response status to stop the request, and [WasmCtx::plugin_responded] returns
-    /// `true`.
-    ///
-    /// When Pingora retries the request, the body bytes it replays are not run through the
-    /// plugins again. The upstream gets what the plugins produced the first time. This relies on
-    /// [WasmCtx::upstream_attempt] being called from `upstream_peer` for every attempt.
-    ///
-    /// # Errors
-    ///
-    /// For a plugin with [FailPolicy::Closed](crate::FailPolicy::Closed), returns
-    /// [ERR_PLUGIN_FAILED] if the plugin traps or otherwise fails, pauses on the last chunk of
-    /// the body and does not continue, waits for callouts longer than its
-    /// [callout_wait_limit](crate::WasmPluginConf::callout_wait_limit), or lost the guest holding
-    /// this request. A plugin with [FailPolicy::Open](crate::FailPolicy::Open) is skipped
-    /// instead, unless it has already changed the request body or its length, or a response body
-    /// that can still have bytes to come. See
-    /// [fail_policy](crate::WasmPluginConf::fail_policy) for the full rule.
-    ///
-    /// Under both policies, returns [ERR_PLUGIN_FAILED] if a plugin sends a response after the
-    /// response header has been processed, if [WasmCtx::upstream_attempt] was never called, or if
-    /// an earlier filter of this request was cancelled while a plugin was waiting for a callout.
-    /// Returns [ERR_REQUEST_BODY_TOO_LARGE](crate::ERR_REQUEST_BODY_TOO_LARGE) if a plugin holds
-    /// more bytes than its limit.
+    /// Pingora has already sent the request header upstream by the time it reads the body, so a
+    /// plugin that changes the body length must remove `content-length` in
+    /// `proxy_on_request_headers`. This filter also returns an error if a plugin runs on the
+    /// body and [WasmCtx::upstream_attempt] was not called from `upstream_peer`.
     pub async fn request_body_filter<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -89,6 +61,7 @@ impl WasmCtx {
         // An H2 downstream that sends request trailers ends its body with `None` and never sets
         // the end flag
         let end_of_stream = end_of_stream || body.is_none();
+        // A retry gets what the plugins produced the first time, without running them again
         let replay = mem::take(&mut self.request_body.replay_due)
             && self.request_body.progress != RequestBodyProgress::Waiting;
         if let (true, Some(kept)) = (replay, self.request_body.kept.as_ref()) {

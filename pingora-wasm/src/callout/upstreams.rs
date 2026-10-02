@@ -71,19 +71,15 @@ pub trait CalloutUpstreams: Send + Sync {
 
     /// Select the peer for one callout.
     ///
-    /// This is called from the task that sends the callout, after [Self::has_upstream] has
-    /// returned `true` for it. The time spent here counts against the callout's timeout, and the
-    /// future is dropped if that timeout expires.
+    /// The time spent here counts against the callout's timeout, and the future is dropped if
+    /// that timeout expires. Return an error if the upstream has no peer to offer, e.g. because
+    /// every backend is unhealthy. The plugin then gets a 503 response with the body
+    /// `no healthy upstream`.
     ///
     /// `HttpPeer::new` resolves a hostname with a blocking call, so build your peers before the
     /// server starts or pass an IP address. A TLS peer needs one of this crate's TLS features,
     /// such as `openssl` or `rustls`, to be enabled. Without one, the callout fails when its
     /// timeout expires.
-    ///
-    /// # Errors
-    ///
-    /// Return an error if the upstream has no peer to offer, e.g. because every backend is
-    /// unhealthy. The plugin then gets a 503 response with the body `no healthy upstream`.
     async fn callout_peer(&self, target: &CalloutTarget<'_>) -> Result<Box<HttpPeer>>;
 }
 
@@ -102,9 +98,6 @@ pub struct CalloutTarget<'a> {
 
 impl<'a> CalloutTarget<'a> {
     /// Create a target, e.g. to test your own [CalloutUpstreams].
-    ///
-    /// The struct is non-exhaustive, so this is how you build one outside of this crate. Any
-    /// field added in a later version will be given a default value here.
     pub fn new(plugin_name: &'a str, upstream_name: &'a str, request: &'a RequestHeader) -> Self {
         CalloutTarget {
             plugin_name,
@@ -129,13 +122,11 @@ impl StaticCalloutUpstreams {
     }
 
     /// Add an upstream, or replace the peer of one already in the map.
-    ///
-    /// Returns the peer the upstream had before, if any.
     pub fn insert(&mut self, upstream_name: impl Into<String>, peer: HttpPeer) -> Option<HttpPeer> {
         self.peers.insert(upstream_name.into(), peer)
     }
 
-    /// Return the peer of an upstream, or `None` if the upstream is not in the map.
+    /// Return the peer of an upstream.
     pub fn peer(&self, upstream_name: &str) -> Option<&HttpPeer> {
         self.peers.get(upstream_name)
     }

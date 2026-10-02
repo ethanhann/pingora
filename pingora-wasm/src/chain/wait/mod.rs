@@ -14,7 +14,7 @@
 
 //! Waiting for callouts
 //!
-//! A plugin that pauses with a callout in flight keeps its phase waiting. Results are delivered
+//! A plugin that pauses with a callout in flight keeps its filter waiting. Results are delivered
 //! to the plugin as they arrive, until it continues, sends a response, or has no callout left.
 
 mod delivery;
@@ -36,33 +36,20 @@ use std::pin::pin;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-/// Upper bound on the wait limit that is applied, so that computing the deadline cannot overflow.
 const LONGEST_WAIT_LIMIT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
-/// Outcome of [WasmCtx::wait_for_callouts].
 pub(super) enum CalloutWaitOutcome {
-    /// The plugin continued.
     Continued,
     /// The plugin is still paused and has no callout left to wait for.
     StillPaused,
-    /// The plugin sent its own response.
     Respond(Box<PluginResponse>),
-    /// The plugin failed during the wait and was skipped. The pass continues without it.
     PluginSkipped,
 }
 
 impl WasmCtx {
-    /// Fail the filter if an earlier filter of this request was cancelled during a callout wait.
-    ///
-    /// A filter is cancelled when its future is dropped. If that happened while a plugin was
-    /// waiting for a callout, the plugin is still paused in that filter, so the header, body, and
-    /// trailer filters that follow fail the request. [WasmCtx::logging] still runs.
-    ///
-    /// # Errors
-    ///
-    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if a callout wait was cancelled.
-    /// The failure is reported for the plugin that was waiting.
     pub(super) fn refuse_after_cancelled_wait(&mut self) -> Result<()> {
+        // A dropped filter future leaves its plugin paused in that filter, so the later header,
+        // body, and trailer filters fail the request
         match self.callouts.waiting_position {
             Some(position) => {
                 Err(self.failed_request_error(position, FilterFailure::cancelled_wait()))
@@ -71,60 +58,39 @@ impl WasmCtx {
         }
     }
 
-    /// Return `true` if the plugin that returned `action` from the last guest call is paused in
-    /// `direction`.
-    ///
-    /// A plugin that returns `Pause` but asked to continue `direction` during the same call is
-    /// not paused.
     pub(super) fn plugin_stays_paused(&mut self, action: Action, direction: StreamType) -> bool {
         action == Action::Pause && !self.stream().continue_requested(direction)
     }
 
-    /// Return `true` if the plugin at `position` has a callout pending.
     pub(super) fn waits_for_callout(&self, position: usize) -> bool {
         self.callouts.has_pending(position)
     }
 
-    /// Start the callouts the plugin at `position` made during the last guest call.
-    ///
-    /// If the plugin is `paused`, the callouts become pending so the phase can wait for their
-    /// results. Otherwise the callouts are still sent, but their results are discarded.
     pub(super) fn start_callouts(&mut self, position: usize, paused: bool) {
         let runtime = self.chain.runtime.clone();
         for callout in self.callouts.take_accepted() {
             let id = callout.id;
             match runtime.callout_launcher.spawn(callout) {
                 Some(result) if paused => self.callouts.add_pending(position, id, result),
+                // The callout of a plugin that is not paused is still sent, and its result is
+                // discarded
                 _ => {}
             }
         }
     }
 
     /// Deliver pending callout results to the plugin at `position` as they arrive.
-    ///
-    /// Returns once the plugin continues, sends a response, or has no pending callout left.
-    /// Callouts still pending at that point are no longer waited for.
-    ///
-    /// The whole wait is bounded by the plugin's `callout_wait_limit`, or by
-    /// [LONGEST_WAIT_LIMIT] if that is shorter. Running past the limit is a plugin failure, as is
-    /// a failed delivery, and both return [CalloutWaitOutcome::PluginSkipped] if the plugin is
-    /// skipped.
-    ///
-    /// If this future is dropped mid-wait, `waiting_position` stays set, which is what
-    /// [Self::refuse_after_cancelled_wait] checks.
-    ///
-    /// # Errors
-    ///
-    /// Returns the failure's error if the plugin failed and was not skipped. On an HTTP/2
-    /// downstream, also returns an error if the client closes the stream during the wait.
     pub(super) async fn wait_for_callouts<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
         position: usize,
         mut phase: PausedPhase<'_>,
     ) -> Result<CalloutWaitOutcome> {
+        // Stays set if this future is dropped during the wait, which
+        // `refuse_after_cancelled_wait` checks
         self.callouts.waiting_position = Some(position);
         let limit = self.pool_at(position).callout_conf.wait_limit;
+        // `Instant + Duration` panics on overflow
         let deadline = Instant::now() + limit.min(LONGEST_WAIT_LIMIT);
         let delivered = self
             .deliver_results(session, position, &mut phase, deadline)
@@ -141,18 +107,6 @@ impl WasmCtx {
         }
     }
 
-    /// Deliver callout results until the plugin continues, sends a response, has no callout
-    /// left, or `deadline` passes.
-    ///
-    /// Returns `None` if the deadline passed. The deadline is checked before each wait, because
-    /// the timer is never polled for a result that is ready immediately, such as that of a
-    /// callout over the in-flight limit. The task yields after each delivery for the same reason,
-    /// so a plugin that sends a new callout from every delivery cannot keep the thread to itself.
-    ///
-    /// # Errors
-    ///
-    /// Returns the failure's error if a delivery failed and the plugin was not skipped. On an
-    /// HTTP/2 downstream, also returns an error if the client closes the stream during the wait.
     async fn deliver_results<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -161,6 +115,8 @@ impl WasmCtx {
         deadline: Instant,
     ) -> Result<Option<CalloutWaitOutcome>> {
         loop {
+            // The timer is never polled for a result that is ready immediately, such as that of
+            // a callout over the in-flight limit, so the deadline is checked before each wait
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(None);
@@ -185,18 +141,12 @@ impl WasmCtx {
             if continued {
                 return Ok(Some(CalloutWaitOutcome::Continued));
             }
+            // Yield, so that a plugin that sends a new callout from every delivery cannot keep
+            // the thread to itself
             tokio::task::yield_now().await;
         }
     }
 
-    /// Wait for the next callout result for the plugin at `position`.
-    ///
-    /// Returns `None` if the plugin has no pending callout.
-    ///
-    /// # Errors
-    ///
-    /// On an HTTP/2 downstream, returns an error if the client closes the stream before a result
-    /// arrives.
     async fn next_result_or_downstream_close<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,

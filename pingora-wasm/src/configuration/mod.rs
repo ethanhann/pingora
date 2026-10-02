@@ -48,8 +48,8 @@ use std::sync::Arc;
 /// [WasmRuntime::new_with_services](crate::WasmRuntime::new_with_services) together with
 /// [plugins](Self::plugins), then build each chain with
 /// [WasmRuntime::chain](crate::WasmRuntime::chain) from the names
-/// [chain_plugins](Self::chain_plugins) returns. The
-/// [crate documentation](crate#configuration-from-a-file) has an example.
+/// [chain_plugins](Self::chain_plugins) returns. See `examples/wasm_proxy.yaml` for an
+/// example.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]

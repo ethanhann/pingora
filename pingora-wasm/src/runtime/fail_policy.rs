@@ -20,24 +20,52 @@ use std::fmt;
 /// What happens to a request when one of its plugins fails.
 ///
 /// Each plugin has its own policy, set in
-/// [WasmPluginConf::fail_policy](crate::WasmPluginConf::fail_policy), which describes both
-/// policies in full. A guest that can no longer be used is replaced under either policy.
+/// [WasmPluginConf::fail_policy](crate::WasmPluginConf::fail_policy). A plugin fails when it:
+///
+/// - traps or returns an error in a callback, including `proxy_on_http_call_response`
+/// - has no guest in any of its slots when the request starts
+/// - loses the guest that held the request's context, e.g. to a trap in another request
+/// - pauses on request headers, response headers, response trailers, or the last chunk of a
+///   body with no callout pending
+/// - waits for callouts longer than
+///   [callout_wait_limit](crate::WasmPluginConf::callout_wait_limit)
+///
+/// Some failures fail the request under both policies:
+///
+/// - A failure while a body the plugin changed can still have bytes to come. The rest of the
+///   body would go out without the plugin's changes.
+/// - More held body bytes than
+///   [request_body_limit](crate::WasmPluginConf::request_body_limit) or
+///   [response_body_limit](crate::WasmPluginConf::response_body_limit) allows. Otherwise a
+///   client could bypass the plugin by padding its request.
+/// - A response sent after the response header. It can no longer replace the response that
+///   has already started.
+/// - Any filter that runs after an earlier filter of the request was cancelled during a
+///   callout wait, since the plugins may have been left halfway through that filter.
+///
+/// A plugin that cannot start fails [WasmRuntime::new](crate::WasmRuntime::new) under both
+/// policies.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FailPolicy {
     /// The request fails.
+    ///
+    /// The filter returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED), and Pingora responds
+    /// with 503 or, once the response header has been sent, ends the response early.
     #[default]
     Closed,
     /// The failure is logged, the plugin is skipped for the rest of the request, and the request
-    /// continues without it.
+    /// continues with the next plugin.
+    ///
+    /// Use it for plugins a request can do without, such as one that collects statistics.
+    /// [WasmCtx::skipped_plugins](crate::WasmCtx::skipped_plugins) returns the plugins that
+    /// were skipped on a request.
     Open,
 }
 
 impl FailPolicy {
     /// Return the policy as a lowercase string, `closed` or `open`.
-    ///
-    /// `Display` writes the same string.
     pub fn as_str(&self) -> &'static str {
         match self {
             FailPolicy::Closed => "closed",

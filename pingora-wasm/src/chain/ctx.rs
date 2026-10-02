@@ -56,6 +56,11 @@ pub(super) enum ResponseProgress {
 /// Create it with [WasmChain::new_ctx] and keep it in your proxy's `CTX`. It holds a reference to
 /// its chain and runtime, so a request finishes on the runtime it started on.
 ///
+/// If any of the filters returns an `Err`, return it from your own filter so that Pingora fails
+/// the request. If [WasmCtx::plugin_responded] returns `true`, a plugin sent its own response
+/// and the error stops the request. Otherwise the request failed, most often because a plugin
+/// failed, see [FailPolicy](crate::FailPolicy).
+///
 /// Call [WasmCtx::logging] for every `WasmCtx` you create, so that each plugin sees the end of
 /// its request. If the request task ends before `logging`, dropping the `WasmCtx` ends each open
 /// context without `proxy_on_log`.
@@ -116,7 +121,7 @@ impl WasmCtx {
     /// Run `body` on the guest on behalf of `context`, one plugin's context for this request.
     ///
     /// Only callouts sent from `context` are accepted during the call. They are kept on the
-    /// request until the phase starts them, and are discarded by the next call if it does not.
+    /// request until the filter starts them, and are discarded by the next call if it does not.
     pub(crate) fn run_for_context<R>(
         &mut self,
         loaded: &mut Loaded,

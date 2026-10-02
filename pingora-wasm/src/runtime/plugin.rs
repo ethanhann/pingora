@@ -73,11 +73,8 @@ pub struct WasmPluginConf {
     ///
     /// When enabled, `proxy_on_request_body` is called once for each chunk of a request body. A
     /// guest runs one callback at a time, so a chunk has to wait while another request is running
-    /// a callback in the same guest. In the worst case the wait lasts as long as the CPU time
-    /// allowed by [limits](Self::limits). Only enable this for a plugin that reads request
-    /// bodies, and set [slots](Self::slots) to the thread count of the service.
-    ///
-    /// The phases each plugin runs on are logged when the runtime is built.
+    /// a callback in the same guest. Only enable this for a plugin that reads request bodies, and
+    /// set [slots](Self::slots) to the thread count of the service.
     pub request_body: bool,
     /// Whether to run the plugin on response bodies. Default `false`.
     ///
@@ -91,46 +88,36 @@ pub struct WasmPluginConf {
     /// Default 1 MiB.
     ///
     /// A request whose plugin holds more fails with
-    /// [ERR_REQUEST_BODY_TOO_LARGE](crate::ERR_REQUEST_BODY_TOO_LARGE). Must be greater than
-    /// zero.
+    /// [ERR_REQUEST_BODY_TOO_LARGE](crate::ERR_REQUEST_BODY_TOO_LARGE) under both fail policies.
+    /// Must be greater than zero.
     pub request_body_limit: usize,
     /// The maximum number of response body bytes the plugin may hold while it pauses the body.
     /// Default 1 MiB.
     ///
     /// A request whose plugin holds more fails with
-    /// [ERR_RESPONSE_BODY_TOO_LARGE](crate::ERR_RESPONSE_BODY_TOO_LARGE). Must be greater than
-    /// zero.
+    /// [ERR_RESPONSE_BODY_TOO_LARGE](crate::ERR_RESPONSE_BODY_TOO_LARGE) under both fail
+    /// policies. Must be greater than zero.
     pub response_body_limit: usize,
     /// The longest a single callout from the plugin may take. Default 10 seconds.
     ///
     /// A callout normally uses the timeout the plugin passes to `proxy_http_call`. If that
-    /// timeout is zero, which some hosts treat as no timeout, or longer than this limit, the
-    /// limit is used instead and a warning is logged the first time it happens. A request can
-    /// therefore stay open for up to this long for each callout its plugin waits for, and for up
-    /// to [callout_wait_limit](Self::callout_wait_limit) for the wait as a whole.
-    ///
-    /// If the plugin sends callouts from a body filter or from the response header filter, keep
-    /// this limit below the `read_timeout` of your upstream peers. Must be greater than zero and
-    /// less than [callout_wait_limit](Self::callout_wait_limit).
+    /// timeout is zero or longer than this limit, the limit is used instead and a warning is
+    /// logged the first time it happens. Must be greater than zero and less than
+    /// [callout_wait_limit](Self::callout_wait_limit).
     pub callout_timeout_limit: Duration,
     /// The longest a filter may wait for the plugin's callouts. Default 30 seconds.
     ///
     /// A callout wait begins when the plugin pauses a filter to wait for a callout, and ends
     /// when the plugin continues or sends a response. It covers every callout the plugin sends
-    /// in the meantime. Each callout is already bounded by
-    /// [callout_timeout_limit](Self::callout_timeout_limit), but a plugin may send a new callout
-    /// from each `proxy_on_http_call_response`, and without this limit it could keep a request
-    /// open indefinitely.
+    /// in the meantime, and the limit applies to each wait separately.
     ///
     /// When a wait reaches the limit, the filter stops waiting and treats this as a plugin
     /// failure, so [fail_policy](Self::fail_policy) decides whether the request fails or
-    /// continues without the plugin. Callouts still in flight run to completion and their results
-    /// are discarded.
+    /// continues without the plugin. A slow plugin with [FailPolicy::Open] makes each request
+    /// wait for the whole limit before it is skipped, so set a low limit for such a plugin.
     ///
-    /// The limit applies to each wait separately. A body filter runs once per chunk, so a plugin
-    /// that waits on every chunk gets the full limit each time. If the plugin sends callouts
-    /// from a body filter or from the response header filter, keep this limit below the
-    /// `read_timeout` of your upstream peers. Must be greater than
+    /// If the plugin sends callouts from a body filter or from the response header filter, keep
+    /// this limit below the `read_timeout` of your upstream peers. Must be greater than
     /// [callout_timeout_limit](Self::callout_timeout_limit).
     ///
     /// A timeout of your own around a filter cannot replace this limit. Once the future of a
@@ -145,67 +132,11 @@ pub struct WasmPluginConf {
     pub callout_response_limit: usize,
     /// What happens to a request when the plugin fails. Default [FailPolicy::Closed].
     ///
-    /// With [FailPolicy::Closed], a plugin failure fails the request. The filter returns
-    /// [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED), and Pingora responds with 503 or, once the
-    /// response header has been sent, ends the response early. The exception is
-    /// [WasmCtx::response_trailer_filter](crate::WasmCtx::response_trailer_filter). Pingora only
-    /// logs an error from `response_trailer_filter` and still sends the trailers. If a plugin
-    /// was holding body bytes, the filter logs the failure and returns those bytes in place of
-    /// the error.
-    ///
-    /// With [FailPolicy::Open], the failure is logged, the plugin is skipped, and the request
-    /// continues with the next plugin. No later header, body, or trailer filter of that request
-    /// runs the skipped plugin again. Per plugin, one skip every 10 seconds is logged as a
-    /// warning, and the rest at debug level. A plugin is skipped when it:
-    ///
-    /// - traps or returns an error in a callback, including `proxy_on_http_call_response`
-    /// - has no guest in any of its slots when the request starts
-    /// - loses the guest that held the request's context, e.g. to a trap in another request
-    /// - pauses on request headers, response headers, response trailers, or the last chunk of a
-    ///   body with no callout pending
-    /// - waits for callouts longer than [callout_wait_limit](Self::callout_wait_limit)
-    ///
-    /// `Open` on a plugin that authorizes requests therefore lets a request through each time
+    /// [FailPolicy::Open] on a plugin that authorizes requests lets a request through each time
     /// the plugin crashes, hangs, or is slow.
     /// [WasmCtx::skipped_plugins](crate::WasmCtx::skipped_plugins) returns the plugins skipped
     /// on a request, so your proxy can enforce a rule of its own, e.g. deny the request, add a
     /// header, or tag its access log.
-    ///
-    /// Some failures fail the request under both policies:
-    ///
-    /// - A failure while a body the plugin changed can still have bytes to come. A plugin
-    ///   changes a body when it writes to the body bytes, or when one of its writes changes the
-    ///   value of the `content-length` or `transfer-encoding` header of that message. A write
-    ///   that leaves the header as it was does not count. A body only counts if the plugin runs
-    ///   on it, i.e. [request_body](Self::request_body) or
-    ///   [response_body](Self::response_body) is enabled and the plugin exports the callback. A
-    ///   request body counts until its last chunk has run through the plugins. A response body
-    ///   counts until the response has ended, which it has if it has no body, once its last
-    ///   body chunk has run through the plugins, or once its trailers have arrived. Neither
-    ///   counts once a plugin has sent its own response, since no body is proxied after that.
-    ///   Until then, the rest of the body would go out without the plugin's changes, so the
-    ///   upstream or the downstream would get a complete message with a mixed body.
-    /// - More held body bytes than [request_body_limit](Self::request_body_limit) or
-    ///   [response_body_limit](Self::response_body_limit) allows. Otherwise a client could
-    ///   bypass the plugin by padding its request.
-    /// - A response sent after the response header. It can no longer replace the response that
-    ///   has already started.
-    /// - Any filter that runs after an earlier filter of the request was cancelled during a
-    ///   callout wait, since the plugins may have been left halfway through that filter.
-    ///
-    /// A skipped plugin keeps what it did before it failed, e.g. a header it added or a property
-    /// it set. Body bytes it was holding are released as it left them. They go to the next
-    /// plugin if it failed in the filter of that body, and otherwise ahead of the next chunk of
-    /// that body. The response trailer filter also releases held response bytes. If the body has
-    /// no further chunk and no trailers, the bytes are not sent, and
-    /// [WasmCtx::logging](crate::WasmCtx::logging) logs how many were left.
-    ///
-    /// A response or callout from the failing callback is dropped, and the results of its
-    /// pending callouts are discarded. If its guest is still usable, `logging` runs its
-    /// `proxy_on_log` as usual, so a statistics plugin still counts the request.
-    ///
-    /// A plugin that cannot start fails [WasmRuntime::new](crate::WasmRuntime::new) under both
-    /// policies.
     pub fail_policy: FailPolicy,
 }
 
@@ -237,11 +168,7 @@ impl fmt::Debug for WasmPluginConf {
 }
 
 impl WasmPluginConf {
-    /// Create the configuration for the plugin at `path`.
-    ///
-    /// The plugin starts out with one slot, its name as the VM id, an empty root id, no
-    /// configuration, the log level `Info`, and the default limits. It runs on request and
-    /// response headers only.
+    /// Create the configuration for the plugin at `path`, with the default of every other field.
     pub fn new(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
         let name = name.into();
         WasmPluginConf {
