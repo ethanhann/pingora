@@ -270,6 +270,7 @@ impl WasmPluginConf {
 
     pub(crate) fn check(&self) -> Result<()> {
         let name = &self.name;
+        let (wait, timeout) = (self.callout_wait_limit, self.callout_timeout_limit);
         let mistake = if self.slots == 0 {
             "slots must be at least 1"
         } else if self.limits.fuel().is_some() {
@@ -278,10 +279,12 @@ impl WasmPluginConf {
             "request_body_limit must be greater than zero"
         } else if self.response_body_limit == 0 {
             "response_body_limit must be greater than zero"
-        } else if self.callout_timeout_limit.is_zero() {
+        } else if timeout.is_zero() {
             "callout_timeout_limit must be greater than zero"
-        } else if self.callout_wait_limit < self.callout_timeout_limit {
-            "callout_wait_limit must not be less than callout_timeout_limit"
+        } else if wait <= timeout {
+            return Err(invalid_conf(format!(
+                "wasm plugin {name}: callout_wait_limit {wait:?} must be greater than callout_timeout_limit {timeout:?}"
+            )));
         } else if self.callout_response_limit == 0 {
             "callout_response_limit must be greater than zero"
         } else {
@@ -372,6 +375,8 @@ mod tests {
         callout.callout_response_limit = 0;
         let mut wait = WasmPluginConf::new("wait", "wait.wasm");
         wait.callout_wait_limit = Duration::from_secs(9);
+        let mut equal = WasmPluginConf::new("equal", "equal.wasm");
+        equal.callout_wait_limit = equal.callout_timeout_limit;
 
         let errors = [
             zero.check(),
@@ -381,6 +386,7 @@ mod tests {
             timeout.check(),
             callout.check(),
             wait.check(),
+            equal.check(),
         ]
         .map(|r| r.unwrap_err());
 
@@ -393,8 +399,10 @@ mod tests {
         assert!(errors[3].contains("response: response_body_limit must be greater than zero"));
         assert!(errors[4].contains("timeout: callout_timeout_limit must be greater than zero"));
         assert!(errors[5].contains("callout: callout_response_limit must be greater than zero"));
-        let wait = "wait: callout_wait_limit must not be less than callout_timeout_limit";
-        assert!(errors[6].contains(wait));
+        let wait = "wait: callout_wait_limit 9s must be greater than callout_timeout_limit 10s";
+        assert!(errors[6].contains(wait), "{}", errors[6]);
+        let equal = "equal: callout_wait_limit 10s must be greater than callout_timeout_limit 10s";
+        assert!(errors[7].contains(equal), "{}", errors[7]);
     }
 
     #[test]
