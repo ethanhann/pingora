@@ -27,8 +27,9 @@ impl WasmCtx {
     ///
     /// Call this from your `request_body_filter` and pass its arguments through. Only plugins
     /// that have [request_body](crate::WasmPluginConf::request_body) enabled and export the
-    /// callback are run. By default no plugin runs on request bodies and this filter does
-    /// nothing.
+    /// callback are run. A plugin may pause on a chunk to wait for a callout, in which case this
+    /// filter waits with it, up to its
+    /// [callout_wait_limit](crate::WasmPluginConf::callout_wait_limit).
     ///
     /// A plugin may send its own response, e.g. to deny a request after inspecting the body.
     /// This filter writes it to the downstream and then returns an error with the response
