@@ -20,7 +20,7 @@ mod prometheus_recorders;
 mod prometheus_sink;
 
 pub(crate) use log_sink::LogCrateSink;
-pub use plugin_failure::{FailureOutcome, PluginFailure, PluginFailureReport};
+pub use plugin_failure::{PluginFailure, PluginFailureOutcome, PluginFailureReport};
 pub use prometheus_sink::PrometheusMetricSink;
 
 /// A sink for the metrics plugins define, and for reports of failed callouts, plugin failures,
@@ -59,7 +59,7 @@ pub trait WasmMetricSink: Send + Sync {
     /// has the outcome, either a failed request or a skipped plugin. Only the first failure of a
     /// plugin on a request is reported. By default it does nothing.
     ///
-    /// The outcome is [FailureOutcome::Failed] in three cases where no request fails. One is a
+    /// The outcome is [PluginFailureOutcome::Failed] in three cases where no request fails. One is a
     /// failure in [WasmCtx::response_trailer_filter](crate::WasmCtx::response_trailer_filter)
     /// that does not skip the plugin, because Pingora still sends the trailers. Another is a failure in [WasmCtx::logging](crate::WasmCtx::logging),
     /// or in the end-of-request callbacks that run when a `WasmCtx` is dropped without it. The

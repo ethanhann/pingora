@@ -76,7 +76,7 @@ impl FilterFailure {
     ///
     /// `detail` says where the plugin paused and is used as the message.
     pub(in crate::chain) fn paused(callback: Callback, detail: &str) -> Self {
-        Self::new(PluginFailure::Paused, Some(callback), detail)
+        Self::new(PluginFailure::PausedWithoutCallout, Some(callback), detail)
     }
 
     /// Build the failure for a callout wait that started in `callback` and ran past `limit`.

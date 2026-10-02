@@ -41,7 +41,7 @@ pub enum PluginFailure {
     GuestLost,
     /// The plugin paused on headers, on trailers, or on the last chunk of a body with no callout
     /// pending.
-    Paused,
+    PausedWithoutCallout,
     /// A callout wait lasted longer than
     /// [callout_wait_limit](crate::WasmPluginConf::callout_wait_limit).
     WaitLimit,
@@ -49,7 +49,7 @@ pub enum PluginFailure {
     ///
     /// Only reported for a plugin with [FailPolicy::Open](crate::FailPolicy::Open), where it is
     /// the reason the request failed and the plugin was not skipped, so the outcome is always
-    /// [FailureOutcome::Failed]. [fail_policy](crate::WasmPluginConf::fail_policy) describes
+    /// [PluginFailureOutcome::Failed]. [fail_policy](crate::WasmPluginConf::fail_policy) describes
     /// when a changed body has this effect. For a plugin with `Closed`, the report has the
     /// failure itself, e.g. [GuestError](Self::GuestError).
     BodyChanged,
@@ -70,7 +70,7 @@ impl PluginFailure {
             PluginFailure::GuestError => "guest_error",
             PluginFailure::Unavailable => "unavailable",
             PluginFailure::GuestLost => "guest_lost",
-            PluginFailure::Paused => "paused",
+            PluginFailure::PausedWithoutCallout => "paused_without_callout",
             PluginFailure::WaitLimit => "wait_limit",
             PluginFailure::BodyChanged => "body_changed",
             PluginFailure::BodyLimit => "body_limit",
@@ -89,7 +89,7 @@ impl fmt::Display for PluginFailure {
 /// What a plugin failure did to its request.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FailureOutcome {
+pub enum PluginFailureOutcome {
     /// The request failed.
     ///
     /// Also the outcome of a failure outside of a request, e.g. in `proxy_on_tick`, of a
@@ -101,19 +101,19 @@ pub enum FailureOutcome {
     Skipped,
 }
 
-impl FailureOutcome {
+impl PluginFailureOutcome {
     /// Return the outcome as a lowercase string, `failed` or `skipped`.
     ///
     /// `Display` writes the same string.
     pub fn as_str(&self) -> &'static str {
         match self {
-            FailureOutcome::Failed => "failed",
-            FailureOutcome::Skipped => "skipped",
+            PluginFailureOutcome::Failed => "failed",
+            PluginFailureOutcome::Skipped => "skipped",
         }
     }
 }
 
-impl fmt::Display for FailureOutcome {
+impl fmt::Display for PluginFailureOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -130,7 +130,7 @@ pub struct PluginFailureReport<'a> {
     /// The kind of failure.
     pub failure: PluginFailure,
     /// What the failure did to the request.
-    pub outcome: FailureOutcome,
+    pub outcome: PluginFailureOutcome,
     /// The ABI name of the callback the failure belongs to, e.g. `proxy_on_request_headers`.
     ///
     /// For a callback that trapped or returned an error, this is that callback. For a pause, a
@@ -146,7 +146,11 @@ impl<'a> PluginFailureReport<'a> {
     /// The struct is non-exhaustive, so use this to build a report in your own code, e.g. to test
     /// your [WasmMetricSink](crate::WasmMetricSink). Set [callback](Self::callback) on the result
     /// if you need one.
-    pub fn new(plugin_name: &'a str, failure: PluginFailure, outcome: FailureOutcome) -> Self {
+    pub fn new(
+        plugin_name: &'a str,
+        failure: PluginFailure,
+        outcome: PluginFailureOutcome,
+    ) -> Self {
         PluginFailureReport {
             plugin_name,
             failure,

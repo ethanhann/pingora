@@ -15,7 +15,7 @@
 use super::body::BodyDirection;
 use super::slot::LockedSlot;
 use super::WasmCtx;
-use crate::observability::{FailureOutcome, PluginFailure};
+use crate::observability::{PluginFailure, PluginFailureOutcome};
 use crate::properties::built_in::LoggingFacts;
 use log::{debug, error, warn};
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
@@ -129,7 +129,7 @@ impl WasmCtx {
             Err((callback, e)) => {
                 error!("wasm plugin {}: {callback} failed: {e}", locked.pool.name);
                 locked.replace_guest_if_unusable(&e);
-                let (failure, outcome) = (PluginFailure::GuestError, FailureOutcome::Failed);
+                let (failure, outcome) = (PluginFailure::GuestError, PluginFailureOutcome::Failed);
                 self.report_failure(position, failure, outcome, Some(callback));
             }
         }

@@ -27,7 +27,7 @@ use crate::properties::WasmProperties;
 use crate::root_callbacks::RootCallbackPluginState;
 use crate::root_callbacks::RootCallbackThread;
 use crate::{invalid_conf, ERR_INVALID_CONF};
-use pingora_error::{OrErr, Result};
+use pingora_error::{ErrorType, OrErr, Result};
 use proxy_wasm_host::abi::v0_2_1::{
     GuestSpec, Host, InMemoryStoreLimits, LogSink, QueueEnqueued, SharedServices,
 };
@@ -96,7 +96,7 @@ pub(super) fn build_pool(
     plugin: &WasmPluginConf,
     inputs: &PoolInputs<'_>,
 ) -> Result<GuestPool> {
-    let bytes = std::fs::read(&plugin.path).or_err_with(ERR_INVALID_CONF, || {
+    let bytes = std::fs::read(&plugin.path).or_err_with(ErrorType::ReadError, || {
         format!(
             "failed to read wasm plugin {} from {}",
             plugin.name,

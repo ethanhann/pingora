@@ -85,7 +85,7 @@ impl WasmRuntime {
     ///
     /// Returns [ERR_INVALID_CONF](crate::ERR_INVALID_CONF) if `plugins` is empty or two plugins
     /// have the same name. The same error, with the plugin's name in its message, is returned
-    /// if a plugin's file cannot be read or is not a supported Proxy-Wasm module, if the plugin
+    /// if a plugin's file is not a supported Proxy-Wasm module, if the plugin
     /// traps or otherwise fails during startup, if its `proxy_on_vm_start` or
     /// `proxy_on_configure` returns `false`, or if its configuration is invalid. A configuration
     /// is invalid when [slots](WasmPluginConf::slots) is zero, when
@@ -94,7 +94,8 @@ impl WasmRuntime {
     /// than [callout_timeout_limit](WasmPluginConf::callout_timeout_limit). A plugin's
     /// [fail_policy](WasmPluginConf::fail_policy) has no effect on these errors.
     ///
-    /// Returns `InternalError` if the wasm engine cannot be built.
+    /// Returns `ReadError` if a plugin's file cannot be read, and `InternalError` if the wasm
+    /// engine cannot be built.
     pub fn new(plugins: Vec<WasmPluginConf>) -> Result<Self> {
         Self::new_with_services(plugins, WasmServices::default())
     }
@@ -347,10 +348,6 @@ mod tests {
             ),
             (vec![fuel], "fuel: fuel limits are not supported"),
             (
-                vec![plugin("gone", "/no/such/file.wasm".into(), 1)],
-                "failed to read wasm plugin gone",
-            ),
-            (
                 vec![plugin("text", text, 1)],
                 "failed to compile wasm plugin text",
             ),
@@ -423,6 +420,17 @@ mod tests {
             let err = err.to_string();
             assert!(err.contains(message), "{message} not found in {err}");
         }
+    }
+
+    #[test]
+    fn new_returns_read_error_for_unreadable_plugin_file() {
+        let plugins = vec![plugin("gone", "/no/such/file.wasm".into(), 1)];
+
+        let err = WasmRuntime::new(plugins).err().unwrap();
+
+        assert_eq!(err.etype(), &ErrorType::ReadError);
+        let message = "failed to read wasm plugin gone from /no/such/file.wasm";
+        assert!(err.to_string().contains(message), "{err}");
     }
 
     #[test]

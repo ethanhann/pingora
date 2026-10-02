@@ -18,7 +18,7 @@
 
 use super::callback_loop::RootCallbackLoop;
 use super::root_callouts::FinishedCallout;
-use crate::observability::{FailureOutcome, PluginFailure, PluginFailureReport};
+use crate::observability::{PluginFailure, PluginFailureOutcome, PluginFailureReport};
 use crate::root_callbacks::RootStream;
 use crate::runtime::pool::events::GuestAddress;
 use crate::runtime::pool::SlotLockAttempt;
@@ -226,7 +226,7 @@ impl RootCallbackLoop {
                 runtime.metric_sink.plugin_failed(&PluginFailureReport {
                     plugin_name: &pool.name,
                     failure: PluginFailure::GuestError,
-                    outcome: FailureOutcome::Failed,
+                    outcome: PluginFailureOutcome::Failed,
                     callback: Some(callback_name),
                 });
                 GuestCallOutcome::Failed

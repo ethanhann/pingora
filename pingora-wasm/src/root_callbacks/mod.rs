@@ -159,7 +159,7 @@ mod tests {
         crate_log_lines_with, plugin, record_crate_logs, session, wat_guest, RecordedFailures,
         RecordedGuestLogs, Wat, GET,
     };
-    use crate::{FailureOutcome, PluginFailure, WasmRuntime, WasmServices};
+    use crate::{PluginFailure, PluginFailureOutcome, WasmRuntime, WasmServices};
     use parking_lot::Mutex;
     use proxy_wasm_host::abi::v0_2_1::types::LogLevel;
     use proxy_wasm_host::abi::v0_2_1::CalloutId;
@@ -282,7 +282,7 @@ mod tests {
         assert!(wait_until(|| !crate_log_lines_with(replaced).is_empty()));
         let failed = "wasm plugin trap-in-tick: proxy_on_tick failed";
         assert!(wait_until(|| crate_log_lines_with(failed).len() >= 2));
-        let (failure, outcome) = (PluginFailure::GuestError, FailureOutcome::Failed);
+        let (failure, outcome) = (PluginFailure::GuestError, PluginFailureOutcome::Failed);
         let tick = Some("proxy_on_tick".to_string());
         let want = ("trap-in-tick".to_string(), failure, outcome, tick);
         assert_eq!(reports.failures().first(), Some(&want));

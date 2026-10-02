@@ -22,7 +22,7 @@ use crate::chain::body::BodyDirection;
 use crate::chain::ctx::PluginRecord;
 use crate::chain::slot::LockedSlot;
 use crate::chain::WasmCtx;
-use crate::observability::{FailureOutcome, PluginFailure, PluginFailureReport};
+use crate::observability::{PluginFailure, PluginFailureOutcome, PluginFailureReport};
 use crate::runtime::pool::GuestPool;
 use crate::runtime::FailPolicy;
 use log::{debug, warn};
@@ -128,7 +128,7 @@ impl WasmCtx {
         self.report_failure(
             position,
             failure.kind,
-            FailureOutcome::Skipped,
+            PluginFailureOutcome::Skipped,
             failure.callback,
         );
         self.log_skipped_plugin(position, &failure);
@@ -243,7 +243,7 @@ impl WasmCtx {
         self.report_failure(
             position,
             failure.kind,
-            FailureOutcome::Failed,
+            PluginFailureOutcome::Failed,
             failure.callback,
         );
         failure.into_error(&self.pool_at(position).name)
@@ -256,7 +256,7 @@ impl WasmCtx {
         &mut self,
         position: usize,
         failure: PluginFailure,
-        outcome: FailureOutcome,
+        outcome: PluginFailureOutcome,
         callback: Option<Callback>,
     ) {
         if self.failures.reported.contains(&position) {
@@ -430,7 +430,7 @@ mod tests {
 
     fn expected_report(
         failure: PluginFailure,
-        outcome: FailureOutcome,
+        outcome: PluginFailureOutcome,
         callback: Option<Callback>,
     ) -> RecordedFailure {
         let callback = callback.map(|callback| callback.export_name().to_string());
@@ -446,7 +446,7 @@ mod tests {
         let cases = EVERY_PHASE.into_iter().flat_map(|phase| {
             [
                 (phase, TRAP, PluginFailure::GuestError),
-                (phase, PAUSE, PluginFailure::Paused),
+                (phase, PAUSE, PluginFailure::PausedWithoutCallout),
             ]
         });
 
@@ -469,7 +469,11 @@ mod tests {
                 next_plugin_ran(phase, &session, &inputs),
                 "{phase:?} {callback}"
             );
-            let want = expected_report(failure, FailureOutcome::Skipped, Some(callback_of(phase)));
+            let want = expected_report(
+                failure,
+                PluginFailureOutcome::Skipped,
+                Some(callback_of(phase)),
+            );
             assert_eq!(reports.failures(), [want]);
         }
     }
@@ -490,7 +494,11 @@ mod tests {
             assert!(result.is_ok(), "{phase:?}: {result:?}");
             assert_eq!(skipped_plugin_names(&ctx), ["optional"], "{phase:?}");
             assert!(next_plugin_ran(phase, &session, &inputs), "{phase:?}");
-            let want = expected_report(PluginFailure::GuestLost, FailureOutcome::Skipped, None);
+            let want = expected_report(
+                PluginFailure::GuestLost,
+                PluginFailureOutcome::Skipped,
+                None,
+            );
             assert_eq!(reports.failures(), [want]);
         }
     }
@@ -498,8 +506,8 @@ mod tests {
     #[tokio::test]
     async fn plugin_with_no_guest_fails_or_is_skipped_by_policy() {
         let cases = [
-            (FailPolicy::Closed, FailureOutcome::Failed),
-            (FailPolicy::Open, FailureOutcome::Skipped),
+            (FailPolicy::Closed, PluginFailureOutcome::Failed),
+            (FailPolicy::Open, PluginFailureOutcome::Skipped),
         ];
 
         for (policy, outcome) in cases {
@@ -541,7 +549,7 @@ mod tests {
                 (
                     phase,
                     STAY_PAUSED,
-                    PluginFailure::Paused,
+                    PluginFailure::PausedWithoutCallout,
                     callback_of(phase),
                 ),
             ]
@@ -564,7 +572,7 @@ mod tests {
                 "{phase:?} {delivery}"
             );
             assert!(!ctx.waits_for_callout(position_of_optional(phase)));
-            let want = expected_report(failure, FailureOutcome::Skipped, Some(callback));
+            let want = expected_report(failure, PluginFailureOutcome::Skipped, Some(callback));
             assert_eq!(reports.failures(), [want]);
         }
     }
@@ -592,7 +600,11 @@ mod tests {
             assert!(result.is_ok(), "{phase:?}: {result:?}");
             assert_eq!(skipped_plugin_names(&ctx), ["optional"], "{phase:?}");
             assert!(next_plugin_ran(phase, &session, &inputs), "{phase:?}");
-            let want = expected_report(PluginFailure::GuestLost, FailureOutcome::Skipped, None);
+            let want = expected_report(
+                PluginFailure::GuestLost,
+                PluginFailureOutcome::Skipped,
+                None,
+            );
             assert_eq!(reports.failures(), [want]);
         }
     }
@@ -621,8 +633,8 @@ mod tests {
             assert_eq!(next_plugin_ran(phase, &session, &inputs), open, "{phase:?}");
             assert!(!ctx.waits_for_callout(position_of_optional(phase)));
             let outcome = match policy {
-                FailPolicy::Open => FailureOutcome::Skipped,
-                _ => FailureOutcome::Failed,
+                FailPolicy::Open => PluginFailureOutcome::Skipped,
+                _ => PluginFailureOutcome::Failed,
             };
             let callback = Some(callback_of(phase));
             let want = expected_report(PluginFailure::WaitLimit, outcome, callback);
@@ -662,7 +674,11 @@ mod tests {
 
         assert_eq!(result.unwrap_err().etype(), &ERR_PLUGIN_FAILED);
         let callback = Some(Callback::RequestHeaders);
-        let want = expected_report(PluginFailure::WaitLimit, FailureOutcome::Failed, callback);
+        let want = expected_report(
+            PluginFailure::WaitLimit,
+            PluginFailureOutcome::Failed,
+            callback,
+        );
         assert_eq!(reports.failures(), [want]);
     }
 
@@ -717,8 +733,11 @@ mod tests {
             assert!(err.to_string().contains(&message), "{err}");
             assert!(skipped_plugin_names(&ctx).is_empty());
             let callback = Some(direction.callback());
-            let want =
-                expected_report(PluginFailure::BodyChanged, FailureOutcome::Failed, callback);
+            let want = expected_report(
+                PluginFailure::BodyChanged,
+                PluginFailureOutcome::Failed,
+                callback,
+            );
             assert_eq!(reports.failures(), [want]);
         }
     }
@@ -748,7 +767,11 @@ mod tests {
         );
         assert!(skipped_plugin_names(&ctx).is_empty());
         let callback = Some(Callback::ResponseHeaders);
-        let want = expected_report(PluginFailure::BodyChanged, FailureOutcome::Failed, callback);
+        let want = expected_report(
+            PluginFailure::BodyChanged,
+            PluginFailureOutcome::Failed,
+            callback,
+        );
         assert_eq!(reports.failures(), [want]);
     }
 
@@ -911,7 +934,7 @@ mod tests {
         let callback = Some(Callback::ResponseBody);
         let want = expected_report(
             PluginFailure::LateResponse,
-            FailureOutcome::Failed,
+            PluginFailureOutcome::Failed,
             callback,
         );
         assert_eq!(reports.failures(), [want]);
@@ -936,7 +959,11 @@ mod tests {
 
         assert_eq!(result.unwrap_err().etype(), &ERR_PLUGIN_FAILED);
         assert!(skipped_plugin_names(&ctx).is_empty());
-        let want = expected_report(PluginFailure::CancelledWait, FailureOutcome::Failed, None);
+        let want = expected_report(
+            PluginFailure::CancelledWait,
+            PluginFailureOutcome::Failed,
+            None,
+        );
         assert_eq!(reports.failures(), [want]);
     }
 
@@ -1173,7 +1200,7 @@ mod tests {
             assert_eq!(trailer_result.is_err(), response_trailers.is_some());
             let want = expected_report(
                 PluginFailure::GuestError,
-                FailureOutcome::Failed,
+                PluginFailureOutcome::Failed,
                 Some(callback),
             );
             assert_eq!(reports.failures(), [want]);

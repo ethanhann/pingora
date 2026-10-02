@@ -14,12 +14,12 @@
 
 //! Recording metric sink for tests
 
-use crate::{FailureOutcome, PluginFailure, PluginFailureReport, WasmMetricSink};
+use crate::{PluginFailure, PluginFailureOutcome, PluginFailureReport, WasmMetricSink};
 use parking_lot::Mutex;
 
 /// A failure report as [RecordedFailures] stores it, made up of the plugin name, the failure, the
 /// outcome, and the callback.
-pub(crate) type RecordedFailure = (String, PluginFailure, FailureOutcome, Option<String>);
+pub(crate) type RecordedFailure = (String, PluginFailure, PluginFailureOutcome, Option<String>);
 
 /// A metric sink that records every plugin failure and every replaced guest.
 #[derive(Default)]

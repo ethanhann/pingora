@@ -293,7 +293,7 @@ fn prometheus_name(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FailureOutcome, PluginFailure};
+    use crate::{PluginFailure, PluginFailureOutcome};
     use prometheus::{Encoder, TextEncoder};
 
     fn metric(vm_id: &str, name: &str, kind: WasmMetricKind) -> WasmMetric {
@@ -374,7 +374,7 @@ mod tests {
         let report = PluginFailureReport {
             plugin_name: "stats",
             failure: PluginFailure::WaitLimit,
-            outcome: FailureOutcome::Skipped,
+            outcome: PluginFailureOutcome::Skipped,
             callback: Some("proxy_on_request_headers"),
         };
 
