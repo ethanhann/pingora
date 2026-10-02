@@ -75,23 +75,28 @@
 //! this crate, such as `openssl` or `rustls`. Without one, a callout to a TLS peer fails at its
 //! timeout.
 //!
-//! While a plugin waits for a callout, the phase that ran the plugin waits with it, and your
-//! filter returns once the plugin continues or sends a response. A callout can take as long as
-//! the timeout that the plugin passes, up to [WasmPluginConf::callout_timeout_limit]. If an
-//! HTTP/2 client resets its stream during the wait, the phase returns an error at once. Pingora
-//! cannot see that an HTTP/1 client disconnected until it writes to it, so the phase waits for
-//! the callout to end, and the write of the response then fails.
+//! While a plugin waits for a callout, the filter that ran the plugin waits with it, and returns
+//! once the plugin continues or sends a response. Each callout can take as long as the timeout
+//! the plugin passes, up to [WasmPluginConf::callout_timeout_limit]. A plugin may send another
+//! callout when a response arrives, so the wait as a whole has a limit of its own,
+//! [WasmPluginConf::callout_wait_limit]. A wait that reaches this limit counts as a plugin
+//! failure. If an HTTP/2 client resets its stream during the wait, the filter returns an error
+//! at once. Pingora cannot see that an HTTP/1 client disconnected until it writes to it, so the
+//! filter keeps waiting, and the write of the response then fails.
 //!
 //! [WasmCtx::request_body_filter], [WasmCtx::response_filter], and
 //! [WasmCtx::response_body_filter] run while Pingora reads from the upstream. Pingora fails the
 //! request when the upstream is silent for the `read_timeout` of its peer. For a plugin that
-//! sends callouts from these phases, keep [WasmPluginConf::callout_timeout_limit] below that
+//! sends callouts from these filters, keep [WasmPluginConf::callout_wait_limit] below that
 //! timeout.
 //!
-//! If the future of a phase is dropped while a plugin waits for a callout, the request cannot
-//! continue. Pingora drops the future of a body filter when the upstream fails, and you may drop
-//! one with a timeout of your own. Every later phase of that request except [WasmCtx::logging]
-//! then returns an [ERR_PLUGIN_FAILED] error, so end the request.
+//! If the future of a filter is dropped while a plugin waits for a callout, the request cannot
+//! continue. Pingora drops the future of a body filter when the upstream fails, and a timeout of
+//! your own around a filter drops it as well. Every later header or trailer filter of that request,
+//! and every later body filter that has a plugin to run, then returns an [ERR_PLUGIN_FAILED]
+//! error under both fail policies, so end the request. [WasmCtx::logging] still runs. A timeout of your own can therefore only fail the
+//! request. To let a request continue without a slow plugin, set
+//! [WasmPluginConf::callout_wait_limit] and [FailPolicy::Open] on that plugin instead.
 //!
 //! A plugin can also send a callout and continue, for example to report a request to an audit
 //! service. The callout is sent, but the plugin does not receive its response. It receives a
@@ -150,9 +155,15 @@
 //! # }
 //! ```
 //!
-//! The sink also counts the callouts that fail, by plugin and by reason, in
-//! `wasm_callout_failures_total`. A registry accepts each name once, so when you reload plugins,
-//! pass the same sink to the new runtime.
+//! The sink also publishes three counters of its own:
+//!
+//! - `wasm_callout_failures_total` counts failed callouts, by plugin and by reason
+//! - `wasm_plugin_failures_total` counts plugin failures, by plugin, by kind of failure, and by
+//!   whether the request failed or the plugin was skipped
+//! - `wasm_guests_replaced_total` counts the guests replaced after a failure, by plugin
+//!
+//! A registry accepts each name once, so when you reload plugins, pass the same sink to the new
+//! runtime.
 //!
 //! # Properties
 //!
@@ -171,9 +182,11 @@
 //!
 //! For facts that do not change, such as the name of the node, use
 //! [WasmServices::fixed_properties]. A plugin cannot change a property that your proxy set on
-//! the request or one that the runtime provides, and it can override a fixed property for its
-//! own request. Ticks and the other callbacks that run with no request read only the fixed
-//! properties.
+//! the request, one that the runtime provides, or a fixed property. During a request, a
+//! `proxy_set_property` call on such a path still succeeds, but the plugin reads the same value
+//! as before, and what it wrote is only returned by [WasmCtx::guest_property]. Ticks and the
+//! other callbacks that run outside of a request read only the fixed properties, and
+//! `proxy_set_property` fails in them for every path.
 //!
 //! The runtime provides these properties, where an integer is 8 little-endian bytes and a bool is
 //! one byte:
@@ -192,20 +205,124 @@
 //! so `request.total_size`, `response.total_size`, and `connection.requested_server_name` are
 //! not provided.
 //!
+//! # Configuration from a file
+//!
+//! [WasmConf] and the types inside it implement serde's `Deserialize`, so you can keep your
+//! plugins and chains in a configuration file. This crate does not read the file for you. Add a
+//! [WasmConf] field to your own configuration struct, or parse one from the top level of a file.
+//! The format has to be self-describing, such as YAML, JSON, or TOML. At its top level a
+//! `WasmConf` ignores the keys it does not know, as Pingora's `ServerConf` does, so one file can
+//! hold the settings for Pingora, your proxy, and your plugins:
+//!
+//! ```yaml
+//! version: 1
+//! threads: 4
+//!
+//! plugins:
+//!   - name: auth
+//!     path: /etc/proxy/plugins/auth.wasm
+//!     configuration: '{"mode": "strict"}'
+//!   - name: stats
+//!     path: /etc/proxy/plugins/stats.wasm
+//!     fail_policy: open
+//!
+//! chains:
+//!   default: [auth, stats]
+//!
+//! static_callout_upstreams:
+//!   authz:
+//!     address: 10.0.0.5:8181
+//! ```
+//!
+//! [WasmConf::services] returns the [WasmServices] the file describes. Set on it whatever a file
+//! cannot hold, such as a metric sink, then build the runtime and its chains:
+//!
+//! ```no_run
+//! use pingora_wasm::{PrometheusMetricSink, WasmConf, WasmRuntime};
+//! use std::sync::Arc;
+//!
+//! # fn main() -> pingora_core::Result<()> {
+//! let yaml = std::fs::read_to_string("proxy.yaml").expect("a readable configuration file");
+//! let conf: WasmConf = serde_yaml::from_str(&yaml).expect("a valid configuration");
+//! let mut services = conf.services();
+//! let registry = pingora_wasm::prometheus::default_registry().clone();
+//! let sink = PrometheusMetricSink::new(registry).expect("a registry with no wasm metrics");
+//! services.metric_sink = Arc::new(sink);
+//! let runtime = WasmRuntime::new_with_services(conf.plugins.clone(), services)?;
+//! let chain = runtime.chain(&conf.chain_plugins("default")?)?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! A plugin entry needs a `name` and a `path`, and every other key defaults to what
+//! [WasmPluginConf::new] sets. [WasmConf::plugins] describes the keys.
+//!
+//! A misspelled key inside a plugin entry, a missing `name` or `path`, an unknown `log_level`,
+//! a hostname as the address of a callout upstream, or a fixed property that is not a string is
+//! an error from your parser when the file is read. A mistake the parser cannot see, such as a
+//! limit of zero or a chain that is not in the file, is returned as an [ERR_INVALID_CONF] error
+//! by [WasmRuntime::new_with_services], [WasmConf::chain_plugins], or [WasmRuntime::chain].
+//!
 //! # When a plugin fails
 //!
-//! A phase returns an [ERR_PLUGIN_FAILED] error when a plugin traps or returns an error, and
-//! Pingora responds with 503.
+//! A plugin fails when one of its callbacks traps or returns an error, when it has no guest to
+//! run a request on, when it pauses on headers, on trailers, or on the last chunk of a body with
+//! no callout to wait for, or when its callouts take longer than
+//! [WasmPluginConf::callout_wait_limit]. What happens to the request is decided by the plugin's
+//! [fail policy](WasmPluginConf::fail_policy).
 //!
-//! A plugin that pauses and has no callout to wait for cannot continue, so the phase returns
-//! the same error. The body phases are different. A plugin can pause a body to hold its bytes
-//! until the last chunk arrives, up to a limit. Past
+//! With [FailPolicy::Closed], which is the default, the failure fails the request. The filter
+//! returns an [ERR_PLUGIN_FAILED] error and Pingora responds with 503, or ends the response
+//! early if its header has already been sent. The exception is
+//! [WasmCtx::response_trailer_filter]. Pingora only logs an error from `response_trailer_filter`
+//! and still sends the trailers, and if a plugin was holding body bytes, the filter logs the
+//! failure and returns those bytes in place of the error.
+//!
+//! The 503 that Pingora's `fail_to_proxy` writes for a failed request is not run through
+//! `proxy_on_response_headers` of the other plugins. Those plugins still run `proxy_on_log`,
+//! where `response.code` reads 503.
+//!
+//! With [FailPolicy::Open], the failure is logged, the plugin is skipped for the rest of the
+//! request, and the request continues with the other plugins. Every skip is logged at debug
+//! level, and as a warning at most once every 10 seconds per plugin. On a plugin that
+//! authorizes requests, `Open` lets a request through each time the plugin crashes, hangs, or is
+//! too slow. Use it for plugins a request can do without, such as one that collects statistics.
+//! [WasmCtx::skipped_plugins] returns the plugins that were skipped on a request, so your proxy
+//! can still apply a rule of its own, e.g. deny a request that skipped its authorization plugin.
+//!
+//! | Event | `Closed` | `Open` |
+//! |---|---|---|
+//! | A callback traps or returns an error | request fails | plugin skipped |
+//! | The plugin has no guest when the request starts | request fails | plugin skipped |
+//! | The guest running the request is replaced or lost | request fails | plugin skipped |
+//! | The plugin pauses with no callout, except to hold a body | request fails | plugin skipped |
+//! | A callout wait reaches `callout_wait_limit` | request fails | plugin skipped |
+//! | The plugin fails while a body it changed has bytes to come | request fails | request fails |
+//! | The plugin holds more body bytes than its limit | request fails | request fails |
+//! | The plugin sends a response after the response header | request fails | request fails |
+//! | An earlier filter was cancelled during a callout wait | request fails | request fails |
+//!
+//! The last four events fail the request under both policies, and
+//! [WasmPluginConf::fail_policy] gives the reason for each. A plugin changes a body when it
+//! writes to the body bytes, or when it changes the value of the `content-length` or
+//! `transfer-encoding` header of that message. If it fails while that body can still have bytes
+//! to come, skipping it would send the rest of the body without its changes. This only applies
+//! to a body the plugin runs on, and only until that body has ended.
+//!
+//! A plugin can pause a body to hold its bytes until the last chunk arrives, up to a limit. Past
 //! [WasmPluginConf::request_body_limit], [WasmCtx::request_body_filter] returns an
 //! [ERR_REQUEST_BODY_TOO_LARGE] error, and Pingora responds with 413. Past
 //! [WasmPluginConf::response_body_limit], [WasmCtx::response_body_filter] returns an
 //! [ERR_RESPONSE_BODY_TOO_LARGE] error. Pingora has usually sent the response header before that
 //! point, so the downstream receives a response that ends early. If the header has not been sent
 //! yet, Pingora responds with 500.
+//!
+//! A guest that can no longer be used is replaced under both policies. The first failure of each
+//! plugin on a request is reported to the [metric sink](WasmMetricSink::plugin_failed). A plugin
+//! that cannot start fails [WasmRuntime::new] whatever its policy.
+//!
+//! The proxy below calls each filter of its [WasmCtx] and leaves its plugins on the default
+//! policy:
 //!
 //! ```no_run
 //! use async_trait::async_trait;
@@ -311,6 +428,7 @@
 
 mod callout;
 mod chain;
+mod configuration;
 mod observability;
 mod properties;
 mod root_callbacks;
@@ -322,9 +440,10 @@ mod test_support;
 pub use callout::{CalloutTarget, CalloutUpstreams, StaticCalloutUpstreams};
 pub use chain::write_plugin_response;
 pub use chain::{RequestOutcome, WasmChain, WasmCtx};
+pub use configuration::{CalloutUpstreamConf, WasmConf};
 pub use observability::{
-    CalloutFailure, PrometheusMetricSink, WasmMetric, WasmMetricKind, WasmMetricRecorder,
-    WasmMetricSink,
+    CalloutFailure, FailureOutcome, PluginFailure, PluginFailureReport, PrometheusMetricSink,
+    WasmMetric, WasmMetricKind, WasmMetricRecorder, WasmMetricSink,
 };
 /// Re-export of the `prometheus` crate that [PrometheusMetricSink] is built against.
 ///
@@ -334,13 +453,16 @@ pub use properties::{WasmProperties, WasmPropertyValue};
 pub use proxy_wasm_host::abi::v0_2_1::types::LogLevel;
 pub use proxy_wasm_host::abi::v0_2_1::{LogContext, LogSink};
 pub use proxy_wasm_host::Limits;
-pub use runtime::{WasmPluginConf, WasmRuntime, WasmServices};
+pub use runtime::{FailPolicy, WasmPluginConf, WasmRuntime, WasmServices};
 
 use http::StatusCode;
 use pingora_error::{Error, ErrorType};
-use proxy_wasm_host::abi::v0_2_1::GuestError;
 
-/// The error type returned by a phase when a plugin fails.
+/// The error type returned by a filter when a plugin failure fails the request.
+///
+/// Whether a failure fails the request depends on the plugin's
+/// [fail_policy](WasmPluginConf::fail_policy). A plugin with [FailPolicy::Open] is skipped
+/// after most failures, and the filter returns no error for them.
 ///
 /// The default `fail_to_proxy` of `ProxyHttp` responds with 503 for this type. Match on it in
 /// your own `fail_to_proxy` if you want to send a different response.
@@ -352,25 +474,29 @@ pub const ERR_PLUGIN_FAILED: ErrorType =
 
 /// The error type returned when a plugin holds more of a request body than its limit allows.
 ///
-/// Returned by [WasmCtx::request_body_filter]. The default `fail_to_proxy` responds with 413.
+/// Returned by [WasmCtx::request_body_filter], under both fail policies. The default
+/// `fail_to_proxy` responds with 413.
 pub const ERR_REQUEST_BODY_TOO_LARGE: ErrorType =
     ErrorType::HTTPStatus(StatusCode::PAYLOAD_TOO_LARGE.as_u16());
 
 /// The error type returned when a plugin holds more of a response body than its limit allows.
 ///
-/// Returned by [WasmCtx::response_body_filter]. The response header has usually been sent by
-/// then, in which case the default `fail_to_proxy` writes nothing and the downstream sees the
-/// response end early. If the header has not been sent yet, the default `fail_to_proxy` responds
-/// with 500.
+/// Returned by [WasmCtx::response_body_filter], under both fail policies. The response header
+/// has usually been sent by then, in which case the default `fail_to_proxy` writes nothing and
+/// the downstream sees the response end early. If the header has not been sent yet, the default
+/// `fail_to_proxy` responds with 500.
 pub const ERR_RESPONSE_BODY_TOO_LARGE: ErrorType =
     ErrorType::HTTPStatus(StatusCode::INTERNAL_SERVER_ERROR.as_u16());
 
-pub(crate) fn plugin_failure(name: &str, what: &str, cause: GuestError) -> Box<Error> {
-    Error::because(
-        ERR_PLUGIN_FAILED,
-        format!("wasm plugin {name}: {what}"),
-        cause,
-    )
+/// The error type returned for a mistake in the configuration.
+///
+/// Returned by [WasmRuntime::new], [WasmRuntime::new_with_services], [WasmRuntime::chain], and
+/// [WasmConf::chain_plugins]. A plugin whose file cannot be read or compiled, or whose guest does
+/// not start, is reported with this type as well.
+pub const ERR_INVALID_CONF: ErrorType = ErrorType::new("WasmInvalidConf");
+
+pub(crate) fn invalid_conf(detail: impl Into<String>) -> Box<Error> {
+    Error::explain(ERR_INVALID_CONF, detail.into())
 }
 
 pub(crate) fn plugin_unavailable(name: &str, what: &str) -> Box<Error> {

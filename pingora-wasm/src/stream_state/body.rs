@@ -25,6 +25,8 @@ use proxy_wasm_host::{Buffer, NotAllowed};
 pub(crate) enum BodyBuffer {
     Shared(Bytes),
     Owned(Vec<u8>),
+    /// Owned bytes a guest has written to.
+    WrittenByGuest(Vec<u8>),
 }
 
 impl Default for BodyBuffer {
@@ -49,21 +51,26 @@ impl BodyBuffer {
     pub(crate) fn into_bytes(self) -> Bytes {
         match self {
             BodyBuffer::Shared(bytes) => bytes,
-            BodyBuffer::Owned(bytes) => bytes.into(),
+            BodyBuffer::Owned(bytes) | BodyBuffer::WrittenByGuest(bytes) => bytes.into(),
         }
     }
 
     pub(crate) fn into_vec(self) -> Vec<u8> {
         match self {
             BodyBuffer::Shared(bytes) => bytes.into(),
-            BodyBuffer::Owned(bytes) => bytes,
+            BodyBuffer::Owned(bytes) | BodyBuffer::WrittenByGuest(bytes) => bytes,
         }
+    }
+
+    /// Return `true` if a guest wrote to the buffer.
+    pub(crate) fn was_written_by_guest(&self) -> bool {
+        matches!(self, BodyBuffer::WrittenByGuest(_))
     }
 
     fn as_slice(&self) -> &[u8] {
         match self {
             BodyBuffer::Shared(bytes) => bytes,
-            BodyBuffer::Owned(bytes) => bytes,
+            BodyBuffer::Owned(bytes) | BodyBuffer::WrittenByGuest(bytes) => bytes,
         }
     }
 }
@@ -83,7 +90,7 @@ impl Buffer for BodyBuffer {
     fn replace(&mut self, start: usize, size: usize, value: &[u8]) -> Result<(), NotAllowed> {
         let mut owned = std::mem::take(self).into_vec();
         let result = owned.replace(start, size, value);
-        *self = BodyBuffer::Owned(owned);
+        *self = BodyBuffer::WrittenByGuest(owned);
         result
     }
 }
@@ -109,6 +116,7 @@ mod tests {
         let buffer = BodyBuffer::new(b"held ".to_vec(), Bytes::from_static(b"chunk"));
 
         assert_eq!(buffer.len(), 10);
+        assert!(!buffer.was_written_by_guest());
         assert_eq!(buffer.into_vec(), b"held chunk");
     }
 
@@ -137,6 +145,7 @@ mod tests {
             let result = buffer.replace(start, size, value);
 
             assert_eq!(result, Ok(()));
+            assert!(buffer.was_written_by_guest());
             assert_eq!(buffer.into_bytes(), expected);
         }
     }

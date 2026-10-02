@@ -19,7 +19,6 @@
 
 use crate::callout::CalloutResult;
 use crate::chain::body::BodyDirection;
-use crate::chain::slot::LockedSlot;
 use crate::chain::WasmCtx;
 use crate::stream_state::{BodyBuffer, ResponseTrailers};
 use bytes::Bytes;
@@ -47,7 +46,7 @@ impl PausedPhase<'_> {
     /// Return the callback that belongs to the phase.
     ///
     /// While a result is being delivered, the plugin gets the access it has in this callback.
-    fn callback(&self) -> Callback {
+    pub(super) fn callback(&self) -> Callback {
         match self {
             PausedPhase::RequestHeaders => Callback::RequestHeaders,
             PausedPhase::RequestBody => Callback::RequestBody,
@@ -66,7 +65,7 @@ impl PausedPhase<'_> {
     }
 
     /// Return which body the plugin is holding, or `None` outside of a body phase.
-    fn body_direction(&self) -> Option<BodyDirection> {
+    pub(super) fn body_direction(&self) -> Option<BodyDirection> {
         match self {
             PausedPhase::RequestBody => Some(BodyDirection::Request),
             PausedPhase::ResponseBody => Some(BodyDirection::Response),
@@ -78,8 +77,17 @@ impl PausedPhase<'_> {
 impl WasmCtx {
     /// Deliver the result of callout `id` to the plugin at `position`.
     ///
-    /// Runs `proxy_on_http_call_response` with the access of the phase the plugin paused in. A
-    /// failed callback is treated like any other guest failure, so the guest may be replaced.
+    /// Runs `proxy_on_http_call_response` with the access of the phase the plugin paused in.
+    /// Returns `true` once the callback has run.
+    ///
+    /// A failed callback is a plugin failure like any other, so the guest may be replaced and the
+    /// plugin's fail policy applies. The same goes for a guest that is no longer in its slot.
+    /// Returns `false` if the plugin was skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if the delivery failed and the plugin
+    /// was not skipped, or if the plugin has no context for this request.
     pub(super) fn deliver_callout_result<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -87,13 +95,17 @@ impl WasmCtx {
         phase: &mut PausedPhase<'_>,
         id: CalloutId,
         result: &CalloutResult,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let runtime = self.chain.runtime.clone();
         let pool = &runtime.pools[self.chain.plugins[position]];
         let Some(record) = self.records[position] else {
             return Err(self.plugin_error(position, "no context for callout result"));
         };
-        let mut locked = LockedSlot::of_request(pool, &record)?;
+        let callback = Callback::HttpCallResponse;
+        let Some(mut locked) = self.lock_slot_or_skip_plugin(pool, position, &record, callback)?
+        else {
+            return Ok(false);
+        };
         let loaded = locked.loaded()?;
         let delivery = self.with_phase_in_stream(session, position, phase, |ctx| {
             ctx.run_for_context(loaded, record.context, |scope| {
@@ -101,8 +113,11 @@ impl WasmCtx {
             })
         });
         match delivery {
-            Ok(()) => Ok(()),
-            Err(e) => Err(locked.guest_failure("proxy_on_http_call_response failed", e)),
+            Ok(()) => Ok(true),
+            Err(e) => {
+                self.guest_call_failed(position, locked, Callback::HttpCallResponse, e)?;
+                Ok(false)
+            }
         }
     }
 
@@ -136,10 +151,13 @@ impl WasmCtx {
 
         if let Some(direction) = phase.body_direction() {
             let buffer = mem::take(&mut self.stream().body_buffer);
+            if buffer.was_written_by_guest() {
+                self.record_body_change(direction, position);
+            }
             self.held.put(direction, position, buffer.into_vec());
         }
         match phase {
-            PausedPhase::ResponseHeaders(response) => self.response_out(response),
+            PausedPhase::ResponseHeaders(response) => self.response_out(position, response),
             PausedPhase::ResponseTrailers(trailers) => {
                 if let Some(map) = self.stream().trailers.take() {
                     **trailers = map.trailers;
@@ -147,7 +165,7 @@ impl WasmCtx {
             }
             _ => {}
         }
-        self.request_out(session.req_header_mut());
+        self.request_out(position, session.req_header_mut());
         self.stream().delivery_callback = None;
         result
     }

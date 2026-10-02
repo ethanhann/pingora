@@ -57,6 +57,15 @@ impl RequestBodyState {
         }
     }
 
+    /// Return `true` if the request has a body whose last chunk has not been run through the
+    /// plugins yet.
+    pub(crate) fn is_unfinished(&self) -> bool {
+        matches!(
+            self.progress,
+            RequestBodyProgress::Waiting | RequestBodyProgress::Streaming
+        )
+    }
+
     /// Mark the request as having a body.
     pub(crate) fn expect_body(&mut self) {
         self.progress = RequestBodyProgress::Waiting;

@@ -25,16 +25,16 @@ mod retry;
 mod trailers;
 
 pub(crate) use direction::BodyDirection;
+use held::BodyHold;
 pub(crate) use held::HeldBodies;
 pub(crate) use retry::RequestBodyState;
 
-use super::slot::LockedSlot;
 use super::wait::CalloutWaitOutcome;
 use super::{ResponseProgress, WasmCtx};
 use crate::stream_state::{BodyBuffer, PluginResponse};
 use bytes::Bytes;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
-use pingora_error::{Error, Result};
+use pingora_error::Result;
 use pingora_proxy::Session;
 use proxy_wasm_host::Buffer;
 use std::mem;
@@ -116,53 +116,23 @@ impl WasmCtx {
             };
             let position = direction.position_at_step(step, count);
             let phase = direction.paused_phase();
-            match self.wait_for_callouts(session, position, phase).await? {
-                CalloutWaitOutcome::Continued => {
-                    current = Bytes::from(self.held.take(direction, position));
-                    first_step = step + 1;
-                }
+            let outcome = self.wait_for_callouts(session, position, phase).await?;
+            let released_by_plugin = match outcome {
+                CalloutWaitOutcome::Continued | CalloutWaitOutcome::PluginSkipped => true,
                 CalloutWaitOutcome::StillPaused => {
-                    self.check_body_can_be_held(direction, position, end_of_stream)?;
-                    return Ok(BodyOutcome::Released(Bytes::new()));
+                    let held = self.hold_body_or_skip_plugin(direction, position, end_of_stream)?;
+                    held == BodyHold::EndedBySkip
                 }
                 CalloutWaitOutcome::Respond(response) => {
                     return Ok(BodyOutcome::Respond(position, response))
                 }
+            };
+            if !released_by_plugin {
+                return Ok(BodyOutcome::Released(Bytes::new()));
             }
+            current = self.prepend_held_bytes(direction, position, Bytes::new());
+            first_step = step + 1;
         }
-    }
-
-    /// Check that the plugin at `position` may keep holding the bytes it paused on.
-    ///
-    /// # Errors
-    ///
-    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) at the end of the stream, where no
-    /// later chunk can release the bytes, and the too-large error of `direction` if the plugin
-    /// holds more than its limit.
-    fn check_body_can_be_held(
-        &self,
-        direction: BodyDirection,
-        position: usize,
-        end_of_stream: bool,
-    ) -> Result<()> {
-        if end_of_stream {
-            return Err(self.plugin_error(
-                position,
-                "paused on the last body chunk with no callout pending",
-            ));
-        }
-        let pool = self.pool_at(position);
-        let size = self.held.len(direction, position);
-        if size > direction.limit(&pool.phases) {
-            return Error::e_explain(
-                direction.too_large(),
-                format!(
-                    "wasm plugin {}: {size} held body bytes exceed its limit",
-                    pool.name
-                ),
-            );
-        }
-        Ok(())
     }
 
     /// Run the body callbacks on `chunk`, starting at `first_step` of the pass.
@@ -170,7 +140,11 @@ impl WasmCtx {
     /// Each plugin gets the output of the one before it, preceded by any bytes it was already
     /// holding. The pass stops early when a plugin pauses, which leaves its bytes held, when a
     /// plugin sends its own response, and when there is nothing left to pass on before the end of
-    /// the stream. The bytes of a plugin whose callback fails stay held as well.
+    /// the stream.
+    ///
+    /// A skipped plugin is not run. The bytes held for it, including what it was given in a call
+    /// that failed, are passed on to the next plugin as they are. If a failing plugin is not
+    /// skipped, those bytes stay held and the error is returned.
     fn run_body_callbacks_from<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -191,10 +165,20 @@ impl WasmCtx {
             if !direction.runs(&pool.phases) {
                 continue;
             }
+            if self.is_skipped(position) {
+                current = self.prepend_held_bytes(direction, position, current);
+                continue;
+            }
             if current.is_empty() && !end_of_stream {
                 break;
             }
-            let mut locked = LockedSlot::of_request(pool, &record)?;
+            let callback = direction.callback();
+            let Some(mut locked) =
+                self.lock_slot_or_skip_plugin(pool, position, &record, callback)?
+            else {
+                current = self.prepend_held_bytes(direction, position, current);
+                continue;
+            };
             let loaded = locked.loaded()?;
             let held = self.held.take(direction, position);
             let buffer = BodyBuffer::new(held, mem::take(&mut current));
@@ -209,14 +193,19 @@ impl WasmCtx {
                     scope.on_response_body(record.context, size, end_of_stream)
                 }
             });
-            self.request_out(session.req_header_mut());
+            self.request_out(position, session.req_header_mut());
             let buffer = mem::take(&mut self.stream().body_buffer);
+            if buffer.was_written_by_guest() {
+                self.record_body_change(direction, position);
+            }
             let sent = self.stream().plugin_response.take();
             let action = match action {
                 Ok(action) => action,
                 Err(e) => {
                     self.held.put(direction, position, buffer.into_vec());
-                    return Err(locked.guest_failure(direction.failure(), e));
+                    self.guest_call_failed(position, locked, direction.callback(), e)?;
+                    current = self.prepend_held_bytes(direction, position, Bytes::new());
+                    continue;
                 }
             };
             drop(locked);
@@ -236,8 +225,12 @@ impl WasmCtx {
             if self.waits_for_callout(position) {
                 return Ok(BodyCallbacksOutcome::WaitsForCallout(step));
             }
-            self.check_body_can_be_held(direction, position, end_of_stream)?;
-            break;
+            match self.hold_body_or_skip_plugin(direction, position, end_of_stream)? {
+                BodyHold::Continues => break,
+                BodyHold::EndedBySkip => {
+                    current = self.prepend_held_bytes(direction, position, Bytes::new());
+                }
+            }
         }
         let outcome = BodyOutcome::Released(current);
         Ok(BodyCallbacksOutcome::Finished(outcome))
@@ -251,7 +244,7 @@ mod tests {
         body_chunk, body_plugin, start_request, Wat, GET, HOLD, HOLD_THEN_TRAP, MARK_AND_HOLD,
         MARK_A_REQUEST, MARK_A_RESPONSE, MARK_B_REQUEST, MARK_B_RESPONSE, PAUSE, POST, UPGRADE,
     };
-    use crate::{WasmPluginConf, ERR_PLUGIN_FAILED};
+    use crate::{FailPolicy, WasmPluginConf, ERR_PLUGIN_FAILED};
     use crate::{ERR_REQUEST_BODY_TOO_LARGE, ERR_RESPONSE_BODY_TOO_LARGE};
     use pingora_http::ResponseHeader;
 
@@ -410,29 +403,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn held_request_body_over_limit_fails() {
-        let (_runtime, mut ctx, mut session, _client) =
-            start_request(hold_with_a_limit_of_4(), POST).await;
+    async fn held_body_over_limit_fails() {
+        let cases = [
+            (
+                BodyDirection::Request,
+                ERR_REQUEST_BODY_TOO_LARGE,
+                "wasm plugin a: 6 held request body bytes exceed request_body_limit 4",
+            ),
+            (
+                BodyDirection::Response,
+                ERR_RESPONSE_BODY_TOO_LARGE,
+                "wasm plugin a: 6 held response body bytes exceed response_body_limit 4",
+            ),
+        ];
 
-        let err = ctx
-            .request_body_filter(&mut session, &mut body_chunk("abcdef"), false)
-            .await
-            .unwrap_err();
+        let policies = [FailPolicy::Closed, FailPolicy::Open];
+        let cases = cases
+            .iter()
+            .flat_map(|case| policies.map(|policy| (case, policy)));
 
-        assert_eq!(err.etype(), &ERR_REQUEST_BODY_TOO_LARGE);
-    }
+        for ((direction, error_type, message), policy) in cases {
+            let mut plugins = hold_with_a_limit_of_4();
+            plugins[0].fail_policy = policy;
+            let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
+            let mut body = body_chunk("abcdef");
 
-    #[tokio::test]
-    async fn held_response_body_over_limit_fails() {
-        let (_runtime, mut ctx, mut session, _client) =
-            start_request(hold_with_a_limit_of_4(), POST).await;
+            let result = match direction {
+                BodyDirection::Request => {
+                    ctx.request_body_filter(&mut session, &mut body, false)
+                        .await
+                }
+                BodyDirection::Response => {
+                    ctx.response_body_filter(&mut session, &mut body, false)
+                        .await
+                }
+            };
 
-        let err = ctx
-            .response_body_filter(&mut session, &mut body_chunk("abcdef"), false)
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.etype(), &ERR_RESPONSE_BODY_TOO_LARGE);
+            let err = result.unwrap_err();
+            assert_eq!(err.etype(), error_type, "{policy}");
+            assert!(err.to_string().contains(message), "{err}");
+            assert_eq!(ctx.skipped_plugins().count(), 0, "{policy}");
+        }
     }
 
     #[tokio::test]
@@ -556,6 +567,7 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
-        assert!(err.to_string().contains("guest for this request is gone"));
+        let message = "guest in slot 0 lost before proxy_on_request_body";
+        assert!(err.to_string().contains(message), "{err}");
     }
 }

@@ -98,7 +98,8 @@ impl RootCallbackLoop {
                 for registration in changes.queues {
                     let queue = registration.queue;
                     let pending_item_count =
-                        self.queues.register(queue, address, registration.root);
+                        self.queues
+                            .register(queue, &registration.name, address, registration.root);
                     let items = (0..pending_item_count).map(|_| Work::QueueItem(queue));
                     self.ready_work.extend(items);
                 }

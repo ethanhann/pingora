@@ -26,7 +26,8 @@ use crate::observability::WasmMetricSink;
 use crate::properties::WasmProperties;
 use crate::root_callbacks::RootCallbackPluginState;
 use crate::root_callbacks::RootCallbackThread;
-use pingora_error::{Error, ErrorType, OrErr, Result};
+use crate::{invalid_conf, ERR_INVALID_CONF};
+use pingora_error::{OrErr, Result};
 use proxy_wasm_host::abi::v0_2_1::{
     GuestSpec, Host, InMemoryStoreLimits, LogSink, QueueEnqueued, SharedServices,
 };
@@ -42,19 +43,16 @@ use std::sync::Arc;
 /// the same name.
 pub(super) fn checked_plugin_indexes(plugins: &[WasmPluginConf]) -> Result<HashMap<String, usize>> {
     if plugins.is_empty() {
-        return Error::e_explain(
-            ErrorType::InternalError,
-            "wasm runtime needs at least one plugin",
-        );
+        return Err(invalid_conf("wasm runtime needs at least one plugin"));
     }
     let mut names = HashMap::with_capacity(plugins.len());
     for (index, plugin) in plugins.iter().enumerate() {
         plugin.check()?;
         if names.insert(plugin.name.clone(), index).is_some() {
-            return Error::e_explain(
-                ErrorType::InternalError,
-                format!("wasm plugin {}: duplicate plugin name", plugin.name),
-            );
+            return Err(invalid_conf(format!(
+                "wasm plugin {}: duplicate plugin name",
+                plugin.name
+            )));
         }
     }
     Ok(names)
@@ -82,6 +80,7 @@ pub(super) struct PoolInputs<'a> {
     pub(super) log_sink: Arc<dyn LogSink>,
     pub(super) shared_store: Arc<dyn SharedServices>,
     pub(super) upstreams: Arc<dyn CalloutUpstreams>,
+    pub(super) metric_sink: Arc<dyn WasmMetricSink>,
     pub(super) fixed_properties: Arc<WasmProperties>,
     pub(super) root_callback_thread: &'a RootCallbackThread,
 }
@@ -97,20 +96,19 @@ pub(super) fn build_pool(
     plugin: &WasmPluginConf,
     inputs: &PoolInputs<'_>,
 ) -> Result<GuestPool> {
-    let bytes = std::fs::read(&plugin.path).or_err_with(ErrorType::ReadError, || {
+    let bytes = std::fs::read(&plugin.path).or_err_with(ERR_INVALID_CONF, || {
         format!(
             "failed to read wasm plugin {} from {}",
             plugin.name,
             plugin.path.display()
         )
     })?;
-    let module = Module::new(inputs.engine, &bytes)
-        .or_err_with(ErrorType::InternalError, || {
-            format!("failed to compile wasm plugin {}", plugin.name)
-        })?;
+    let module = Module::new(inputs.engine, &bytes).or_err_with(ERR_INVALID_CONF, || {
+        format!("failed to compile wasm plugin {}", plugin.name)
+    })?;
     let services = plugin.services(inputs.log_sink.clone(), inputs.shared_store.clone());
     let spec = GuestSpec::new(inputs.host, &module, services, &plugin.limits).or_err_with(
-        ErrorType::InternalError,
+        ERR_INVALID_CONF,
         || {
             format!(
                 "wasm plugin {}: not a supported Proxy-Wasm module",
@@ -127,7 +125,9 @@ pub(super) fn build_pool(
         plugin_config: plugin.plugin_config(),
         slot_count: plugin.slots,
         phases: plugin.phase_conf(),
+        fail_policy: plugin.fail_policy,
         callout_conf: plugin.callout_conf(inputs.upstreams.clone()),
+        metric_sink: inputs.metric_sink.clone(),
         root_callback_plugin: Arc::new(root_callback_plugin),
         root_callback_sender: inputs.root_callback_thread.sender(),
     })

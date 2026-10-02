@@ -12,15 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Plugin metrics and callout failure reporting
+//! Plugin metrics and failure reporting
 
 mod log_sink;
+mod plugin_failure;
+mod prometheus_recorders;
 mod prometheus_sink;
 
 pub(crate) use log_sink::LogCrateSink;
+pub use plugin_failure::{FailureOutcome, PluginFailure, PluginFailureReport};
 pub use prometheus_sink::PrometheusMetricSink;
 
-/// A sink for the metrics plugins define and for failed callouts.
+/// A sink for the metrics plugins define, and for reports of failed callouts, plugin failures,
+/// and replaced guests.
 ///
 /// Implement this to publish plugin metrics to your own metrics system, or use
 /// [PrometheusMetricSink]. Set your sink in
@@ -48,6 +52,30 @@ pub trait WasmMetricSink: Send + Sync {
     /// This is called for each callout that fails, with the reason in `failure`. By default it
     /// does nothing.
     fn callout_failed(&self, _plugin_name: &str, _failure: CalloutFailure) {}
+
+    /// Report a plugin failure.
+    ///
+    /// This is called when a plugin fails during a request, under both fail policies. `report`
+    /// has the outcome, either a failed request or a skipped plugin. Only the first failure of a
+    /// plugin on a request is reported. By default it does nothing.
+    ///
+    /// The outcome is [FailureOutcome::Failed] in three cases where no request fails. One is a
+    /// failure in [WasmCtx::response_trailer_filter](crate::WasmCtx::response_trailer_filter)
+    /// that does not skip the plugin, because Pingora still sends the trailers. Another is a failure in [WasmCtx::logging](crate::WasmCtx::logging),
+    /// or in the end-of-request callbacks that run when a `WasmCtx` is dropped without it. The
+    /// third is a failure outside of a request, e.g. a trap in `proxy_on_tick`.
+    ///
+    /// A request error that is not a plugin failure is not reported, e.g. a body chunk received
+    /// after the end of the body, a missing call to
+    /// [WasmCtx::upstream_attempt](crate::WasmCtx::upstream_attempt), or runtime threads that
+    /// cannot be started.
+    fn plugin_failed(&self, _report: &PluginFailureReport<'_>) {}
+
+    /// Report that a guest of the plugin `plugin_name` was replaced after a failure.
+    ///
+    /// This is called each time a new guest is started in a slot that had lost its guest. By
+    /// default it does nothing.
+    fn guest_replaced(&self, _plugin_name: &str) {}
 }
 
 /// A recorder for the changes plugins make to one metric.

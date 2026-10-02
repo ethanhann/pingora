@@ -24,7 +24,7 @@ pub(crate) use request::RequestHeaders;
 pub(crate) use response::ResponseHeaders;
 pub(crate) use trailers::ResponseTrailers;
 
-use http::header::{HeaderName, HeaderValue, HOST};
+use http::header::{HeaderName, HeaderValue, CONTENT_LENGTH, HOST, TRANSFER_ENCODING};
 use pingora_http::{RequestHeader, ResponseHeader};
 use proxy_wasm_host::{NotAllowed, PairVisitor};
 use std::ops::ControlFlow;
@@ -63,6 +63,27 @@ pub(super) fn classify(key: &[u8]) -> Option<Name<'_>> {
         return Some(Name::Host);
     }
     std::str::from_utf8(key).ok().map(Name::Regular)
+}
+
+/// Return the values of `key` in `headers` if `key` is `content-length` or `transfer-encoding`.
+///
+/// Returns `None` for any other key. Comparing the result from before a write with the one from
+/// after it shows whether the write changed the framing of the message.
+pub(super) fn framing_header_values(
+    headers: &http::HeaderMap,
+    key: &[u8],
+) -> Option<Vec<HeaderValue>> {
+    let name = [CONTENT_LENGTH, TRANSFER_ENCODING]
+        .into_iter()
+        .find(|name| key.eq_ignore_ascii_case(name.as_str().as_bytes()))?;
+    Some(headers.get_all(name).iter().cloned().collect())
+}
+
+/// Return `true` if `content-length` or `transfer-encoding` differs between the two maps.
+pub(super) fn framing_headers_differ(before: &http::HeaderMap, after: &http::HeaderMap) -> bool {
+    [CONTENT_LENGTH, TRANSFER_ENCODING]
+        .iter()
+        .any(|name| !before.get_all(name).iter().eq(after.get_all(name)))
 }
 
 pub(super) fn header_name(key: &[u8]) -> Result<HeaderName, NotAllowed> {

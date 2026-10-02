@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::slot::LockedSlot;
+use super::failure::FilterFailure;
 use super::wait::{CalloutWaitOutcome, PausedPhase};
 use super::{ResponseProgress, WasmCtx};
 use crate::stream_state::PluginResponse;
@@ -24,9 +24,21 @@ use pingora_error::Result;
 use pingora_http::ResponseHeader;
 use pingora_proxy::Session;
 use proxy_wasm_host::abi::v0_2_1::types::StreamType;
+use proxy_wasm_host::abi::v0_2_1::Callback;
 
 const CHUNKED: &str = "chunked";
-const PAUSED_A_RESPONSE: &str = "paused on response headers with no callout pending";
+
+/// Build the failure for a plugin that paused on response headers with nothing to wait for.
+///
+/// On an upstream response the plugin has no callout pending. On a plugin's response its callouts
+/// are never started, so the pause could not end.
+fn response_pause_failure(origin: ResponseSource) -> FilterFailure {
+    let what = match origin {
+        ResponseSource::Upstream => "paused on response headers with no callout pending",
+        ResponseSource::Plugin => "paused on plugin response headers, callouts not started",
+    };
+    FilterFailure::paused(Callback::ResponseHeaders, what)
+}
 
 /// Where the response header given to [WasmCtx::response_pass] came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,11 +70,18 @@ impl WasmCtx {
     ///
     /// # Errors
     ///
-    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if a plugin traps or otherwise fails,
-    /// if a plugin pauses the response with no callout pending, or if the guest holding this
-    /// request was replaced after a failure. The same error is returned if an earlier phase of
-    /// this request was cancelled while a plugin was waiting for a callout, or if the runtime's
-    /// threads cannot be started.
+    /// For a plugin with [FailPolicy::Closed](crate::FailPolicy::Closed), returns
+    /// [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if the plugin traps or otherwise fails,
+    /// pauses the response with no callout pending, waits for callouts longer than its
+    /// [callout_wait_limit](crate::WasmPluginConf::callout_wait_limit), or lost the guest holding
+    /// this request. A plugin with [FailPolicy::Open](crate::FailPolicy::Open) is skipped
+    /// instead, unless it has already changed a body that can still have bytes to come, or that
+    /// body's length, e.g. a request body that is still being sent upstream. See
+    /// [fail_policy](crate::WasmPluginConf::fail_policy) for the full rule.
+    ///
+    /// Under both policies, the same error is returned if an earlier filter of this request was
+    /// cancelled while a plugin was waiting for a callout, or if the runtime's threads cannot be
+    /// started.
     pub async fn response_filter<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -79,6 +98,7 @@ impl WasmCtx {
         self.chain.runtime.start_threads()?;
         self.response_progress = ResponseProgress::FromUpstream;
         let end_of_stream = response_ends(&session.req_header().method, resp);
+        self.failures.response_body_ended = end_of_stream;
         let had_length = resp.headers.contains_key(CONTENT_LENGTH);
         let mut remaining = self.records.len();
         loop {
@@ -96,9 +116,9 @@ impl WasmCtx {
             };
             let phase = PausedPhase::ResponseHeaders(&mut *resp);
             match self.wait_for_callouts(session, position, phase).await? {
-                CalloutWaitOutcome::Continued => remaining = position,
+                CalloutWaitOutcome::Continued | CalloutWaitOutcome::PluginSkipped => {}
                 CalloutWaitOutcome::StillPaused => {
-                    return Err(self.plugin_error(position, PAUSED_A_RESPONSE))
+                    self.skip_plugin_or_fail_request(position, response_pause_failure(origin))?;
                 }
                 CalloutWaitOutcome::Respond(response) => {
                     return Err(self
@@ -106,21 +126,25 @@ impl WasmCtx {
                         .await)
                 }
             }
+            remaining = position;
         }
         frame_if_length_removed(resp, had_length, end_of_stream)
     }
 
     /// Run `proxy_on_response_headers` on `resp` for the plugins at `positions`, in that order.
     ///
-    /// Positions without a context for this request are skipped. The pass stops early at a
-    /// plugin that pauses with a callout pending, or that sends its own response while `origin`
-    /// is the upstream. Callouts are only started for an upstream response, because the phases
-    /// that pass a plugin's response along cannot wait on one.
+    /// Positions without a context for this request are passed over, and so are plugins already
+    /// skipped. The pass stops early at a plugin that pauses with a callout pending, or that
+    /// sends its own response while `origin` is the upstream. Callouts are only started for an
+    /// upstream response, because the filters that pass a plugin's response along cannot wait on
+    /// one.
+    ///
+    /// A plugin that fails, whose guest is gone, or that pauses with no callout pending is
+    /// skipped if its fail policy allows it, and the pass continues with the next plugin.
     ///
     /// # Errors
     ///
-    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if a plugin fails, if its guest is
-    /// gone, or if it pauses with no callout pending.
+    /// Returns the failure's error if the plugin failed and was not skipped.
     pub(super) fn response_pass<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -134,8 +158,16 @@ impl WasmCtx {
             let Some(record) = self.records[position] else {
                 continue;
             };
+            if self.is_skipped(position) {
+                continue;
+            }
             let pool = &runtime.pools[self.chain.plugins[position]];
-            let mut locked = LockedSlot::of_request(pool, &record)?;
+            let callback = Callback::ResponseHeaders;
+            let Some(mut locked) =
+                self.lock_slot_or_skip_plugin(pool, position, &record, callback)?
+            else {
+                continue;
+            };
             let loaded = locked.loaded()?;
             self.request_in(session.req_header_mut());
             self.response_in(resp);
@@ -143,12 +175,15 @@ impl WasmCtx {
             let action = self.run_for_context(loaded, record.context, |scope| {
                 scope.on_response_headers(record.context, count, end_of_stream)
             });
-            self.response_out(resp);
-            self.request_out(session.req_header_mut());
+            self.response_out(position, resp);
+            self.request_out(position, session.req_header_mut());
             let sent = self.stream().plugin_response.take();
             let action = match action {
                 Ok(action) => action,
-                Err(e) => return Err(locked.guest_failure("proxy_on_response_headers failed", e)),
+                Err(e) => {
+                    self.guest_call_failed(position, locked, Callback::ResponseHeaders, e)?;
+                    continue;
+                }
             };
             drop(locked);
             let paused =
@@ -167,7 +202,9 @@ impl WasmCtx {
                 (None, _) if paused && self.waits_for_callout(position) => {
                     return Ok(ResponsePassOutcome::WaitsForCallout(position))
                 }
-                (None, _) if paused => return Err(self.plugin_error(position, PAUSED_A_RESPONSE)),
+                (None, _) if paused => {
+                    self.skip_plugin_or_fail_request(position, response_pause_failure(origin))?;
+                }
                 (None, _) => {}
             }
         }
@@ -232,9 +269,9 @@ mod tests {
     use super::*;
     use crate::test_support::{
         add_request_header, body_chunk, body_plugin, one_plugin, read_downstream, session,
-        start_request, Wat, GET, HEAD, POST, REMOVE_LENGTH, TEAPOT, TRAP,
+        start_request, Wat, GET, HEAD, PAUSE, POST, REMOVE_LENGTH, TEAPOT, TRAP,
     };
-    use crate::ERR_PLUGIN_FAILED;
+    use crate::{WasmRuntime, ERR_PLUGIN_FAILED};
     use pingora_error::ErrorType;
 
     fn response(status: u16, length: Option<&str>) -> ResponseHeader {
@@ -259,7 +296,29 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
-        assert!(err.to_string().contains("guest for this request is gone"));
+        let message = "guest in slot 0 lost before proxy_on_response_headers";
+        assert!(err.to_string().contains(message), "{err}");
+    }
+
+    #[tokio::test]
+    async fn pause_on_plugin_response_headers_fails() {
+        let teapot = Wat {
+            request_headers: TEAPOT,
+            ..Wat::default()
+        };
+        let plugins = vec![
+            body_plugin("first", Wat::response_headers(PAUSE)),
+            body_plugin("last", teapot),
+        ];
+        let runtime = WasmRuntime::new(plugins).unwrap();
+        let mut ctx = runtime.chain(&["first", "last"]).unwrap().new_ctx();
+        let (mut session, _client) = session(GET).await;
+
+        let err = ctx.request_filter(&mut session).await.unwrap_err();
+
+        assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
+        let message = "wasm plugin first: paused on plugin response headers";
+        assert!(err.to_string().contains(message), "{err}");
     }
 
     #[tokio::test]

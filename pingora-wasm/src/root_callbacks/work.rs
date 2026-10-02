@@ -18,6 +18,7 @@
 
 use super::callback_loop::RootCallbackLoop;
 use super::root_callouts::FinishedCallout;
+use crate::observability::{FailureOutcome, PluginFailure, PluginFailureReport};
 use crate::root_callbacks::RootStream;
 use crate::runtime::pool::events::GuestAddress;
 use crate::runtime::pool::SlotLockAttempt;
@@ -100,7 +101,8 @@ impl RootCallbackLoop {
     fn run_queue_item(&mut self, runtime: &RuntimeInner, queue: QueueId) -> WorkOutcome {
         loop {
             let Some(registrant) = self.queues.last_registrant(queue) else {
-                debug!("wasm queue {queue}: item kept pending, no live registrant");
+                let name = self.queues.name(queue);
+                debug!("wasm queue {name} ({queue}): item kept pending, no live registrant");
                 self.queues.add_pending_item(queue);
                 return WorkOutcome::Done;
             };
@@ -185,14 +187,14 @@ impl RootCallbackLoop {
     /// runs if it is busy or no longer holds this guest. Callouts the guest made during a
     /// successful call are started afterwards.
     ///
-    /// A failed call is logged as a warning with `callback_name`, unless the failure removed the
-    /// guest from its slot, which the pool logs on its own.
+    /// A failed call is logged as a warning with `callback_name` and reported to the metric sink,
+    /// and the guest is replaced if the failure left it unusable.
     fn call_guest<R>(
         &mut self,
         runtime: &RuntimeInner,
         address: GuestAddress,
         context: GuestCallContext,
-        callback_name: &str,
+        callback_name: &'static str,
         body: impl FnOnce(&mut CallScope<'_, RootStream>, ContextId) -> Result<R, GuestError>,
     ) -> GuestCallOutcome<R> {
         let pool = &runtime.pools[address.slot.pool_index];
@@ -217,9 +219,16 @@ impl RootCallbackLoop {
                 GuestCallOutcome::Ran(value)
             }
             Err(e) => {
-                if !pool.replace_if_unusable(address.slot.slot_index, guard, &e) {
-                    warn!("wasm plugin {}: {callback_name} failed: {e}", pool.name);
-                }
+                warn!("wasm plugin {}: {callback_name} failed: {e}", pool.name);
+                pool.replace_if_unusable(address.slot.slot_index, guard, &e);
+                // Outside of a request there is nothing for a fail policy to act on, so the
+                // outcome is always `Failed`
+                runtime.metric_sink.plugin_failed(&PluginFailureReport {
+                    plugin_name: &pool.name,
+                    failure: PluginFailure::GuestError,
+                    outcome: FailureOutcome::Failed,
+                    callback: Some(callback_name),
+                });
                 GuestCallOutcome::Failed
             }
         }

@@ -12,25 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::fail_policy::FailPolicy;
 use super::pool::PluginPhases;
 use crate::callout::{CalloutUpstreams, PluginCalloutConf};
-use pingora_error::{Error, ErrorType, Result};
+use crate::invalid_conf;
+use pingora_error::Result;
 use proxy_wasm_host::abi::v0_2_1::types::LogLevel;
 use proxy_wasm_host::abi::v0_2_1::{LogSink, PluginConfig, SharedServices, VmServices};
 use proxy_wasm_host::Limits;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 const BODY_LIMIT: usize = 1024 * 1024;
 const CALLOUT_TIMEOUT_LIMIT: Duration = Duration::from_secs(10);
+const CALLOUT_WAIT_LIMIT: Duration = Duration::from_secs(30);
 const CALLOUT_RESPONSE_LIMIT: usize = 1024 * 1024;
 
 /// Configuration for one Proxy-Wasm plugin.
 ///
 /// Create one with [WasmPluginConf::new], then set the fields you need.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WasmPluginConf {
     /// The name of the plugin, which must be unique within a runtime.
     ///
@@ -102,16 +106,136 @@ pub struct WasmPluginConf {
     /// A callout normally uses the timeout the plugin passes to `proxy_http_call`. If that
     /// timeout is zero, which some hosts treat as no timeout, or longer than this limit, the
     /// limit is used instead and a warning is logged the first time it happens. A request can
-    /// therefore stay open for up to this long while its plugin waits for a callout.
+    /// therefore stay open for up to this long for each callout its plugin waits for, and for up
+    /// to [callout_wait_limit](Self::callout_wait_limit) for the wait as a whole.
     ///
-    /// If the plugin sends callouts from a body phase or from the response headers phase, keep
-    /// this limit below the `read_timeout` of your upstream peers. Must be greater than zero.
+    /// If the plugin sends callouts from a body filter or from the response header filter, keep
+    /// this limit below the `read_timeout` of your upstream peers. Must be greater than zero, and
+    /// a value above [callout_wait_limit](Self::callout_wait_limit) is rejected.
     pub callout_timeout_limit: Duration,
+    /// The longest a filter may wait for the plugin's callouts. Default 30 seconds.
+    ///
+    /// A callout wait begins when the plugin pauses a filter to wait for a callout, and ends
+    /// when the plugin continues or sends a response. It covers every callout the plugin sends
+    /// in the meantime. Each callout is already bounded by
+    /// [callout_timeout_limit](Self::callout_timeout_limit), but a plugin may send a new callout
+    /// from each `proxy_on_http_call_response`, and without this limit it could keep a request
+    /// open indefinitely.
+    ///
+    /// When a wait reaches the limit, the filter stops waiting and treats this as a plugin
+    /// failure, so [fail_policy](Self::fail_policy) decides whether the request fails or
+    /// continues without the plugin. Callouts still in flight run to completion and their results
+    /// are discarded.
+    ///
+    /// The limit applies to each wait separately. A body filter runs once per chunk, so a plugin
+    /// that waits on every chunk gets the full limit each time. If the plugin sends callouts
+    /// from a body filter or from the response header filter, keep this limit below the
+    /// `read_timeout` of your upstream peers. Must not be less than
+    /// [callout_timeout_limit](Self::callout_timeout_limit). If the two limits are equal, a
+    /// single callout that times out ends at the same moment as the wait, and either the timeout
+    /// or the wait limit may take effect first.
+    ///
+    /// A timeout of your own around a filter cannot replace this limit. Once the future of a
+    /// filter has been dropped during a callout wait, every later header or trailer filter of the
+    /// request, and every later body filter that has a plugin to run, returns an error, whatever
+    /// the fail policy.
+    pub callout_wait_limit: Duration,
     /// The maximum size in bytes of a callout response body. Default 1 MiB.
     ///
     /// A callout with a larger response body fails, and the plugin receives a result with no
     /// headers and no body. Must be greater than zero.
     pub callout_response_limit: usize,
+    /// What happens to a request when the plugin fails. Default [FailPolicy::Closed].
+    ///
+    /// With [FailPolicy::Closed], a plugin failure fails the request. The filter returns
+    /// [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED), and Pingora responds with 503 or, once the
+    /// response header has been sent, ends the response early. The exception is
+    /// [WasmCtx::response_trailer_filter](crate::WasmCtx::response_trailer_filter). Pingora only
+    /// logs an error from `response_trailer_filter` and still sends the trailers. If a plugin
+    /// was holding body bytes, the filter logs the failure and returns those bytes in place of
+    /// the error.
+    ///
+    /// With [FailPolicy::Open], the failure is logged, the plugin is skipped, and the request
+    /// continues with the next plugin. No later header, body, or trailer filter of that request
+    /// runs the skipped plugin again. Every skip is logged at debug level, and as a warning at
+    /// most once every 10 seconds per plugin. A plugin is skipped when it:
+    ///
+    /// - traps or returns an error in a callback, including `proxy_on_http_call_response`
+    /// - has no guest in any of its slots when the request starts
+    /// - loses the guest that held the request's context, e.g. to a trap in another request
+    /// - pauses on request headers, response headers, response trailers, or the last chunk of a
+    ///   body with no callout pending
+    /// - waits for callouts longer than [callout_wait_limit](Self::callout_wait_limit)
+    ///
+    /// `Open` on a plugin that authorizes requests therefore lets a request through each time
+    /// the plugin crashes, hangs, or is slow.
+    /// [WasmCtx::skipped_plugins](crate::WasmCtx::skipped_plugins) returns the plugins skipped
+    /// on a request, so your proxy can enforce a rule of its own, e.g. deny the request, add a
+    /// header, or tag its access log.
+    ///
+    /// Some failures fail the request under both policies:
+    ///
+    /// - A failure while a body the plugin changed can still have bytes to come. A plugin
+    ///   changes a body when it writes to the body bytes, or when one of its writes changes the
+    ///   value of the `content-length` or `transfer-encoding` header of that message. A write
+    ///   that leaves the header as it was does not count. A body only counts if the plugin runs
+    ///   on it, i.e. [request_body](Self::request_body) or
+    ///   [response_body](Self::response_body) is enabled and the plugin exports the callback. A
+    ///   request body counts until its last chunk has run through the plugins. A response body
+    ///   counts until the response has ended, which it has if it has no body, once its last
+    ///   body chunk has run through the plugins, or once its trailers have arrived. Neither
+    ///   counts once a plugin has sent its own response, since no body is proxied after that.
+    ///   Until then, the rest of the body would go out without the plugin's changes, so the
+    ///   upstream or the downstream would get a complete message with a mixed body.
+    /// - More held body bytes than [request_body_limit](Self::request_body_limit) or
+    ///   [response_body_limit](Self::response_body_limit) allows. Otherwise a client could
+    ///   bypass the plugin by padding its request.
+    /// - A response sent after the response header. It can no longer replace the response that
+    ///   has already started.
+    /// - Any filter that runs after an earlier filter of the request was cancelled during a
+    ///   callout wait, since the plugins may have been left halfway through that filter.
+    ///
+    /// A skipped plugin keeps what it did before it failed, e.g. a header it added or a property
+    /// it set. Body bytes it was holding are released as it left them. They go to the next
+    /// plugin if it failed in the filter of that body, and otherwise ahead of the next chunk of
+    /// that body. The response trailer filter also releases held response bytes. If the body has
+    /// no further chunk and no trailers, the bytes are not sent, and
+    /// [WasmCtx::logging](crate::WasmCtx::logging) logs how many were left.
+    ///
+    /// A response or callout from the failing callback is dropped, and the results of its
+    /// pending callouts are discarded. If its guest is still usable, `logging` runs its
+    /// `proxy_on_log` as usual, so a statistics plugin still counts the request.
+    ///
+    /// A plugin that cannot start fails [WasmRuntime::new](crate::WasmRuntime::new) under both
+    /// policies.
+    pub fail_policy: FailPolicy,
+}
+
+// Either configuration may hold a secret, so only their lengths are printed
+impl fmt::Debug for WasmPluginConf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let bytes = |configuration: &[u8]| format!("{} bytes", configuration.len());
+        f.debug_struct("WasmPluginConf")
+            .field("name", &self.name)
+            .field("path", &self.path)
+            .field("root_id", &self.root_id)
+            .field("vm_id", &self.vm_id)
+            .field("vm_configuration", &bytes(&self.vm_configuration))
+            .field("configuration", &bytes(&self.configuration))
+            .field("log_level", &self.log_level)
+            .field("limits", &self.limits)
+            .field("slots", &self.slots)
+            .field("request_body", &self.request_body)
+            .field("response_body", &self.response_body)
+            .field("response_trailers", &self.response_trailers)
+            .field("request_body_limit", &self.request_body_limit)
+            .field("response_body_limit", &self.response_body_limit)
+            .field("callout_timeout_limit", &self.callout_timeout_limit)
+            .field("callout_wait_limit", &self.callout_wait_limit)
+            .field("callout_response_limit", &self.callout_response_limit)
+            .field("fail_policy", &self.fail_policy)
+            .finish()
+    }
 }
 
 impl WasmPluginConf {
@@ -138,51 +262,32 @@ impl WasmPluginConf {
             request_body_limit: BODY_LIMIT,
             response_body_limit: BODY_LIMIT,
             callout_timeout_limit: CALLOUT_TIMEOUT_LIMIT,
+            callout_wait_limit: CALLOUT_WAIT_LIMIT,
             callout_response_limit: CALLOUT_RESPONSE_LIMIT,
+            fail_policy: FailPolicy::Closed,
         }
     }
 
     pub(crate) fn check(&self) -> Result<()> {
-        if self.slots == 0 {
-            return Error::e_explain(
-                ErrorType::InternalError,
-                format!("wasm plugin {}: slots must be at least 1", self.name),
-            );
-        }
-        if self.limits.fuel().is_some() {
-            return Error::e_explain(
-                ErrorType::InternalError,
-                format!("wasm plugin {}: fuel limits are not supported", self.name),
-            );
-        }
-        if self.request_body_limit == 0 || self.response_body_limit == 0 {
-            return Error::e_explain(
-                ErrorType::InternalError,
-                format!(
-                    "wasm plugin {}: request_body_limit and response_body_limit must be greater than zero",
-                    self.name
-                ),
-            );
-        }
-        if self.callout_timeout_limit.is_zero() {
-            return Error::e_explain(
-                ErrorType::InternalError,
-                format!(
-                    "wasm plugin {}: callout_timeout_limit must be greater than zero",
-                    self.name
-                ),
-            );
-        }
-        if self.callout_response_limit == 0 {
-            return Error::e_explain(
-                ErrorType::InternalError,
-                format!(
-                    "wasm plugin {}: callout_response_limit must be greater than zero",
-                    self.name
-                ),
-            );
-        }
-        Ok(())
+        let name = &self.name;
+        let mistake = if self.slots == 0 {
+            "slots must be at least 1"
+        } else if self.limits.fuel().is_some() {
+            "fuel limits are not supported"
+        } else if self.request_body_limit == 0 {
+            "request_body_limit must be greater than zero"
+        } else if self.response_body_limit == 0 {
+            "response_body_limit must be greater than zero"
+        } else if self.callout_timeout_limit.is_zero() {
+            "callout_timeout_limit must be greater than zero"
+        } else if self.callout_wait_limit < self.callout_timeout_limit {
+            "callout_wait_limit must not be less than callout_timeout_limit"
+        } else if self.callout_response_limit == 0 {
+            "callout_response_limit must be greater than zero"
+        } else {
+            return Ok(());
+        };
+        Err(invalid_conf(format!("wasm plugin {name}: {mistake}")))
     }
 
     pub(crate) fn callout_conf(&self, upstreams: Arc<dyn CalloutUpstreams>) -> PluginCalloutConf {
@@ -190,6 +295,7 @@ impl WasmPluginConf {
             &self.name,
             upstreams,
             self.callout_timeout_limit,
+            self.callout_wait_limit,
             self.callout_response_limit,
         )
     }
@@ -227,6 +333,7 @@ impl WasmPluginConf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ERR_INVALID_CONF;
 
     #[test]
     fn new_sets_defaults() {
@@ -244,7 +351,9 @@ mod tests {
         assert_eq!(conf.request_body_limit, BODY_LIMIT);
         assert_eq!(conf.response_body_limit, BODY_LIMIT);
         assert_eq!(conf.callout_timeout_limit, Duration::from_secs(10));
+        assert_eq!(conf.callout_wait_limit, Duration::from_secs(30));
         assert_eq!(conf.callout_response_limit, CALLOUT_RESPONSE_LIMIT);
+        assert_eq!(conf.fail_policy, FailPolicy::Closed);
     }
 
     #[test]
@@ -261,6 +370,8 @@ mod tests {
         timeout.callout_timeout_limit = Duration::ZERO;
         let mut callout = WasmPluginConf::new("callout", "callout.wasm");
         callout.callout_response_limit = 0;
+        let mut wait = WasmPluginConf::new("wait", "wait.wasm");
+        wait.callout_wait_limit = Duration::from_secs(9);
 
         let errors = [
             zero.check(),
@@ -269,15 +380,37 @@ mod tests {
             response.check(),
             timeout.check(),
             callout.check(),
+            wait.check(),
         ]
-        .map(|r| r.unwrap_err().to_string());
+        .map(|r| r.unwrap_err());
+
+        assert!(errors.iter().all(|e| e.etype() == &ERR_INVALID_CONF));
+        let errors = errors.map(|e| e.to_string());
 
         assert!(errors[0].contains("wasm plugin zero: slots must be at least 1"));
         assert!(errors[1].contains("wasm plugin fuel: fuel limits are not supported"));
-        assert!(errors[2].contains("request: request_body_limit and response_body_limit must be"));
-        assert!(errors[3].contains("response: request_body_limit and response_body_limit must be"));
+        assert!(errors[2].contains("request: request_body_limit must be greater than zero"));
+        assert!(errors[3].contains("response: response_body_limit must be greater than zero"));
         assert!(errors[4].contains("timeout: callout_timeout_limit must be greater than zero"));
         assert!(errors[5].contains("callout: callout_response_limit must be greater than zero"));
+        let wait = "wait: callout_wait_limit must not be less than callout_timeout_limit";
+        assert!(errors[6].contains(wait));
+    }
+
+    #[test]
+    fn debug_output_has_configuration_lengths_only() {
+        let mut conf = WasmPluginConf::new("auth", "auth.wasm");
+        conf.configuration = b"token=s3cret".to_vec();
+        conf.vm_configuration = b"key=hidden".to_vec();
+
+        let debug = format!("{conf:?}");
+
+        assert!(debug.contains("configuration: \"12 bytes\""), "{debug}");
+        assert!(debug.contains("vm_configuration: \"10 bytes\""), "{debug}");
+        assert!(
+            !debug.contains("s3cret") && !debug.contains("115"),
+            "{debug}"
+        );
     }
 
     #[test]

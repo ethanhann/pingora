@@ -1,0 +1,20 @@
+# Configuration for the wasm_proxy example. The plugin paths are relative, so run it from the
+# pingora-wasm directory:
+#
+#   cargo run --example wasm_proxy -- --conf examples/wasm_proxy.yaml
+#
+# Pingora reads its own keys from this file, here version and threads, and ignores the others.
+version: 1
+threads: 2
+
+plugins:
+  - name: add-request-header
+    path: tests/fixtures/add-request-header.wasm
+    slots: 2
+  - name: sdk-http-body
+    path: tests/fixtures/sdk-http-body.wasm
+    response_body: true
+    slots: 2
+
+chains:
+  default: [add-request-header, sdk-http-body]

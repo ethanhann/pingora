@@ -316,7 +316,7 @@ mod tests {
     /// Build a POST callout to the `authz` upstream with `body`.
     fn post_callout(body: &'static str, timeout: Duration) -> AcceptedCallout {
         let upstreams = Arc::new(StaticCalloutUpstreams::new());
-        let conf = PluginCalloutConf::new("a", upstreams, timeout, RESPONSE_LIMIT);
+        let conf = PluginCalloutConf::new("a", upstreams, timeout, timeout, RESPONSE_LIMIT);
         let headers = pairs(&post_to_authz());
         let request = crate::callout::headers::callout_request_header("a", &headers, body.len());
         AcceptedCallout {
@@ -326,6 +326,7 @@ mod tests {
             request: Box::new(request.unwrap()),
             body: Bytes::from_static(body.as_bytes()),
             timeout,
+            callback: None,
         }
     }
 

@@ -21,13 +21,14 @@ use crate::callout::{
     AcceptedCallout, CalloutResult, CalloutSender, CalloutUpstreams, PendingResult,
     StaticCalloutUpstreams,
 };
+use crate::invalid_conf;
 use crate::observability::{CalloutFailure, LogCrateSink, NoMetricSink, WasmMetricSink};
 use crate::properties::WasmProperties;
 use futures::FutureExt;
 use log::warn;
 use pingora_core::connectors::http::Connector;
-use pingora_error::{Error, ErrorType, Result};
-use proxy_wasm_host::abi::v0_2_1::LogSink;
+use pingora_error::Result;
+use proxy_wasm_host::abi::v0_2_1::{Callback, LogSink};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -66,7 +67,8 @@ pub struct WasmServices {
     /// A callout over this limit is not sent, and its plugin receives a 503 response instead.
     /// The limit must be at least 1 and no greater than `tokio::sync::Semaphore::MAX_PERMITS`.
     pub max_callouts_in_flight: usize,
-    /// The sink for metrics defined by plugins and for reports of failed callouts.
+    /// The sink for metrics defined by plugins and for reports of failed callouts, plugin
+    /// failures, and replaced guests.
     ///
     /// The default sink publishes nothing. When you replace a runtime to reload plugins, pass
     /// the same sink to the new one.
@@ -74,9 +76,12 @@ pub struct WasmServices {
     /// Properties for values of your proxy that never change, such as `node.metadata.NAME`.
     /// Default empty.
     ///
-    /// Every plugin can read them, including from `proxy_on_configure`. A plugin can override a
-    /// fixed property for its own request with `proxy_set_property`, which a property set with
-    /// [WasmCtx::set_property](crate::WasmCtx::set_property) does not allow.
+    /// Every plugin can read them, including from `proxy_on_configure`. A plugin cannot override
+    /// a fixed property. During a request, its `proxy_set_property` call on a fixed path still
+    /// succeeds, since the Rust SDK panics on any other status, but the plugin reads the fixed
+    /// value back. [WasmCtx::guest_property](crate::WasmCtx::guest_property) returns what the
+    /// plugin wrote. Outside of a request, e.g. in `proxy_on_configure` or `proxy_on_tick`,
+    /// `proxy_set_property` fails for every path.
     pub fixed_properties: WasmProperties,
 }
 
@@ -127,10 +132,10 @@ impl CalloutLauncher {
         limit: usize,
     ) -> Result<Self> {
         if limit == 0 || limit > Semaphore::MAX_PERMITS {
-            return Error::e_explain(
-                ErrorType::InternalError,
-                format!("invalid max_callouts_in_flight {limit} in wasm services"),
-            );
+            return Err(invalid_conf(format!(
+                "invalid max_callouts_in_flight {limit} in wasm services, must be 1 to {}",
+                Semaphore::MAX_PERMITS
+            )));
         }
         Ok(CalloutLauncher {
             senders,
@@ -177,7 +182,10 @@ impl CalloutLauncher {
             return Some(PendingResult::Known(CalloutResult::overflow_response()));
         };
         let Ok(tokio_runtime) = Handle::try_current() else {
-            warn!("wasm plugin {plugin_name}: callout dropped, no tokio runtime is running");
+            let callback = callout
+                .callback
+                .map_or("an unknown callback", Callback::export_name);
+            warn!("wasm plugin {plugin_name}: callout from {callback} dropped, no tokio runtime is running");
             self.metric_sink
                 .callout_failed(&plugin_name, CalloutFailure::TaskFailed);
             return None;

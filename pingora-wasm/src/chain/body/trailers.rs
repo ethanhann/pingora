@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::chain::slot::LockedSlot;
+use crate::chain::failure::FilterFailure;
 use crate::chain::wait::{CalloutWaitOutcome, PausedPhase};
 use crate::chain::{ResponseProgress, WasmCtx};
 use crate::stream_state::ResponseTrailers;
@@ -22,10 +22,14 @@ use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_error::Result;
 use pingora_proxy::Session;
 use proxy_wasm_host::abi::v0_2_1::types::StreamType;
+use proxy_wasm_host::abi::v0_2_1::Callback;
 use proxy_wasm_host::HeaderMap;
 use std::mem;
 
-const PAUSED_THE_TRAILERS: &str = "paused on response trailers with no callout pending";
+fn trailer_pause_failure() -> FilterFailure {
+    let what = "paused on response trailers with no callout pending";
+    FilterFailure::paused(Callback::ResponseTrailers, what)
+}
 
 impl WasmCtx {
     /// Run `proxy_on_response_trailers` for each plugin, in reverse chain order.
@@ -46,10 +50,20 @@ impl WasmCtx {
     ///
     /// # Errors
     ///
-    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if a plugin traps or otherwise fails,
-    /// if a plugin sends its own response, or if a plugin pauses with no callout pending. Pingora
-    /// only logs an error from `response_trailer_filter` and still sends the trailers, so end the
-    /// response in your filter if they must not go out.
+    /// For a plugin with [FailPolicy::Closed](crate::FailPolicy::Closed), returns
+    /// [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if the plugin traps or otherwise fails,
+    /// pauses with no callout pending, waits for callouts longer than its
+    /// [callout_wait_limit](crate::WasmPluginConf::callout_wait_limit), or lost the guest holding
+    /// this request. A plugin with [FailPolicy::Open](crate::FailPolicy::Open) is skipped
+    /// instead. A change it made to the response body no longer prevents that, because the
+    /// trailers end the response. A change to a request body that is still being sent upstream
+    /// does. See [fail_policy](crate::WasmPluginConf::fail_policy) for the full rule.
+    ///
+    /// Under both policies, the same error is returned if a plugin sends its own response, or if
+    /// an earlier filter of this request was cancelled while a plugin was waiting for a callout.
+    ///
+    /// Pingora only logs an error from `response_trailer_filter` and still sends the trailers, so
+    /// end the response in your filter if they must not go out.
     ///
     /// If a plugin was holding body bytes, the failure is logged and the bytes are returned
     /// instead of the error, so the downstream still gets the whole body.
@@ -63,6 +77,7 @@ impl WasmCtx {
         {
             return Ok(None);
         }
+        self.failures.response_body_ended = true;
         let mut passed = self.refuse_after_cancelled_wait();
         if passed.is_ok() && self.chain.phases.response_trailers {
             self.chain.runtime.start_threads()?;
@@ -71,7 +86,7 @@ impl WasmCtx {
         match (passed, self.release_held()) {
             (Err(e), None) => Err(e),
             (Err(e), held) => {
-                error!("{e}");
+                error!("response trailer filter failed, held body bytes sent in place of the trailers: {e}");
                 Ok(held)
             }
             (Ok(()), held) => Ok(held),
@@ -83,8 +98,9 @@ impl WasmCtx {
     ///
     /// # Errors
     ///
-    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if a callback fails, if a plugin sends
-    /// its own response, or if a plugin is still paused with no callout left to wait for.
+    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if a plugin sends its own response.
+    /// The same error is returned if a callback fails, or if a plugin is still paused with no
+    /// callout left to wait for, unless the plugin's fail policy lets it be skipped.
     async fn run_trailer_callbacks<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -96,20 +112,23 @@ impl WasmCtx {
         {
             let phase = PausedPhase::ResponseTrailers(&mut *trailers);
             match self.wait_for_callouts(session, position, phase).await? {
-                CalloutWaitOutcome::Continued => remaining = position,
+                CalloutWaitOutcome::Continued | CalloutWaitOutcome::PluginSkipped => {}
                 CalloutWaitOutcome::StillPaused => {
-                    return Err(self.plugin_error(position, PAUSED_THE_TRAILERS))
+                    self.skip_plugin_or_fail_request(position, trailer_pause_failure())?;
                 }
-                CalloutWaitOutcome::Respond(_) => return Err(self.late_response_error(position)),
+                CalloutWaitOutcome::Respond(_) => {
+                    return Err(self.late_response_error(position, Callback::ResponseTrailers))
+                }
             }
+            remaining = position;
         }
         Ok(())
     }
 
     /// Run the trailer callbacks of the plugins at positions below `remaining`, in reverse order.
     ///
-    /// Returns the position of a plugin that paused with a callout pending, or `None` once every
-    /// plugin has run.
+    /// Returns the position of a plugin that paused with a callout pending, or `None` once the
+    /// pass is over.
     fn run_trailer_callbacks_before<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -122,10 +141,15 @@ impl WasmCtx {
                 continue;
             };
             let pool = &runtime.pools[self.chain.plugins[position]];
-            if !pool.phases.trailers {
+            if !pool.phases.trailers || self.is_skipped(position) {
                 continue;
             }
-            let mut locked = LockedSlot::of_request(pool, &record)?;
+            let callback = Callback::ResponseTrailers;
+            let Some(mut locked) =
+                self.lock_slot_or_skip_plugin(pool, position, &record, callback)?
+            else {
+                continue;
+            };
             let loaded = locked.loaded()?;
             let map = ResponseTrailers::new(mem::take(trailers));
             let count = u32::try_from(map.len()).unwrap_or(u32::MAX);
@@ -134,21 +158,24 @@ impl WasmCtx {
             let action = self.run_for_context(loaded, record.context, |scope| {
                 scope.on_response_trailers(record.context, count)
             });
-            self.request_out(session.req_header_mut());
+            self.request_out(position, session.req_header_mut());
             if let Some(map) = self.stream().trailers.take() {
                 *trailers = map.trailers;
             }
             let sent = self.stream().plugin_response.take();
             let action = match action {
                 Ok(action) => action,
-                Err(e) => return Err(locked.guest_failure("proxy_on_response_trailers failed", e)),
+                Err(e) => {
+                    self.guest_call_failed(position, locked, Callback::ResponseTrailers, e)?;
+                    continue;
+                }
             };
             drop(locked);
             let paused =
                 sent.is_none() && self.plugin_stays_paused(action, StreamType::HttpResponse);
             self.start_callouts(position, paused);
             if sent.is_some() {
-                return Err(self.late_response_error(position));
+                return Err(self.late_response_error(position, Callback::ResponseTrailers));
             }
             if !paused {
                 continue;
@@ -156,7 +183,7 @@ impl WasmCtx {
             if self.waits_for_callout(position) {
                 return Ok(Some(position));
             }
-            return Err(self.plugin_error(position, PAUSED_THE_TRAILERS));
+            self.skip_plugin_or_fail_request(position, trailer_pause_failure())?;
         }
         Ok(None)
     }

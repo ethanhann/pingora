@@ -18,6 +18,7 @@
 //! through. The helpers here run that response past the plugin that sent it and the plugins ahead
 //! of it in the chain, and write it to the downstream.
 
+use super::failure::FilterFailure;
 use super::response::{frame_if_length_removed, ResponseSource};
 use super::{ResponseProgress, WasmCtx};
 use crate::stream_state::PluginResponse;
@@ -28,6 +29,7 @@ use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_error::{Error, ErrorType, Result};
 use pingora_http::ResponseHeader;
 use pingora_proxy::Session;
+use proxy_wasm_host::abi::v0_2_1::Callback;
 
 impl WasmCtx {
     /// Return `true` if a plugin sent its own response to this request.
@@ -56,6 +58,7 @@ impl WasmCtx {
         header: &mut ResponseHeader,
         no_body: bool,
     ) -> Result<()> {
+        self.failures.plugin_response_started = true;
         let end_of_stream = no_body || session.req_header().method == Method::HEAD;
         let had_length = header.headers.contains_key(CONTENT_LENGTH);
         let positions = (0..=position).rev();
@@ -81,7 +84,7 @@ impl WasmCtx {
         response: PluginResponse,
     ) -> Box<Error> {
         if self.response_progress != ResponseProgress::NotStarted {
-            return self.late_response_error(position);
+            return self.late_response_error(position, Callback::RequestBody);
         }
         let mut header = response.header;
         let no_body = response.body.is_empty();
@@ -127,12 +130,16 @@ impl WasmCtx {
         )
     }
 
-    /// Build the error for a plugin response sent too late to replace the response header.
-    pub(super) fn late_response_error(&self, position: usize) -> Box<Error> {
-        self.plugin_error(
-            position,
-            "response rejected, sent after the response header",
-        )
+    /// Report a response the plugin at `position` sent too late and return its error.
+    ///
+    /// The response was sent from `callback` after the response header had been processed, so it
+    /// cannot replace that header. This fails the request under both fail policies.
+    pub(super) fn late_response_error(
+        &mut self,
+        position: usize,
+        callback: Callback,
+    ) -> Box<Error> {
+        self.failed_request_error(position, FilterFailure::late_response(callback))
     }
 }
 

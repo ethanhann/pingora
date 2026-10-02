@@ -82,9 +82,16 @@ impl Callouts for GuestCalloutService {
     ) -> Result<(), HttpCallRefusal> {
         let plugin = &self.conf.plugin_name;
         let mut call_in_progress = self.call_in_progress.lock();
-        if call_in_progress.calling_context != Some(call.context) {
-            warn!("wasm plugin {plugin}: callout rejected, not sent from the context of the current callback");
-            return Err(HttpCallRefusal::Failed);
+        match call_in_progress.calling_context {
+            Some(context) if context == call.context => {}
+            Some(_) => {
+                warn!("wasm plugin {plugin}: callout rejected, not sent from the context of the current callback");
+                return Err(HttpCallRefusal::Failed);
+            }
+            None => {
+                warn!("wasm plugin {plugin}: callout rejected, sent outside of a plugin callback");
+                return Err(HttpCallRefusal::Failed);
+            }
         }
         let upstream = std::str::from_utf8(&request.upstream)
             .ok()
@@ -95,8 +102,12 @@ impl Callouts for GuestCalloutService {
             return Err(HttpCallRefusal::UnknownUpstream);
         };
         let header = callout_request_header(plugin, &request.headers, request.body.len());
-        let Some(header) = header else {
-            return Err(HttpCallRefusal::UnknownUpstream);
+        let header = match header {
+            Ok(header) => header,
+            Err(rejected) => {
+                self.conf.warn_of_rejected_header_once(&rejected);
+                return Err(HttpCallRefusal::UnknownUpstream);
+            }
         };
         if !request.trailers.is_empty() {
             debug!("wasm plugin {plugin}: callout trailers dropped, not supported");
@@ -108,6 +119,7 @@ impl Callouts for GuestCalloutService {
             request: Box::new(header),
             body: Bytes::copy_from_slice(&request.body),
             timeout: self.conf.effective_timeout(request.timeout),
+            callback: call.callback,
         });
         Ok(())
     }
@@ -127,12 +139,16 @@ mod tests {
         ContextId::try_from(id).unwrap()
     }
 
-    fn authz_service() -> GuestCalloutService {
+    fn service_of_plugin(plugin_name: &str) -> GuestCalloutService {
         let mut upstreams = StaticCalloutUpstreams::new();
         upstreams.insert("authz", HttpPeer::new("127.0.0.1:1", false, String::new()));
         let limit = Duration::from_secs(10);
-        let conf = PluginCalloutConf::new("a", Arc::new(upstreams), limit, 1024);
+        let conf = PluginCalloutConf::new(plugin_name, Arc::new(upstreams), limit, limit, 1024);
         GuestCalloutService::new(Arc::new(conf))
+    }
+
+    fn authz_service() -> GuestCalloutService {
+        service_of_plugin("a")
     }
 
     fn call_to(upstream: &'static [u8]) -> HttpCall<'static> {
@@ -182,6 +198,7 @@ mod tests {
             "refused-plugin",
             Arc::new(StaticCalloutUpstreams::new()),
             Duration::from_secs(10),
+            Duration::from_secs(10),
             1024,
         );
         let service = GuestCalloutService::new(Arc::new(conf));
@@ -214,7 +231,8 @@ mod tests {
 
     #[test]
     fn service_rejects_callout_outside_guest_call() {
-        let service = authz_service();
+        record_crate_logs();
+        let service = service_of_plugin("outside-call");
 
         let before = send_from(&service, 2, call_to(b"authz"));
         service.record_callouts(context(2), || ());
@@ -222,6 +240,29 @@ mod tests {
 
         assert_eq!(before, Err(HttpCallRefusal::Failed));
         assert_eq!(after, Err(HttpCallRefusal::Failed));
+        let lines = crate_log_lines_with("wasm plugin outside-call:");
+        let want = "wasm plugin outside-call: callout rejected, sent outside of a plugin callback";
+        assert_eq!(lines, [want, want]);
+    }
+
+    #[test]
+    fn rejected_callout_header_warns_once_per_plugin() {
+        record_crate_logs();
+        let service = service_of_plugin("bad-header");
+        let mut headers = post_to_authz();
+        headers.push(("bad name", "value"));
+
+        let refusals = [(); 2].map(|()| {
+            let request = HttpCall::new(&b"authz"[..]).with_headers(pairs(&headers));
+            let send = || send_from(&service, 2, request);
+            service.record_callouts(context(2), send).0
+        });
+
+        assert_eq!(refusals, [Err(HttpCallRefusal::UnknownUpstream); 2]);
+        let lines = crate_log_lines_with("wasm plugin bad-header:");
+        let want = "wasm plugin bad-header: callout rejected, header bad name is invalid, \
+                    further occurrences are not logged";
+        assert_eq!(lines, [want]);
     }
 
     #[test]

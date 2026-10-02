@@ -34,6 +34,7 @@ tracing = { version = "0.1", features = ["log"] }
 futures = { workspace = true }
 once_cell = { workspace = true }
 prometheus = "0.14"
+serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
 pingora-load-balancing = { version = "0.9.0", path = "../pingora-load-balancing", default-features = false }
@@ -44,6 +45,7 @@ h2 = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["http2"] }
 wat = "1"
 env_logger = "0.11"
+serde_yaml = "0.9"
 
 [features]
 default = []

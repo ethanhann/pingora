@@ -37,23 +37,35 @@ pub(super) struct Registrant {
 pub(super) struct QueueRegistrations {
     registrants: HashMap<QueueId, Vec<Registrant>>,
     pending_items: HashMap<QueueId, usize>,
+    /// The name each queue was registered with, for log messages.
+    names: HashMap<QueueId, String>,
 }
 
 impl QueueRegistrations {
     /// Register `root` of the guest at `address` as the latest registrant of `queue`.
     ///
     /// Any earlier registration from the same slot is replaced. Returns the number of pending
-    /// items, which this registrant now receives, and resets that count.
+    /// items, which this registrant now receives, and resets that count. `name` is kept for log
+    /// messages the first time the queue is registered.
     pub(super) fn register(
         &mut self,
         queue: QueueId,
+        name: &[u8],
         address: GuestAddress,
         root: ContextId,
     ) -> usize {
+        self.names
+            .entry(queue)
+            .or_insert_with(|| String::from_utf8_lossy(name).into_owned());
         let registrants = self.registrants.entry(queue).or_default();
         registrants.retain(|r| r.address.slot != address.slot);
         registrants.push(Registrant { address, root });
         self.pending_items.remove(&queue).unwrap_or(0)
+    }
+
+    /// Return the name `queue` was registered with, or `unknown` if no guest registered it.
+    pub(super) fn name(&self, queue: QueueId) -> &str {
+        self.names.get(&queue).map_or("unknown", String::as_str)
     }
 
     /// Return the registrant the next item of `queue` should be delivered to.
@@ -98,7 +110,7 @@ mod tests {
     }
 
     fn register(registrations: &mut QueueRegistrations, registrant: Registrant) -> usize {
-        registrations.register(queue_1(), registrant.address, registrant.root)
+        registrations.register(queue_1(), b"jobs", registrant.address, registrant.root)
     }
 
     #[test]

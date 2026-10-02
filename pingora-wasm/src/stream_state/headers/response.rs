@@ -14,7 +14,10 @@
 
 //! Response header map
 
-use super::{classify, visit_headers, Name, Regular, WriteResult};
+use super::{
+    classify, framing_header_values, framing_headers_differ, visit_headers, Name, Regular,
+    WriteResult,
+};
 use http::header::HeaderValue;
 use pingora_http::ResponseHeader;
 use proxy_wasm_host::{HeaderMap, NotAllowed, PairVisitor};
@@ -24,11 +27,17 @@ use std::ops::ControlFlow;
 /// The response header map exposed to a guest.
 pub(crate) struct ResponseHeaders {
     pub(crate) header: ResponseHeader,
+    /// Whether a guest write through this map changed the value of `content-length` or
+    /// `transfer-encoding`. A write that left both as they were does not set it.
+    pub(crate) length_changed: bool,
 }
 
 impl ResponseHeaders {
     pub(crate) fn new(header: ResponseHeader) -> Self {
-        ResponseHeaders { header }
+        ResponseHeaders {
+            header,
+            length_changed: false,
+        }
     }
 }
 
@@ -68,14 +77,24 @@ impl HeaderMap for ResponseHeaders {
     fn set(&mut self, key: &[u8], value: &[u8]) -> WriteResult {
         match classify_response(key).ok_or(NotAllowed)? {
             Name::Status => set_status(&mut self.header, value),
-            Name::Regular(_) => self.header.insert(key, value),
+            Name::Regular(_) => {
+                let before = framing_header_values(&self.header.headers, key);
+                self.header.insert(key, value)?;
+                self.length_changed |= before != framing_header_values(&self.header.headers, key);
+                Ok(())
+            }
             _ => Err(NotAllowed),
         }
     }
 
     fn add(&mut self, key: &[u8], value: &[u8]) -> WriteResult {
         match classify_response(key).ok_or(NotAllowed)? {
-            Name::Regular(_) => self.header.append(key, value),
+            Name::Regular(_) => {
+                let before = framing_header_values(&self.header.headers, key);
+                self.header.append(key, value)?;
+                self.length_changed |= before != framing_header_values(&self.header.headers, key);
+                Ok(())
+            }
             _ => Err(NotAllowed),
         }
     }
@@ -83,7 +102,9 @@ impl HeaderMap for ResponseHeaders {
     fn remove(&mut self, key: &[u8]) -> WriteResult {
         match classify_response(key).ok_or(NotAllowed)? {
             Name::Regular(name) => {
+                let before = framing_header_values(&self.header.headers, key);
                 self.header.remove(name);
+                self.length_changed |= before != framing_header_values(&self.header.headers, key);
                 Ok(())
             }
             _ => Err(NotAllowed),
@@ -100,6 +121,7 @@ impl HeaderMap for ResponseHeaders {
                 _ => return Err(NotAllowed),
             }
         }
+        self.length_changed |= framing_headers_differ(&self.header.headers, &next.headers);
         self.header = next;
         Ok(())
     }

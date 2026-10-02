@@ -47,9 +47,10 @@ struct PendingCallout {
 pub(crate) struct RequestCallouts {
     accepted: Vec<AcceptedCallout>,
     pending: Vec<PendingCallout>,
-    /// Whether a phase is waiting for a callout result. This is left `true` if the phase's
-    /// future is dropped mid-wait, which makes the following phases fail the request.
-    pub(crate) in_callout_wait: bool,
+    /// The chain position of the plugin a filter is waiting on for a callout result. This is
+    /// left set if the filter's future is dropped mid-wait, which makes the following filters
+    /// fail the request.
+    pub(crate) waiting_position: Option<usize>,
 }
 
 impl RequestCallouts {

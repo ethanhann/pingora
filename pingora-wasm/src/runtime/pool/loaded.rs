@@ -34,6 +34,7 @@ struct HeldContext {
 
 /// A started guest with its plugin's root context and its callout service.
 pub(crate) struct Loaded {
+    pub(crate) plugin_name: Arc<str>,
     pub(crate) guest: Guest,
     pub(crate) root: ContextId,
     pub(crate) callout_service: Arc<GuestCalloutService>,
@@ -46,6 +47,7 @@ pub(crate) struct Loaded {
 
 impl Loaded {
     pub(crate) fn new(
+        plugin_name: Arc<str>,
         guest: Guest,
         root: ContextId,
         callout_service: Arc<GuestCalloutService>,
@@ -53,6 +55,7 @@ impl Loaded {
         held_context_count: Arc<AtomicUsize>,
     ) -> Self {
         Loaded {
+            plugin_name,
             guest,
             root,
             callout_service,

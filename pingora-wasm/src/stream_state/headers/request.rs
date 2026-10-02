@@ -20,7 +20,10 @@
 //! reported as `:authority` instead, as Proxy-Wasm plugins expect. Reading or setting `host` by
 //! name acts on `:authority`.
 
-use super::{classify, value_of, visit_headers, Name, Regular, WriteResult};
+use super::{
+    classify, framing_header_values, framing_headers_differ, value_of, visit_headers, Name,
+    Regular, WriteResult,
+};
 use http::header::{HeaderValue, HOST};
 use http::uri::{Authority, PathAndQuery, Scheme};
 use http::{Method, Uri, Version};
@@ -32,12 +35,19 @@ use std::ops::ControlFlow;
 /// The request header map exposed to a guest.
 pub(crate) struct RequestHeaders {
     pub(crate) header: RequestHeader,
+    /// Whether a guest write through this map changed the value of `content-length` or
+    /// `transfer-encoding`. A write that left both as they were does not set it.
+    pub(crate) length_changed: bool,
     scheme: Scheme,
 }
 
 impl RequestHeaders {
     pub(crate) fn new(header: RequestHeader, scheme: Scheme) -> Self {
-        RequestHeaders { header, scheme }
+        RequestHeaders {
+            header,
+            length_changed: false,
+            scheme,
+        }
     }
 
     pub(crate) fn scheme(&self) -> &Scheme {
@@ -155,14 +165,24 @@ impl HeaderMap for RequestHeaders {
 
     fn set(&mut self, key: &[u8], value: &[u8]) -> WriteResult {
         match classify(key).ok_or(NotAllowed)? {
-            Name::Regular(_) => self.header.insert(key, value),
+            Name::Regular(_) => {
+                let before = framing_header_values(&self.header.headers, key);
+                self.header.insert(key, value)?;
+                self.length_changed |= before != framing_header_values(&self.header.headers, key);
+                Ok(())
+            }
             name => set_request_pseudo(&mut self.header, self.scheme.as_str(), name, value),
         }
     }
 
     fn add(&mut self, key: &[u8], value: &[u8]) -> WriteResult {
         match classify(key).ok_or(NotAllowed)? {
-            Name::Regular(_) => self.header.append(key, value),
+            Name::Regular(_) => {
+                let before = framing_header_values(&self.header.headers, key);
+                self.header.append(key, value)?;
+                self.length_changed |= before != framing_header_values(&self.header.headers, key);
+                Ok(())
+            }
             _ => Err(NotAllowed),
         }
     }
@@ -170,7 +190,9 @@ impl HeaderMap for RequestHeaders {
     fn remove(&mut self, key: &[u8]) -> WriteResult {
         match classify(key).ok_or(NotAllowed)? {
             Name::Regular(name) => {
+                let before = framing_header_values(&self.header.headers, key);
                 self.header.remove(name);
+                self.length_changed |= before != framing_header_values(&self.header.headers, key);
                 Ok(())
             }
             _ => Err(NotAllowed),
@@ -186,6 +208,7 @@ impl HeaderMap for RequestHeaders {
                 name => set_request_pseudo(&mut next, self.scheme.as_str(), name, value)?,
             }
         }
+        self.length_changed |= framing_headers_differ(&self.header.headers, &next.headers);
         self.header = next;
         Ok(())
     }
@@ -204,6 +227,32 @@ mod tests {
         }
         header.insert_header("X-Trace", "abc").unwrap();
         RequestHeaders::new(header, Scheme::HTTP)
+    }
+
+    #[test]
+    fn length_change_is_recorded_only_when_framing_header_differs() {
+        type Write = fn(&mut RequestHeaders) -> WriteResult;
+        let writes: [(&str, Write, bool); 5] = [
+            ("same value", |map| map.set(b"content-length", b"5"), false),
+            (
+                "absent header removed",
+                |map| map.remove(b"transfer-encoding"),
+                false,
+            ),
+            ("other header", |map| map.set(b"x-trace", b"new"), false),
+            ("new value", |map| map.set(b"Content-Length", b"6"), true),
+            ("header removed", |map| map.remove(b"content-length"), true),
+        ];
+
+        for (case, write, changed) in writes {
+            let mut map = request("POST", b"/", Some("example.test"));
+            map.header.insert_header("content-length", "5").unwrap();
+
+            let result = write(&mut map);
+
+            assert_eq!(result, Ok(()), "{case}");
+            assert_eq!(map.length_changed, changed, "{case}");
+        }
     }
 
     #[test]

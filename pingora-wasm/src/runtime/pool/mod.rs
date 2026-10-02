@@ -20,23 +20,25 @@
 pub(crate) mod events;
 mod guest_start;
 mod loaded;
+mod rebuild;
+mod warning_rate_limit;
 
 pub(crate) use loaded::Loaded;
 
 use crate::callout::PluginCalloutConf;
-use crate::plugin_unavailable;
+use crate::observability::WasmMetricSink;
 use crate::root_callbacks::RootCallbackPluginState;
+use crate::runtime::FailPolicy;
 use events::RootCallbackSender;
 use guest_start::StartedGuest;
-use log::{error, info, warn};
+use log::info;
 use parking_lot::{Mutex, MutexGuard};
 use pingora_error::Result;
 use proxy_wasm_host::abi::v0_2_1::{Callback, GuestError, GuestId, GuestSpec, PluginConfig};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-const REBUILD_BACKOFF: Duration = Duration::from_secs(1);
+use std::time::Instant;
+use warning_rate_limit::WarningRateLimit;
 
 /// The body and trailer phases a plugin runs in, and its body limits.
 #[derive(Debug, Clone, Copy)]
@@ -92,20 +94,26 @@ pub(crate) struct GuestPoolConf {
     pub(crate) plugin_config: PluginConfig,
     pub(crate) slot_count: usize,
     pub(crate) phases: PluginPhases,
+    pub(crate) fail_policy: FailPolicy,
     pub(crate) callout_conf: PluginCalloutConf,
+    pub(crate) metric_sink: Arc<dyn WasmMetricSink>,
     pub(crate) root_callback_plugin: Arc<RootCallbackPluginState>,
     pub(crate) root_callback_sender: RootCallbackSender,
 }
 
 pub(crate) struct GuestPool {
-    pub(crate) name: String,
+    pub(crate) name: Arc<str>,
     pub(crate) phases: PluginPhases,
+    pub(crate) fail_policy: FailPolicy,
     pub(crate) callout_conf: Arc<PluginCalloutConf>,
     pool_index: usize,
     spec: GuestSpec,
     plugin: PluginConfig,
     root_callback_plugin: Arc<RootCallbackPluginState>,
     root_callback_sender: RootCallbackSender,
+    metric_sink: Arc<dyn WasmMetricSink>,
+    replaced_guest_warnings: WarningRateLimit,
+    pub(crate) skipped_plugin_warnings: WarningRateLimit,
     next: AtomicUsize,
     slots: Vec<Slot>,
 }
@@ -114,14 +122,18 @@ impl GuestPool {
     pub(crate) fn new(conf: GuestPoolConf) -> Result<Self> {
         let mut phases = conf.phases;
         let mut pool = GuestPool {
-            name: conf.name,
+            name: conf.name.into(),
             phases,
+            fail_policy: conf.fail_policy,
             callout_conf: Arc::new(conf.callout_conf),
             pool_index: conf.pool_index,
             spec: conf.spec,
             plugin: conf.plugin_config,
             root_callback_plugin: conf.root_callback_plugin,
             root_callback_sender: conf.root_callback_sender,
+            metric_sink: conf.metric_sink,
+            replaced_guest_warnings: WarningRateLimit::default(),
+            skipped_plugin_warnings: WarningRateLimit::default(),
             next: AtomicUsize::new(0),
             slots: (0..conf.slot_count).map(|_| Slot::default()).collect(),
         };
@@ -138,7 +150,12 @@ impl GuestPool {
             phases.trailers &= exports(Callback::ResponseTrailers);
         }
         pool.phases = phases;
-        info!("wasm plugin {}: runs on {}", pool.name, phases.list());
+        info!(
+            "wasm plugin {}: runs on {}, fail policy {}",
+            pool.name,
+            phases.list(),
+            pool.fail_policy
+        );
         Ok(pool)
     }
 
@@ -148,17 +165,15 @@ impl GuestPool {
     /// one slot that lost its guest is rebuilt if its backoff has elapsed. Otherwise this blocks
     /// until a slot with a guest is unlocked.
     ///
-    /// # Errors
-    ///
-    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if no slot has a guest.
-    pub(crate) fn pick(&self) -> Result<(usize, SlotGuard<'_>)> {
+    /// Returns `None` if no slot has a guest.
+    pub(crate) fn pick(&self) -> Option<(usize, SlotGuard<'_>)> {
         let count = self.slots.len();
         let first = self.next.fetch_add(1, Ordering::Relaxed) % count;
         let order = || (0..count).map(move |i| (first + i) % count);
         for index in order() {
             if let Some(guard) = self.slots[index].guest.try_lock() {
                 if guard.is_some() {
-                    return Ok((index, guard));
+                    return Some((index, guard));
                 }
             }
         }
@@ -166,17 +181,17 @@ impl GuestPool {
             self.rebuild(index, None);
             if let Some(guard) = self.slots[index].guest.try_lock() {
                 if guard.is_some() {
-                    return Ok((index, guard));
+                    return Some((index, guard));
                 }
             }
         }
         for index in order() {
             let guard = self.slots[index].guest.lock();
             if guard.is_some() {
-                return Ok((index, guard));
+                return Some((index, guard));
             }
         }
-        Err(plugin_unavailable(&self.name, "no guest available"))
+        None
     }
 
     /// Try to lock the slot holding `guest` without blocking.
@@ -227,50 +242,6 @@ impl GuestPool {
         drop(guard);
         self.rebuild(index, Some(err));
         true
-    }
-
-    fn rebuild_due(&self, index: usize) -> bool {
-        let slot = &self.slots[index];
-        let due = slot
-            .failed_at
-            .lock()
-            .is_none_or(|at| at.elapsed() >= REBUILD_BACKOFF);
-        due && slot.guest.try_lock().is_some_and(|guard| guard.is_none())
-    }
-
-    /// Start a new guest in an empty slot.
-    ///
-    /// `failure` is the error that emptied the slot when the rebuild immediately follows it, and
-    /// is only used for logging. A failed rebuild starts the slot's backoff.
-    fn rebuild(&self, index: usize, failure: Option<&GuestError>) {
-        let slot = &self.slots[index];
-        let name = &self.name;
-        match self.start_guest(index) {
-            Ok(started) => {
-                let mut guard = slot.guest.lock();
-                if guard.is_none() {
-                    slot.open.store(0, Ordering::Relaxed);
-                    slot.held.store(0, Ordering::Relaxed);
-                    install_started_guest(&mut guard, started);
-                    *slot.failed_at.lock() = None;
-                    match failure {
-                        Some(failure) => warn!(
-                            "wasm plugin {name}: guest in slot {index} replaced after failure: {failure}"
-                        ),
-                        None => warn!("wasm plugin {name}: guest in slot {index} rebuilt"),
-                    }
-                }
-            }
-            Err(e) => {
-                *slot.failed_at.lock() = Some(Instant::now());
-                match failure {
-                    Some(failure) => error!(
-                        "wasm plugin {name}: guest in slot {index} lost after failure: {failure}, rebuild failed: {e}"
-                    ),
-                    None => error!("wasm plugin {name}: failed to rebuild slot {index}: {e}"),
-                }
-            }
-        }
     }
 
     pub(crate) fn opened(&self, index: usize) {
@@ -337,9 +308,13 @@ mod tests {
         }
     }
 
-    use crate::test_support::{body_plugin, fixture, plugin, Wat, CONTINUE, HOLD};
-    use crate::WasmRuntime;
+    use crate::test_support::{
+        body_plugin, crate_log_lines_with, fixture, plugin, record_crate_logs, RecordedFailures,
+        Wat, CONTINUE, HOLD,
+    };
+    use crate::{WasmRuntime, WasmServices};
     use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn phase_list_has_headers_and_enabled_phases() {
@@ -416,7 +391,7 @@ mod tests {
         let busy = pool.lock_slot(1);
 
         let picked = thread::scope(|scope| {
-            let picker = scope.spawn(|| pool.pick().map(|(slot, _)| slot).ok());
+            let picker = scope.spawn(|| pool.pick().map(|(slot, _)| slot));
             thread::sleep(Duration::from_millis(50));
             drop(busy);
             picker.join().unwrap()
@@ -424,6 +399,42 @@ mod tests {
 
         assert_eq!(picked, Some(1));
         assert!(pool.lock_slot(0).is_none());
+    }
+
+    #[test]
+    fn replaced_guests_are_counted_and_warn_once() {
+        record_crate_logs();
+        let reports = Arc::new(RecordedFailures::default());
+        let services = WasmServices {
+            metric_sink: reports.clone(),
+            ..WasmServices::default()
+        };
+        let conf = plugin("replaced-thrice", fixture("add-request-header"), 1);
+        let runtime = WasmRuntime::new_with_services(vec![conf], services).unwrap();
+
+        for _ in 0..3 {
+            runtime.inner.pools[0].replace_slot(0);
+        }
+
+        assert_eq!(reports.replaced_guests(), ["replaced-thrice"; 3]);
+        let lines = crate_log_lines_with("wasm plugin replaced-thrice: guest");
+        assert_eq!(
+            lines,
+            ["wasm plugin replaced-thrice: guest in slot 0 rebuilt"]
+        );
+    }
+
+    #[test]
+    fn start_line_has_phases_and_fail_policy() {
+        record_crate_logs();
+        let mut conf = body_plugin("start-line", Wat::response_body(HOLD));
+        conf.fail_policy = FailPolicy::Open;
+
+        let _runtime = WasmRuntime::new(vec![conf]).unwrap();
+
+        let lines = crate_log_lines_with("wasm plugin start-line: runs on");
+        let want = "wasm plugin start-line: runs on headers, response bodies, fail policy open";
+        assert_eq!(lines, [want]);
     }
 
     #[test]

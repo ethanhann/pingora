@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::body::{HeldBodies, RequestBodyState};
+use super::body::{BodyDirection, HeldBodies, RequestBodyState};
+use super::failure::FailPolicyRecord;
 use super::logging::finish;
 use super::slot::LockedSlot;
 use super::WasmChain;
@@ -66,6 +67,7 @@ pub struct WasmCtx {
     pub(super) request_body: RequestBodyState,
     pub(super) held: HeldBodies,
     pub(super) callouts: RequestCallouts,
+    pub(super) failures: FailPolicyRecord,
     stream: PingoraStream,
     spare_request: Option<RequestHeader>,
     spare_response: Option<ResponseHeader>,
@@ -90,6 +92,7 @@ impl WasmCtx {
             request_body: RequestBodyState::new(),
             held: HeldBodies::default(),
             callouts: RequestCallouts::default(),
+            failures: FailPolicyRecord::default(),
             chain,
             records,
             scheme: Scheme::HTTP,
@@ -121,6 +124,7 @@ impl WasmCtx {
         body: impl FnOnce(&mut CallScope<'_, PingoraStream>) -> R,
     ) -> R {
         self.stream.clear_continue_requests();
+        self.stream.plugin_name = loaded.plugin_name.clone();
         let service = loaded.callout_service.clone();
         let guest_call = || self.run(&mut loaded.guest, body);
         let (result, accepted) = service.record_callouts(context, guest_call);
@@ -179,8 +183,15 @@ impl WasmCtx {
     }
 
     /// Move the request header back into the session, keeping the placeholder for reuse.
-    pub(crate) fn request_out(&mut self, header: &mut RequestHeader) {
+    ///
+    /// If a write by the plugin at `position` changed the value of `content-length` or
+    /// `transfer-encoding` of the request, that is recorded as a change to the request body. A
+    /// write that left both headers as they were does not count.
+    pub(crate) fn request_out(&mut self, position: usize, header: &mut RequestHeader) {
         if let Some(request) = self.stream.request.take() {
+            if request.length_changed {
+                self.record_body_change(BodyDirection::Request, position);
+            }
             self.spare_request = Some(mem::replace(header, request.header));
         }
     }
@@ -194,8 +205,16 @@ impl WasmCtx {
         self.stream.response = Some(ResponseHeaders::new(response));
     }
 
-    pub(crate) fn response_out(&mut self, header: &mut ResponseHeader) {
+    /// Move the response header back into `header`, keeping the placeholder for reuse.
+    ///
+    /// If a write by the plugin at `position` changed the value of `content-length` or
+    /// `transfer-encoding` of the response, that is recorded as a change to the response body. A
+    /// write that left both headers as they were does not count.
+    pub(crate) fn response_out(&mut self, position: usize, header: &mut ResponseHeader) {
         if let Some(response) = self.stream.response.take() {
+            if response.length_changed {
+                self.record_body_change(BodyDirection::Response, position);
+            }
             self.spare_response = Some(mem::replace(header, response.header));
         }
     }
@@ -219,12 +238,16 @@ impl Drop for WasmCtx {
     fn drop(&mut self) {
         let runtime = self.chain.runtime.clone();
         self.callouts.clear();
+        // `logging` takes every record, so an open one means the request ended without it
+        if self.records.iter().any(Option::is_some) {
+            self.log_bytes_still_held();
+        }
         for position in (0..self.records.len()).rev() {
             let Some(record) = self.records[position].take() else {
                 continue;
             };
             let pool = &runtime.pools[self.chain.plugins[position]];
-            let Ok(mut locked) = LockedSlot::of_request(pool, &record) else {
+            let Some(mut locked) = LockedSlot::of_request(pool, &record) else {
                 continue;
             };
             let Ok(loaded) = locked.loaded() else {
@@ -308,7 +331,7 @@ mod tests {
 
         ctx.request_in(&mut session_header);
         let during = session_header.raw_path().to_vec();
-        ctx.request_out(&mut session_header);
+        ctx.request_out(0, &mut session_header);
 
         assert_eq!(during, b"/");
         assert_eq!(session_header.method, http::Method::POST);

@@ -15,6 +15,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use pingora_core::protocols::Digest;
+use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{Error, Result};
@@ -22,7 +23,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use pingora_wasm::{
     write_plugin_response, PrometheusMetricSink, RequestOutcome, StaticCalloutUpstreams, WasmChain,
-    WasmCtx, WasmPluginConf, WasmRuntime, WasmServices,
+    WasmConf, WasmCtx, WasmPluginConf, WasmRuntime, WasmServices,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,6 +36,8 @@ const DEFAULT_PLUGIN: &str = concat!(
 
 const BODY_FLAG: &str = "--body";
 const CALLOUT_UPSTREAM_FLAG: &str = "--callout-upstream";
+const CONF_FLAG: &str = "--conf";
+const DEFAULT_CHAIN: &str = "default";
 
 pub struct PluginProxy {
     chain: WasmChain,
@@ -141,32 +144,8 @@ impl ProxyHttp for PluginProxy {
     }
 }
 
-// RUST_LOG=INFO cargo run --example wasm_proxy -- tests/fixtures/add-request-header.wasm
-// curl 127.0.0.1:6190/headers
-//
-// Plugins you list after --body also run on request bodies, response bodies, and response trailers
-// RUST_LOG=INFO cargo run --example wasm_proxy -- --body tests/fixtures/sdk-http-body.wasm
-// curl -d 'a secret' 127.0.0.1:6190/anything
-//
-// Use --callout-upstream name=address to tell the proxy where callouts to an upstream name go
-// RUST_LOG=INFO cargo run --example wasm_proxy -- --callout-upstream httpbin=127.0.0.1:8080 \
-//     tests/fixtures/sdk-http-auth-random.wasm
-// curl -i 127.0.0.1:6190/headers
-//
-// A failing plugin is also logged as a warning by the proxy_wasm_host crate. You can silence
-// that with RUST_LOG=info,proxy_wasm_host=error
-//
-// Plugin metrics are served at 127.0.0.1:6192/metrics
-fn main() {
-    env_logger::init();
-
-    let mut my_server = Server::new(None).unwrap();
-    my_server.bootstrap();
-
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() {
-        args.push(DEFAULT_PLUGIN.into());
-    }
+/// Build the runtime and a chain of the plugins listed on the command line.
+fn runtime_and_chain_from_args(args: &[String], slots: usize) -> (WasmRuntime, WasmChain) {
     // Body phases cost a plugin call per chunk, so only enable them for plugins that need the body
     let mut body = false;
     let mut plugins = Vec::new();
@@ -190,7 +169,7 @@ fn main() {
         let path = PathBuf::from(arg);
         let name = path.file_stem().unwrap().to_string_lossy();
         let mut plugin = WasmPluginConf::new(name, &path);
-        plugin.slots = my_server.configuration.threads;
+        plugin.slots = slots;
         plugin.request_body = body;
         plugin.response_body = body;
         plugin.response_trailers = body;
@@ -200,10 +179,79 @@ fn main() {
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let mut services = WasmServices::default();
     services.callout_upstreams = Arc::new(upstreams);
-    let registry = pingora_prometheus::prometheus::default_registry().clone();
-    services.metric_sink = Arc::new(PrometheusMetricSink::new(registry).unwrap());
+    services.metric_sink = prometheus_sink();
     let runtime = WasmRuntime::new_with_services(plugins, services).unwrap();
     let chain = runtime.chain(&names).unwrap();
+    (runtime, chain)
+}
+
+/// Build the runtime and the `default` chain from a YAML file.
+fn runtime_and_chain_from_conf(path: &str) -> (WasmRuntime, WasmChain) {
+    let yaml = std::fs::read_to_string(path).expect("conf file should be readable");
+    let conf: WasmConf = serde_yaml::from_str(&yaml).expect("conf file should be valid");
+    let mut services = conf.services();
+    services.metric_sink = prometheus_sink();
+    let runtime = WasmRuntime::new_with_services(conf.plugins.clone(), services).unwrap();
+    let chain = runtime
+        .chain(&conf.chain_plugins(DEFAULT_CHAIN).unwrap())
+        .unwrap();
+    (runtime, chain)
+}
+
+fn prometheus_sink() -> Arc<PrometheusMetricSink> {
+    let registry = pingora_prometheus::prometheus::default_registry().clone();
+    Arc::new(PrometheusMetricSink::new(registry).unwrap())
+}
+
+// RUST_LOG=INFO cargo run --example wasm_proxy -- tests/fixtures/add-request-header.wasm
+// curl 127.0.0.1:6190/headers
+//
+// Plugins you list after --body also run on request bodies, response bodies, and response trailers
+// RUST_LOG=INFO cargo run --example wasm_proxy -- --body tests/fixtures/sdk-http-body.wasm
+// curl -d 'a secret' 127.0.0.1:6190/anything
+//
+// Use --callout-upstream name=address to tell the proxy where callouts to an upstream name go
+// RUST_LOG=INFO cargo run --example wasm_proxy -- --callout-upstream httpbin=127.0.0.1:8080 \
+//     tests/fixtures/sdk-http-auth-random.wasm
+// curl -i 127.0.0.1:6190/headers
+//
+// With --conf and a YAML file as the only arguments, the plugins and the chain are read from
+// that file, and Pingora reads its own settings from it as well
+// RUST_LOG=INFO cargo run --example wasm_proxy -- --conf examples/wasm_proxy.yaml
+// curl -d 'a secret' 127.0.0.1:6190/anything
+//
+// A failing plugin is also logged as a warning by the proxy_wasm_host crate. You can silence
+// that with RUST_LOG=info,proxy_wasm_host=error
+//
+// Plugin metrics are served at 127.0.0.1:6192/metrics
+fn main() {
+    env_logger::init();
+
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let conf_path = match &args[..] {
+        [flag, path] if flag == CONF_FLAG => Some(path.clone()),
+        _ if args.iter().any(|arg| arg == CONF_FLAG) => {
+            panic!("--conf takes one file and cannot be combined with other arguments")
+        }
+        _ => None,
+    };
+    let opt = Opt {
+        conf: conf_path.clone(),
+        ..Opt::default()
+    };
+    let mut my_server = Server::new(Some(opt)).unwrap();
+    my_server.bootstrap();
+
+    let slots = my_server.configuration.threads;
+    let (_runtime, chain) = match conf_path {
+        Some(path) => runtime_and_chain_from_conf(&path),
+        None => {
+            if args.is_empty() {
+                args.push(DEFAULT_PLUGIN.into());
+            }
+            runtime_and_chain_from_args(&args, slots)
+        }
+    };
 
     let mut my_proxy =
         pingora_proxy::http_proxy_service(&my_server.configuration, PluginProxy { chain });

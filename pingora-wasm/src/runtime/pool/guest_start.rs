@@ -21,8 +21,8 @@ use super::events::{GuestAddress, RootCallbackLink, SlotIndex};
 use super::{GuestPool, Loaded};
 use crate::callout::{AcceptedCallout, GuestCalloutService};
 use crate::root_callbacks::RootStream;
-use crate::{plugin_failure, plugin_unavailable};
-use pingora_error::Result;
+use crate::{invalid_conf, ERR_INVALID_CONF};
+use pingora_error::{Error, Result};
 use proxy_wasm_host::abi::v0_2_1::{Callback, GuestError};
 use std::sync::Arc;
 
@@ -39,6 +39,14 @@ enum StartOutcome {
 }
 
 impl GuestPool {
+    /// Build the [ERR_INVALID_CONF] error for a guest that failed to start.
+    ///
+    /// `what` is the part of the message after the plugin name.
+    fn guest_start_error(&self, detail: &str, cause: GuestError) -> Box<Error> {
+        let context = format!("wasm plugin {}: {detail}", self.name);
+        Error::because(ERR_INVALID_CONF, context, cause)
+    }
+
     /// Build a guest for `slot` and start it.
     ///
     /// Startup runs under the root stream state, which lets the plugin read the fixed properties
@@ -46,14 +54,14 @@ impl GuestPool {
     ///
     /// # Errors
     ///
-    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if the guest cannot be built, if
-    /// creating the root context or one of the two callbacks fails, or if one of the callbacks
-    /// returns `false`.
+    /// Returns [ERR_INVALID_CONF] if the guest cannot be built, if creating the root context or
+    /// one of the two callbacks fails, or if one of the callbacks returns `false`. A rebuild gets
+    /// the same error type, but only logs it.
     pub(super) fn start_guest(&self, slot: usize) -> Result<StartedGuest> {
         let mut guest = self
             .spec
             .build()
-            .map_err(|e| plugin_failure(&self.name, "failed to build guest", e))?;
+            .map_err(|e| self.guest_start_error("failed to build guest", e))?;
         // Callout ids are only unique within a guest, so every guest gets its own service
         let callout_service = Arc::new(GuestCalloutService::new(self.callout_conf.clone()));
         let services = guest
@@ -64,20 +72,21 @@ impl GuestPool {
         let mut scope = guest.enter(RootStream::new(self.root_callback_plugin.clone()));
         let root = match scope.on_context_create(None) {
             Ok(root) => root,
-            Err(e) => {
-                return Err(plugin_failure(
-                    &self.name,
-                    "failed to create root context",
-                    e,
-                ))
-            }
+            Err(e) => return Err(self.guest_start_error("failed to create root context", e)),
         };
         let plugin = self.plugin.clone();
         let (outcome, root_callouts) = callout_service.record_callouts(root, || {
-            if !scope.on_vm_start(root)? {
-                return Ok::<_, GuestError>(StartOutcome::Refused(Callback::VmStart));
+            let failed_in = |callback| move |e: GuestError| (callback, e);
+            if !scope
+                .on_vm_start(root)
+                .map_err(failed_in(Callback::VmStart))?
+            {
+                return Ok(StartOutcome::Refused(Callback::VmStart));
             }
-            if !scope.on_configure(root, plugin)? {
+            if !scope
+                .on_configure(root, plugin)
+                .map_err(failed_in(Callback::Configure))?
+            {
                 return Ok(StartOutcome::Refused(Callback::Configure));
             }
             Ok(StartOutcome::Started)
@@ -86,12 +95,15 @@ impl GuestPool {
         match outcome {
             Ok(StartOutcome::Started) => {}
             Ok(StartOutcome::Refused(callback)) => {
-                return Err(plugin_unavailable(
-                    &self.name,
-                    &format!("{callback} returned false, guest not started"),
-                ))
+                return Err(invalid_conf(format!(
+                    "wasm plugin {}: {callback} returned false, guest not started",
+                    self.name
+                )))
             }
-            Err(e) => return Err(plugin_failure(&self.name, "guest failed to start", e)),
+            Err((callback, e)) => {
+                let what = format!("{callback} failed, guest not started");
+                return Err(self.guest_start_error(&what, e));
+            }
         }
         let address = GuestAddress {
             slot: SlotIndex {
@@ -106,7 +118,7 @@ impl GuestPool {
             self.root_callback_sender.clone(),
         );
         let held = self.slots[slot].held.clone();
-        let loaded = Loaded::new(guest, root, callout_service, link, held);
+        let loaded = Loaded::new(self.name.clone(), guest, root, callout_service, link, held);
         Ok(StartedGuest {
             loaded,
             root_callouts,

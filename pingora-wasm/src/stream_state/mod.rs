@@ -40,6 +40,8 @@ use std::sync::Arc;
 /// them back out afterwards.
 #[derive(Default)]
 pub(crate) struct PingoraStream {
+    /// The plugin whose callback is running, for log messages.
+    pub(crate) plugin_name: Arc<str>,
     pub(crate) request: Option<RequestHeaders>,
     pub(crate) response: Option<ResponseHeaders>,
     pub(crate) trailers: Option<ResponseTrailers>,
@@ -186,15 +188,16 @@ impl StreamState for PingoraStream {
             return Err(Status::Unimplemented);
         }
         let plugin_response = PluginResponse::build(&response).ok_or(Status::BadArgument)?;
+        let plugin = &self.plugin_name;
         if !response.status_code_details.is_empty() {
             debug!(
-                "wasm plugin response {}: {}",
+                "wasm plugin {plugin}: sent a {} response with details: {}",
                 response.status_code,
                 String::from_utf8_lossy(&response.status_code_details)
             );
         }
         if let Some(grpc_status) = response.grpc_status {
-            warn!("gRPC status {grpc_status} of a wasm plugin response dropped, not supported");
+            warn!("wasm plugin {plugin}: gRPC status {grpc_status} of its response dropped, not supported");
         }
         self.plugin_response = Some(plugin_response);
         Ok(())
@@ -219,8 +222,8 @@ impl StreamState for PingoraStream {
         if write_built_in_property(key, &self.request_facts, &headers, out) {
             return Ok(());
         }
-        let stored = self.guest_properties.get_joined(key);
-        match stored.or_else(|| self.fixed_properties.get_joined(key)) {
+        let fixed = self.fixed_properties.get_joined(key);
+        match fixed.or_else(|| self.guest_properties.get_joined(key)) {
             Some(value) => {
                 out.extend_from_slice(value);
                 Ok(())
@@ -229,9 +232,9 @@ impl StreamState for PingoraStream {
         }
     }
 
-    // Always returns `Ok`, even for a path the proxy or a built-in property already provides,
+    // Always returns `Ok`, even for a path a proxy, built-in, or fixed property already provides,
     // because a guest built with the Rust SDK panics on any other status. Reads of such a path
-    // keep returning the proxy's or the built-in value.
+    // keep returning the value the proxy or the runtime provides.
     fn set_property(
         &mut self,
         _call: Invocation,
@@ -549,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn guest_property_write_cannot_shadow_proxy_or_built_in_value() {
+    fn guest_property_write_cannot_shadow_proxy_built_in_or_fixed_value() {
         let mut stream = stream(false);
         stream
             .proxy_properties
@@ -558,10 +561,11 @@ mod tests {
         fixed.insert(&["node", "name"], "edge-1");
         stream.fixed_properties = Arc::new(fixed);
         let call = call(Callback::RequestHeaders);
-        let paths: [[&[u8]; 2]; 3] = [
+        let paths: [[&[u8]; 2]; 4] = [
             [b"xds", b"route_name"],
             [b"request", b"method"],
             [b"node", b"name"],
+            [b"plugin", b"note"],
         ];
 
         let writes = paths.map(|path| stream.set_property(call, &path, b"guest"));
@@ -570,9 +574,12 @@ mod tests {
             let mut value = Vec::new();
             stream.property(call, &path, &mut value).map(|()| value)
         };
-        assert_eq!(writes, [Ok(()), Ok(()), Ok(())]);
+        assert_eq!(writes, [Ok(()); 4]);
         assert_eq!(read(paths[0]), Ok(b"checkout".to_vec()));
         assert_eq!(read(paths[1]), Ok(b"GET".to_vec()));
-        assert_eq!(read(paths[2]), Ok(b"guest".to_vec()));
+        assert_eq!(read(paths[2]), Ok(b"edge-1".to_vec()));
+        assert_eq!(read(paths[3]), Ok(b"guest".to_vec()));
+        let written_over_fixed = stream.guest_properties.get(&["node", "name"]);
+        assert_eq!(written_over_fixed, Some(&b"guest"[..]));
     }
 }

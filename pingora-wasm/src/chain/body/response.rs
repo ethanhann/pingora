@@ -18,6 +18,7 @@ use bytes::Bytes;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_error::Result;
 use pingora_proxy::Session;
+use proxy_wasm_host::abi::v0_2_1::Callback;
 
 impl WasmCtx {
     /// Run `proxy_on_response_body` for each plugin, in reverse chain order.
@@ -45,14 +46,23 @@ impl WasmCtx {
     ///
     /// # Errors
     ///
-    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if a plugin traps or otherwise fails,
-    /// if a plugin pauses on the last chunk of the body and does not continue, or if a plugin
-    /// sends its own response. The same error is returned if an earlier phase of this request was
-    /// cancelled while a plugin was waiting for a callout. Returns
-    /// [ERR_RESPONSE_BODY_TOO_LARGE](crate::ERR_RESPONSE_BODY_TOO_LARGE) if a plugin holds more
-    /// bytes than its limit. Pingora has usually sent the response header before this phase, so
-    /// after an error the downstream receives a response that ends early. If the header has not
-    /// been sent yet, the default `fail_to_proxy` responds with the status of the error.
+    /// For a plugin with [FailPolicy::Closed](crate::FailPolicy::Closed), returns
+    /// [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if the plugin traps or otherwise fails,
+    /// pauses on the last chunk of the body and does not continue, waits for callouts longer than
+    /// its [callout_wait_limit](crate::WasmPluginConf::callout_wait_limit), or lost the guest
+    /// holding this request. A plugin with [FailPolicy::Open](crate::FailPolicy::Open) is skipped
+    /// instead, unless it has already changed the body or the length of a response that has a
+    /// body, or a request body that can still have bytes to come. See
+    /// [fail_policy](crate::WasmPluginConf::fail_policy) for the full rule.
+    ///
+    /// Under both policies, the same error is returned if a plugin sends its own response, or if
+    /// an earlier filter of this request was cancelled while a plugin was waiting for a callout.
+    /// Returns [ERR_RESPONSE_BODY_TOO_LARGE](crate::ERR_RESPONSE_BODY_TOO_LARGE) if a plugin
+    /// holds more bytes than its limit.
+    ///
+    /// Pingora has usually sent the response header before this phase, so after an error the
+    /// downstream receives a response that ends early. If the header has not been sent yet, the
+    /// default `fail_to_proxy` responds with the status of the error.
     pub async fn response_body_filter<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -73,10 +83,13 @@ impl WasmCtx {
             .await?;
         match outcome {
             BodyOutcome::Released(output) => {
+                self.failures.response_body_ended |= end_of_stream;
                 *body = filter_output(output, end_of_stream);
                 Ok(())
             }
-            BodyOutcome::Respond(position, _) => Err(self.late_response_error(position)),
+            BodyOutcome::Respond(position, _) => {
+                Err(self.late_response_error(position, Callback::ResponseBody))
+            }
         }
     }
 }

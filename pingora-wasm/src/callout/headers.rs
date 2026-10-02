@@ -19,11 +19,12 @@ use http::Method;
 use log::debug;
 use pingora_http::RequestHeader;
 use proxy_wasm_host::abi::v0_2_1::HeaderPairs;
+use std::fmt;
 
-const PSEUDO_PREFIX: &[u8] = b":";
-const PSEUDO_AUTHORITY: &[u8] = b":authority";
-const PSEUDO_METHOD: &[u8] = b":method";
-const PSEUDO_PATH: &[u8] = b":path";
+const PSEUDO_PREFIX: &str = ":";
+const PSEUDO_AUTHORITY: &str = ":authority";
+const PSEUDO_METHOD: &str = ":method";
+const PSEUDO_PATH: &str = ":path";
 const KEEP_ALIVE: &str = "keep-alive";
 const PROXY_CONNECTION: &str = "proxy-connection";
 
@@ -34,6 +35,29 @@ fn is_framing_or_hop_header(name: &HeaderName) -> bool {
         || name == PROXY_CONNECTION
 }
 
+/// The header at fault when a callout's header pairs cannot be turned into a request header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RejectedCalloutHeader {
+    MissingPseudo(&'static str),
+    InvalidPseudo(&'static str),
+    /// A regular header with an invalid name or value. Only its name is kept.
+    InvalidRegular(String),
+}
+
+impl fmt::Display for RejectedCalloutHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RejectedCalloutHeader::MissingPseudo(name) => {
+                write!(f, "pseudo-header {name} is missing")
+            }
+            RejectedCalloutHeader::InvalidPseudo(name) => {
+                write!(f, "pseudo-header {name} is invalid")
+            }
+            RejectedCalloutHeader::InvalidRegular(name) => write!(f, "header {name} is invalid"),
+        }
+    }
+}
+
 /// Build the request header for a callout from the header pairs `plugin` passed.
 ///
 /// The method, path, and `host` are taken from the `:method`, `:path`, and `:authority`
@@ -41,39 +65,51 @@ fn is_framing_or_hop_header(name: &HeaderName) -> bool {
 /// dropped, as are framing and hop-by-hop headers. `content-length` is set from `body_len` when
 /// the callout has a body, so a plugin cannot frame the body any other way.
 ///
-/// Returns `None` if one of the three pseudo-headers is missing or a header is invalid.
+/// # Errors
+///
+/// Returns the header at fault if one of the three pseudo-headers is missing or a header is
+/// invalid. A header value is never part of the error, since it can be a credential.
 pub(crate) fn callout_request_header(
     plugin: &str,
     pairs: &HeaderPairs<'_>,
     body_len: usize,
-) -> Option<RequestHeader> {
-    let pseudo_header = |name: &[u8]| {
+) -> Result<RequestHeader, RejectedCalloutHeader> {
+    use RejectedCalloutHeader::{InvalidPseudo, InvalidRegular, MissingPseudo};
+    let pseudo_header = |name: &'static str| {
         pairs
             .iter()
-            .find(|(key, _)| key.as_ref() == name)
+            .find(|(key, _)| key.as_ref() == name.as_bytes())
             .map(|(_, value)| value.as_ref())
+            .ok_or(MissingPseudo(name))
     };
-    let method = Method::from_bytes(pseudo_header(PSEUDO_METHOD)?).ok()?;
+    let method = Method::from_bytes(pseudo_header(PSEUDO_METHOD)?)
+        .map_err(|_| InvalidPseudo(PSEUDO_METHOD))?;
     let path = pseudo_header(PSEUDO_PATH)?;
-    let mut request = RequestHeader::build(method, path, Some(pairs.len())).ok()?;
+    let mut request = RequestHeader::build(method, path, Some(pairs.len()))
+        .map_err(|_| InvalidPseudo(PSEUDO_PATH))?;
     request
         .insert_header(HOST, pseudo_header(PSEUDO_AUTHORITY)?)
-        .ok()?;
+        .map_err(|_| InvalidPseudo(PSEUDO_AUTHORITY))?;
     for (key, value) in pairs {
-        if key.starts_with(PSEUDO_PREFIX) {
+        if key.starts_with(PSEUDO_PREFIX.as_bytes()) {
             continue;
         }
-        let name = HeaderName::from_bytes(key).ok()?;
+        let invalid = || InvalidRegular(String::from_utf8_lossy(key).into_owned());
+        let name = HeaderName::from_bytes(key).map_err(|_| invalid())?;
         if name == HOST || is_framing_or_hop_header(&name) {
             debug!("wasm plugin {plugin}: callout header {name} dropped, host, framing, and hop-by-hop headers are not forwarded");
             continue;
         }
-        request.append_header(name, value.as_ref()).ok()?;
+        request
+            .append_header(name, value.as_ref())
+            .map_err(|_| invalid())?;
     }
     if body_len > 0 {
-        request.insert_header(CONTENT_LENGTH, body_len).ok()?;
+        request
+            .insert_header(CONTENT_LENGTH, body_len)
+            .map_err(|_| InvalidRegular(CONTENT_LENGTH.to_string()))?;
     }
-    Some(request)
+    Ok(request)
 }
 
 #[cfg(test)]
@@ -141,12 +177,22 @@ pub(crate) mod tests {
     fn callout_request_rejects_invalid_headers() {
         let mut bad_name = post_to_authz();
         bad_name.push(("bad name", "value"));
+        let mut bad_value = post_to_authz();
+        bad_value.push(("x-token", "line\nbreak"));
         let mut bad_method = post_to_authz();
         bad_method[0] = (":method", "NOT A TOKEN");
-        let cases = [bad_name, bad_method];
+        let no_authority = post_to_authz()[..2].to_vec();
+        let cases = [
+            (bad_name, "header bad name is invalid"),
+            (bad_value, "header x-token is invalid"),
+            (bad_method, "pseudo-header :method is invalid"),
+            (no_authority, "pseudo-header :authority is missing"),
+        ];
 
-        let built = cases.map(|headers| callout_request_header("a", &pairs(&headers), 0));
+        for (headers, rejected) in cases {
+            let built = callout_request_header("a", &pairs(&headers), 0);
 
-        assert!(built.iter().all(Option::is_none));
+            assert_eq!(built.unwrap_err().to_string(), rejected);
+        }
     }
 }

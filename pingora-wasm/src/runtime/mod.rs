@@ -19,12 +19,14 @@
 
 mod build;
 use build::{build_pool, checked_plugin_indexes, new_shared_store, PoolInputs};
+mod fail_policy;
 mod plugin;
 pub(crate) mod pool;
 mod services;
 mod shared_store;
 mod ticker;
 
+pub use fail_policy::FailPolicy;
 pub use plugin::WasmPluginConf;
 pub use services::WasmServices;
 pub(crate) use services::{CalloutLauncher, CalloutSenders};
@@ -33,11 +35,13 @@ pub(crate) use services::{CalloutLauncher, CalloutSenders};
 use crate::callout::CalloutSender;
 use crate::callout::ConnectorSender;
 use crate::chain::WasmChain;
+use crate::invalid_conf;
+use crate::observability::WasmMetricSink;
 use crate::properties::WasmProperties;
 use crate::root_callbacks::RootCallbackThread;
 use once_cell::sync::OnceCell;
 use pingora_core::connectors::http::Connector;
-use pingora_error::{Error, ErrorType, OrErr, Result};
+use pingora_error::{ErrorType, OrErr, Result};
 use pool::GuestPool;
 use proxy_wasm_host::abi::v0_2_1::Host;
 use proxy_wasm_host::{Engine, EngineConfig};
@@ -67,6 +71,7 @@ pub(crate) struct RuntimeInner {
     pub(crate) callout_launcher: CalloutLauncher,
     pub(crate) root_callback_thread: RootCallbackThread,
     pub(crate) fixed_properties: Arc<WasmProperties>,
+    pub(crate) metric_sink: Arc<dyn WasmMetricSink>,
     names: HashMap<String, usize>,
 }
 
@@ -78,13 +83,18 @@ impl WasmRuntime {
     ///
     /// # Errors
     ///
-    /// Returns an error if `plugins` is empty or two plugins have the same name. Also returns an
-    /// error, with the plugin's name in its message, if a plugin's file cannot be read or is not
-    /// a supported Proxy-Wasm module, if the plugin traps or otherwise fails during startup, if
-    /// its `proxy_on_vm_start` or `proxy_on_configure` returns `false`, or if its configuration
-    /// is invalid. A configuration is invalid when [slots](WasmPluginConf::slots) is zero, when
-    /// [limits](WasmPluginConf::limits) sets a fuel limit, or when one of the body or callout
-    /// limits is zero.
+    /// Returns [ERR_INVALID_CONF](crate::ERR_INVALID_CONF) if `plugins` is empty or two plugins
+    /// have the same name. The same error, with the plugin's name in its message, is returned
+    /// if a plugin's file cannot be read or is not a supported Proxy-Wasm module, if the plugin
+    /// traps or otherwise fails during startup, if its `proxy_on_vm_start` or
+    /// `proxy_on_configure` returns `false`, or if its configuration is invalid. A configuration
+    /// is invalid when [slots](WasmPluginConf::slots) is zero, when
+    /// [limits](WasmPluginConf::limits) sets a fuel limit, when one of the body or callout limits
+    /// is zero, or when [callout_wait_limit](WasmPluginConf::callout_wait_limit) is less than
+    /// [callout_timeout_limit](WasmPluginConf::callout_timeout_limit). A plugin's
+    /// [fail_policy](WasmPluginConf::fail_policy) has no effect on these errors.
+    ///
+    /// Returns `InternalError` if the wasm engine cannot be built.
     pub fn new(plugins: Vec<WasmPluginConf>) -> Result<Self> {
         Self::new_with_services(plugins, WasmServices::default())
     }
@@ -97,7 +107,8 @@ impl WasmRuntime {
     ///
     /// # Errors
     ///
-    /// Returns the same errors as [WasmRuntime::new]. Also returns an error if
+    /// Returns the same errors as [WasmRuntime::new]. Also returns
+    /// [ERR_INVALID_CONF](crate::ERR_INVALID_CONF) if
     /// [max_callouts_in_flight](WasmServices::max_callouts_in_flight) is zero or greater than
     /// `tokio::sync::Semaphore::MAX_PERMITS`.
     pub fn new_with_services(plugins: Vec<WasmPluginConf>, services: WasmServices) -> Result<Self> {
@@ -155,7 +166,8 @@ impl WasmRuntime {
             "failed to link the Proxy-Wasm host functions",
         )?;
         let root_callback_thread = RootCallbackThread::new();
-        let shared_store = new_shared_store(&root_callback_thread, services.metric_sink.clone());
+        let metric_sink = services.metric_sink;
+        let shared_store = new_shared_store(&root_callback_thread, metric_sink.clone());
         let fixed_properties = Arc::new(services.fixed_properties);
         let inputs = PoolInputs {
             engine: &engine,
@@ -163,6 +175,7 @@ impl WasmRuntime {
             log_sink: services.log_sink,
             shared_store,
             upstreams: services.callout_upstreams,
+            metric_sink: metric_sink.clone(),
             fixed_properties: fixed_properties.clone(),
             root_callback_thread: &root_callback_thread,
         };
@@ -181,6 +194,7 @@ impl WasmRuntime {
                 callout_launcher,
                 root_callback_thread,
                 fixed_properties,
+                metric_sink,
                 names,
             }),
         })
@@ -193,28 +207,23 @@ impl WasmRuntime {
     ///
     /// # Errors
     ///
-    /// Returns an error if `names` is empty, if a name does not belong to a plugin of this
-    /// runtime, or if a name is listed more than once.
+    /// Returns [ERR_INVALID_CONF](crate::ERR_INVALID_CONF) if `names` is empty, if a name does
+    /// not belong to a plugin of this runtime, or if a name is listed more than once.
     pub fn chain(&self, names: &[&str]) -> Result<WasmChain> {
         if names.is_empty() {
-            return Error::e_explain(
-                ErrorType::InternalError,
-                "wasm chain needs at least one plugin",
-            );
+            return Err(invalid_conf("wasm chain needs at least one plugin"));
         }
         let mut plugins = Vec::with_capacity(names.len());
         for name in names {
             let Some(index) = self.inner.names.get(*name) else {
-                return Error::e_explain(
-                    ErrorType::InternalError,
-                    format!("wasm plugin {name}: not in the runtime"),
-                );
+                return Err(invalid_conf(format!(
+                    "wasm plugin {name}: not in the runtime"
+                )));
             };
             if plugins.contains(index) {
-                return Error::e_explain(
-                    ErrorType::InternalError,
-                    format!("wasm plugin {name}: listed twice in the chain"),
-                );
+                return Err(invalid_conf(format!(
+                    "wasm plugin {name}: listed twice in the chain"
+                )));
             }
             plugins.push(*index);
         }
@@ -275,7 +284,7 @@ impl RuntimeInner {
     }
 
     pub(crate) fn plugin_names(&self) -> Vec<&str> {
-        self.pools.iter().map(|pool| pool.name.as_str()).collect()
+        self.pools.iter().map(|pool| &*pool.name).collect()
     }
 }
 
@@ -283,6 +292,7 @@ impl RuntimeInner {
 mod tests {
     use super::*;
     use crate::test_support::{fixture, plugin, wat_guest, Wat};
+    use crate::ERR_INVALID_CONF;
     use proxy_wasm_host::abi::v0_2_1::types::LogLevel;
     use proxy_wasm_host::abi::v0_2_1::{LogContext, LogSink};
     use proxy_wasm_host::Limits;
@@ -302,12 +312,11 @@ mod tests {
                 .err()
                 .unwrap();
 
-            assert!(err.to_string().contains("max_callouts_in_flight"), "{err}");
+            assert_eq!(err.etype(), &ERR_INVALID_CONF);
+            let message =
+                format!("invalid max_callouts_in_flight {limit} in wasm services, must be 1 to");
+            assert!(err.to_string().contains(&message), "{err}");
         }
-    }
-
-    fn refusal(plugins: Vec<WasmPluginConf>) -> String {
-        WasmRuntime::new(plugins).err().unwrap().to_string()
     }
 
     #[test]
@@ -316,6 +325,13 @@ mod tests {
         std::fs::write(&text, "not wasm").unwrap();
         let mut fuel = plugin("fuel", fixture("add-request-header"), 1);
         fuel.limits = Limits::default().with_fuel(10);
+        let refuses_configuration = Wat {
+            configure: "i32.const 0",
+            ..Wat::default()
+        };
+        let path = wat_guest("refused-open", refuses_configuration);
+        let mut refused_under_open = plugin("refused-open", path, 1);
+        refused_under_open.fail_policy = FailPolicy::Open;
         let cases = [
             (vec![], "wasm runtime needs at least one plugin"),
             (
@@ -378,13 +394,33 @@ mod tests {
                     ),
                     1,
                 )],
-                "trapped: guest failed to start",
+                "trapped: proxy_on_vm_start failed, guest not started",
+            ),
+            (
+                vec![plugin(
+                    "unconfigured",
+                    wat_guest(
+                        "unconfigured",
+                        Wat {
+                            configure: "unreachable",
+                            ..Wat::default()
+                        },
+                    ),
+                    1,
+                )],
+                "unconfigured: proxy_on_configure failed, guest not started",
+            ),
+            (
+                vec![refused_under_open],
+                "refused-open: proxy_on_configure returned false, guest not started",
             ),
         ];
 
         for (plugins, message) in cases {
-            let err = refusal(plugins);
+            let err = WasmRuntime::new(plugins).err().unwrap();
 
+            assert_eq!(err.etype(), &ERR_INVALID_CONF, "{message}");
+            let err = err.to_string();
             assert!(err.contains(message), "{message} not found in {err}");
         }
     }
@@ -396,9 +432,11 @@ mod tests {
 
         let errors: Vec<_> = [&[][..], &["missing"][..], &["a", "a"][..]]
             .iter()
-            .map(|names| runtime.chain(names).err().unwrap().to_string())
+            .map(|names| runtime.chain(names).err().unwrap())
             .collect();
 
+        assert!(errors.iter().all(|e| e.etype() == &ERR_INVALID_CONF));
+        let errors: Vec<_> = errors.iter().map(ToString::to_string).collect();
         assert!(errors[0].contains("wasm chain needs at least one plugin"));
         assert!(errors[1].contains("wasm plugin missing: not in the runtime"));
         assert!(errors[2].contains("wasm plugin a: listed twice in the chain"));

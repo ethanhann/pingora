@@ -21,18 +21,23 @@ mod delivery;
 
 pub(super) use delivery::PausedPhase;
 
+use super::failure::FilterFailure;
 use super::WasmCtx;
 use crate::callout::CalloutResult;
 use crate::stream_state::PluginResponse;
-use crate::ERR_PLUGIN_FAILED;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_error::{Error, ErrorType, Result};
 use pingora_proxy::Session;
+use pingora_timeout::timeout;
 use proxy_wasm_host::abi::v0_2_1::types::{Action, StreamType};
 use proxy_wasm_host::abi::v0_2_1::CalloutId;
 use std::future::{poll_fn, Future};
 use std::pin::pin;
 use std::task::Poll;
+use std::time::{Duration, Instant};
+
+/// Upper bound on the wait limit that is applied, so that computing the deadline cannot overflow.
+const LONGEST_WAIT_LIMIT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// Outcome of [WasmCtx::wait_for_callouts].
 pub(super) enum CalloutWaitOutcome {
@@ -42,26 +47,28 @@ pub(super) enum CalloutWaitOutcome {
     StillPaused,
     /// The plugin sent its own response.
     Respond(Box<PluginResponse>),
+    /// The plugin failed during the wait and was skipped. The pass continues without it.
+    PluginSkipped,
 }
 
 impl WasmCtx {
-    /// Fail the phase if an earlier phase of this request was cancelled during a callout wait.
+    /// Fail the filter if an earlier filter of this request was cancelled during a callout wait.
     ///
-    /// A phase is cancelled when its future is dropped. If that happened while a plugin was
-    /// waiting for a callout, the plugin is still paused in that phase, so the header, body, and
+    /// A filter is cancelled when its future is dropped. If that happened while a plugin was
+    /// waiting for a callout, the plugin is still paused in that filter, so the header, body, and
     /// trailer filters that follow fail the request. [WasmCtx::logging] still runs.
     ///
     /// # Errors
     ///
-    /// Returns [ERR_PLUGIN_FAILED] if a callout wait was cancelled.
-    pub(super) fn refuse_after_cancelled_wait(&self) -> Result<()> {
-        if self.callouts.in_callout_wait {
-            return Error::e_explain(
-                ERR_PLUGIN_FAILED,
-                "request aborted, an earlier phase was cancelled while a wasm plugin waited for a callout",
-            );
+    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if a callout wait was cancelled.
+    /// The failure is reported for the plugin that was waiting.
+    pub(super) fn refuse_after_cancelled_wait(&mut self) -> Result<()> {
+        match self.callouts.waiting_position {
+            Some(position) => {
+                Err(self.failed_request_error(position, FilterFailure::cancelled_wait()))
+            }
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// Return `true` if the plugin that returned `action` from the last guest call is paused in
@@ -96,44 +103,89 @@ impl WasmCtx {
     /// Deliver pending callout results to the plugin at `position` as they arrive.
     ///
     /// Returns once the plugin continues, sends a response, or has no pending callout left.
-    /// Callouts still pending at that point are no longer waited for. If this future is dropped
-    /// mid-wait, `in_callout_wait` stays set, which is what [Self::refuse_after_cancelled_wait]
-    /// checks.
+    /// Callouts still pending at that point are no longer waited for.
+    ///
+    /// The whole wait is bounded by the plugin's `callout_wait_limit`, or by
+    /// [LONGEST_WAIT_LIMIT] if that is shorter. Running past the limit is a plugin failure, as is
+    /// a failed delivery, and both return [CalloutWaitOutcome::PluginSkipped] if the plugin is
+    /// skipped.
+    ///
+    /// If this future is dropped mid-wait, `waiting_position` stays set, which is what
+    /// [Self::refuse_after_cancelled_wait] checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure's error if the plugin failed and was not skipped. On an HTTP/2
+    /// downstream, also returns an error if the client closes the stream during the wait.
     pub(super) async fn wait_for_callouts<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
         position: usize,
         mut phase: PausedPhase<'_>,
     ) -> Result<CalloutWaitOutcome> {
-        self.callouts.in_callout_wait = true;
-        let outcome = self.deliver_results(session, position, &mut phase).await;
-        self.callouts.in_callout_wait = false;
+        self.callouts.waiting_position = Some(position);
+        let limit = self.pool_at(position).callout_conf.wait_limit;
+        let deadline = Instant::now() + limit.min(LONGEST_WAIT_LIMIT);
+        let delivered = self
+            .deliver_results(session, position, &mut phase, deadline)
+            .await;
+        self.callouts.waiting_position = None;
         self.callouts.forget_pending(position);
-        outcome
+        match delivered? {
+            Some(outcome) => Ok(outcome),
+            None => {
+                let failure = FilterFailure::wait_limit(phase.callback(), limit);
+                self.skip_plugin_or_fail_request(position, failure)?;
+                Ok(CalloutWaitOutcome::PluginSkipped)
+            }
+        }
     }
 
+    /// Deliver callout results until the plugin continues, sends a response, has no callout
+    /// left, or `deadline` passes.
+    ///
+    /// Returns `None` if the deadline passed. The deadline is checked before each wait, because
+    /// the timer is never polled for a result that is ready immediately, such as that of a
+    /// callout over the in-flight limit. The task yields after each delivery for the same reason,
+    /// so a plugin that sends a new callout from every delivery cannot keep the thread to itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure's error if a delivery failed and the plugin was not skipped. On an
+    /// HTTP/2 downstream, also returns an error if the client closes the stream during the wait.
     async fn deliver_results<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
         position: usize,
         phase: &mut PausedPhase<'_>,
-    ) -> Result<CalloutWaitOutcome> {
+        deadline: Instant,
+    ) -> Result<Option<CalloutWaitOutcome>> {
         loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
             let next = self.next_result_or_downstream_close(session, position);
-            let Some((id, result)) = next.await? else {
-                return Ok(CalloutWaitOutcome::StillPaused);
+            let Ok(next) = timeout(remaining, next).await else {
+                return Ok(None);
             };
-            self.deliver_callout_result(session, position, phase, id, &result)?;
+            let Some((id, result)) = next? else {
+                return Ok(Some(CalloutWaitOutcome::StillPaused));
+            };
+            if !self.deliver_callout_result(session, position, phase, id, &result)? {
+                return Ok(Some(CalloutWaitOutcome::PluginSkipped));
+            }
             let sent = self.stream().plugin_response.take();
             let continued = self.stream().continue_requested(phase.direction());
             let paused = sent.is_none() && !continued;
             self.start_callouts(position, paused);
             if let Some(response) = sent {
-                return Ok(CalloutWaitOutcome::Respond(Box::new(response)));
+                return Ok(Some(CalloutWaitOutcome::Respond(Box::new(response))));
             }
             if continued {
-                return Ok(CalloutWaitOutcome::Continued);
+                return Ok(Some(CalloutWaitOutcome::Continued));
             }
+            tokio::task::yield_now().await;
         }
     }
 
@@ -150,6 +202,7 @@ impl WasmCtx {
         session: &mut Session<DS>,
         position: usize,
     ) -> Result<Option<(CalloutId, CalloutResult)>> {
+        let plugin = self.pool_at(position).name.clone();
         let mut result = pin!(self.callouts.next_result(position));
         let Some(stream_close) = session.as_downstream_mut().watch_h2_stream_close() else {
             return Ok(result.await);
@@ -163,7 +216,7 @@ impl WasmCtx {
                 let error = match reason {
                     Ok(reason) => Error::explain(
                         ErrorType::H2Error,
-                        format!("downstream H2 stream closed (reason: {reason}) while a wasm plugin waited for a callout"),
+                        format!("wasm plugin {plugin}: downstream H2 stream closed (reason: {reason}) during a callout wait"),
                     ),
                     Err(e) => e,
                 };
@@ -183,18 +236,20 @@ mod tests {
         CONTINUE_REQUEST_ON_SECOND_DELIVERY, CONTINUE_RESPONSE, CONTINUE_RESPONSE_AND_PAUSE,
         LOG_RESULT, MARK_ASKED_AND_CONTINUE, RELAY_CALLOUT_BODY, STAY_PAUSED, TEAPOT_IF_ASKED,
     };
+    use crate::test_support::phases::{
+        cancel_a_wait_in, plugin_with_callback_in, run_phase, run_request_headers, Phase,
+        PhaseInputs,
+    };
     use crate::test_support::{
         body_chunk, body_plugin, eventually, read_downstream, session, RecordedGuestLogs, Wat,
         CONTINUE, GET, HOLD, MARK_A_REQUEST, MARK_B_REQUEST, MARK_B_RESPONSE, PAUSE, POST,
         REMOVE_LENGTH, SET_TRAILER, TEAPOT, TRAP,
     };
-    use crate::{RequestOutcome, WasmCtx, WasmPluginConf, WasmServices, ERR_PLUGIN_FAILED};
+    use crate::{RequestOutcome, WasmPluginConf, WasmServices, ERR_PLUGIN_FAILED};
     use bytes::Bytes;
     use futures::poll;
     use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
-    use pingora_error::{ErrorType, Result};
-    use pingora_http::ResponseHeader;
-    use pingora_proxy::Session;
+    use pingora_error::ErrorType;
     use std::pin::pin;
     use std::sync::Arc;
     use tokio::sync::Notify;
@@ -202,84 +257,6 @@ mod tests {
     const BOTH_DIRECTIONS: &str = "(call $continue (i32.const 0)) (call $continue (i32.const 1))";
     const CALL_AND_RESPOND: &str =
         "(drop (call $call_authz_and_pause)) (call $respond (i32.const 403))";
-
-    /// The phases after the request headers that `run_phase` can run.
-    #[derive(Debug, Clone, Copy)]
-    enum Phase {
-        RequestBody,
-        ResponseHeaders,
-        ResponseBody,
-        ResponseTrailers,
-    }
-
-    /// The response header, body chunk, and trailers passed to the phases.
-    struct PhaseInputs {
-        response: ResponseHeader,
-        body: Option<Bytes>,
-        trailers: http::HeaderMap,
-    }
-
-    impl PhaseInputs {
-        fn new() -> Self {
-            let mut response = ResponseHeader::build(200, None).unwrap();
-            response.insert_header(CONTENT_LENGTH, 1).unwrap();
-            PhaseInputs {
-                response,
-                body: body_chunk("x"),
-                trailers: http::HeaderMap::new(),
-            }
-        }
-    }
-
-    /// Run the request header phase and record the first upstream attempt.
-    async fn run_request_headers(ctx: &mut WasmCtx, session: &mut Session) {
-        ctx.request_filter(session).await.unwrap();
-        ctx.upstream_attempt();
-    }
-
-    /// Run `phase` once on `inputs`, with a body chunk passed as the last one.
-    async fn run_phase(
-        ctx: &mut WasmCtx,
-        session: &mut Session,
-        phase: Phase,
-        inputs: &mut PhaseInputs,
-    ) -> Result<()> {
-        let PhaseInputs {
-            response,
-            body,
-            trailers,
-        } = inputs;
-        match phase {
-            Phase::RequestBody => ctx.request_body_filter(session, body, true).await,
-            Phase::ResponseHeaders => ctx.response_filter(session, response).await,
-            Phase::ResponseBody => ctx.response_body_filter(session, body, true).await,
-            Phase::ResponseTrailers => ctx
-                .response_trailer_filter(session, trailers)
-                .await
-                .map(|_| ()),
-        }
-    }
-
-    /// Return a plugin that runs `callback` in `phase`, with `delivery` as its
-    /// `proxy_on_http_call_response`.
-    fn plugin_with_callback_in(
-        name: &str,
-        phase: Phase,
-        callback: &'static str,
-        delivery: &'static str,
-    ) -> WasmPluginConf {
-        let mut wat = Wat {
-            http_call_response: Some(delivery),
-            ..Wat::default()
-        };
-        match phase {
-            Phase::RequestBody => wat.request_body = Some(callback),
-            Phase::ResponseHeaders => wat.response_headers = Some(callback),
-            Phase::ResponseBody => wat.response_body = Some(callback),
-            Phase::ResponseTrailers => wat.response_trailers = Some(callback),
-        }
-        body_plugin(name, wat)
-    }
 
     /// Return a plugin that makes a callout and pauses in `proxy_on_request_headers`, with
     /// `delivery` as its `proxy_on_http_call_response`.
@@ -853,15 +830,6 @@ mod tests {
         gate.notify_one();
         assert!(eventually(|| runtime.callouts_in_flight() == 0).await);
         assert_eq!(sender.sent_count(), 1);
-    }
-
-    /// Start a request, leave its plugin waiting for a callout in `phase`, and drop that phase's
-    /// future.
-    async fn cancel_a_wait_in(phase: Phase, ctx: &mut WasmCtx, session: &mut Session) {
-        run_request_headers(ctx, session).await;
-        let mut inputs = PhaseInputs::new();
-        let mut waits = pin!(run_phase(ctx, session, phase, &mut inputs));
-        assert!(poll!(waits.as_mut()).is_pending());
     }
 
     #[tokio::test]

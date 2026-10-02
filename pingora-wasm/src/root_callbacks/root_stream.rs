@@ -47,7 +47,7 @@ impl RootCallbackPluginState {
             .swap(true, Ordering::Relaxed)
         {
             warn!(
-                "wasm plugin {}: {function_name} called outside of a request, no effect",
+                "wasm plugin {}: {function_name} called outside of a request, no effect, further occurrences are not logged",
                 self.plugin_name
             );
         }
@@ -203,7 +203,9 @@ mod tests {
         let second = stream.continue_stream(tick_invocation(), StreamType::HttpRequest);
 
         assert_eq!((first, second), (Ok(()), Ok(())));
-        let warnings = crate_log_lines_with("continue-from-tick: proxy_continue_stream called");
-        assert_eq!(warnings.len(), 1);
+        let warnings = crate_log_lines_with("wasm plugin continue-from-tick:");
+        let want = "wasm plugin continue-from-tick: proxy_continue_stream called outside of a \
+                    request, no effect, further occurrences are not logged";
+        assert_eq!(warnings, [want]);
     }
 }

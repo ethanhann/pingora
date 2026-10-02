@@ -13,7 +13,11 @@
 // limitations under the License.
 
 pub(crate) mod callouts;
+mod metric_sink;
+pub(crate) mod phases;
 mod session;
+
+pub(crate) use metric_sink::{RecordedFailure, RecordedFailures};
 
 pub(crate) use session::{
     read_downstream, read_downstream_after_marker, session, GET, HEAD, MARKER_RESPONSE, POST,

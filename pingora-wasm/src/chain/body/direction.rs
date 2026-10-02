@@ -22,6 +22,7 @@ use crate::runtime::pool::PluginPhases;
 use crate::{ERR_REQUEST_BODY_TOO_LARGE, ERR_RESPONSE_BODY_TOO_LARGE};
 use pingora_error::ErrorType;
 use proxy_wasm_host::abi::v0_2_1::types::StreamType;
+use proxy_wasm_host::abi::v0_2_1::Callback;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BodyDirection {
@@ -44,10 +45,18 @@ impl BodyDirection {
         }
     }
 
-    pub(super) fn too_large(self) -> ErrorType {
+    pub(crate) fn too_large(self) -> ErrorType {
         match self {
             BodyDirection::Request => ERR_REQUEST_BODY_TOO_LARGE,
             BodyDirection::Response => ERR_RESPONSE_BODY_TOO_LARGE,
+        }
+    }
+
+    /// Return the body's name and the name of its limit setting, for use in messages.
+    pub(crate) fn body_and_limit_names(self) -> (&'static str, &'static str) {
+        match self {
+            BodyDirection::Request => ("request", "request_body_limit"),
+            BodyDirection::Response => ("response", "response_body_limit"),
         }
     }
 
@@ -75,10 +84,11 @@ impl BodyDirection {
         }
     }
 
-    pub(super) fn failure(self) -> &'static str {
+    /// Return the body callback for this direction.
+    pub(crate) fn callback(self) -> Callback {
         match self {
-            BodyDirection::Request => "proxy_on_request_body failed",
-            BodyDirection::Response => "proxy_on_response_body failed",
+            BodyDirection::Request => Callback::RequestBody,
+            BodyDirection::Response => Callback::ResponseBody,
         }
     }
 }

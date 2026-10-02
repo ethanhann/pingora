@@ -16,6 +16,7 @@
 
 mod body;
 mod ctx;
+mod failure;
 mod logging;
 mod request;
 mod respond;
@@ -96,7 +97,7 @@ impl WasmChain {
     fn plugin_names(&self) -> Vec<&str> {
         self.plugins
             .iter()
-            .map(|index| self.runtime.pools[*index].name.as_str())
+            .map(|index| &*self.runtime.pools[*index].name)
             .collect()
     }
 }

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::ctx::PluginRecord;
+use super::failure::FilterFailure;
 use super::slot::LockedSlot;
 use super::wait::{CalloutWaitOutcome, PausedPhase};
 use super::{RequestOutcome, ResponseProgress, WasmCtx};
@@ -23,10 +24,13 @@ use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_error::Result;
 use pingora_proxy::Session;
 use proxy_wasm_host::abi::v0_2_1::types::{Action, StreamType};
-use proxy_wasm_host::abi::v0_2_1::StreamKind;
+use proxy_wasm_host::abi::v0_2_1::{Callback, StreamKind};
 use std::time::{Instant, SystemTime};
 
-const PAUSED_A_REQUEST: &str = "paused on request headers with no callout pending";
+fn request_pause_failure() -> FilterFailure {
+    let what = "paused on request headers with no callout pending";
+    FilterFailure::paused(Callback::RequestHeaders, what)
+}
 
 impl WasmCtx {
     /// Run `proxy_on_request_headers` for each plugin, in chain order.
@@ -45,9 +49,17 @@ impl WasmCtx {
     ///
     /// # Errors
     ///
-    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if a plugin traps or otherwise fails,
-    /// if a plugin has no guest available, or if a plugin pauses the request with no callout
-    /// pending. The same error is returned if the runtime's threads cannot be started.
+    /// For a plugin with [FailPolicy::Closed](crate::FailPolicy::Closed), returns
+    /// [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if the plugin traps or otherwise fails, has
+    /// no guest available, pauses the request with no callout pending, waits for callouts longer
+    /// than its [callout_wait_limit](crate::WasmPluginConf::callout_wait_limit), or loses the
+    /// guest holding this request during a callout wait. A plugin with
+    /// [FailPolicy::Open](crate::FailPolicy::Open) is skipped instead, unless it runs on the
+    /// request body, the request has one, and the plugin has already changed `content-length` or
+    /// `transfer-encoding`. See [fail_policy](crate::WasmPluginConf::fail_policy) for the full
+    /// rule.
+    ///
+    /// Under both policies, the same error is returned if the runtime's threads cannot be started.
     pub async fn request_filter<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -64,7 +76,10 @@ impl WasmCtx {
         self.scheme = scheme_of(session);
         self.record_request_facts(session);
         for position in 0..self.chain.plugins.len() {
-            let action = self.run_request_headers_at(session, position, end_of_stream)?;
+            let Some(action) = self.run_request_headers_at(session, position, end_of_stream)?
+            else {
+                continue;
+            };
             let sent = self.stream().plugin_response.take();
             let paused =
                 sent.is_none() && self.plugin_stays_paused(action, StreamType::HttpRequest);
@@ -76,15 +91,16 @@ impl WasmCtx {
                 continue;
             }
             if !self.waits_for_callout(position) {
-                return Err(self.plugin_error(position, PAUSED_A_REQUEST));
+                self.skip_plugin_or_fail_request(position, request_pause_failure())?;
+                continue;
             }
             let wait_outcome = self
                 .wait_for_callouts(session, position, PausedPhase::RequestHeaders)
                 .await?;
             match wait_outcome {
-                CalloutWaitOutcome::Continued => {}
+                CalloutWaitOutcome::Continued | CalloutWaitOutcome::PluginSkipped => {}
                 CalloutWaitOutcome::StillPaused => {
-                    return Err(self.plugin_error(position, PAUSED_A_REQUEST))
+                    self.skip_plugin_or_fail_request(position, request_pause_failure())?;
                 }
                 CalloutWaitOutcome::Respond(response) => {
                     return self.respond_to_request_headers(session, position, *response)
@@ -95,15 +111,24 @@ impl WasmCtx {
     }
 
     /// Create a context for the plugin at `position` and run its `proxy_on_request_headers`.
+    ///
+    /// Returns `None` if the plugin failed and was skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure's error if the plugin failed and was not skipped.
     fn run_request_headers_at<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
         position: usize,
         end_of_stream: bool,
-    ) -> Result<Action> {
+    ) -> Result<Option<Action>> {
         let runtime = self.chain.runtime.clone();
         let pool = &runtime.pools[self.chain.plugins[position]];
-        let mut locked = LockedSlot::for_new_request(pool)?;
+        let Some(mut locked) = LockedSlot::for_new_request(pool) else {
+            self.skip_plugin_or_fail_request(position, FilterFailure::unavailable())?;
+            return Ok(None);
+        };
         let slot = locked.slot;
         let loaded = locked.loaded()?;
         let root = loaded.root;
@@ -113,7 +138,10 @@ impl WasmCtx {
         });
         let context = match created {
             Ok(context) => context,
-            Err(e) => return Err(locked.guest_failure("failed to create a context", e)),
+            Err(e) => {
+                self.guest_call_failed(position, locked, Callback::ContextCreate, e)?;
+                return Ok(None);
+            }
         };
         pool.opened(slot);
         self.records[position] = Some(PluginRecord {
@@ -127,10 +155,13 @@ impl WasmCtx {
             scope.expect_stream_kind(context, StreamKind::Http)?;
             scope.on_request_headers(context, count, end_of_stream)
         });
-        self.request_out(session.req_header_mut());
+        self.request_out(position, session.req_header_mut());
         match action {
-            Ok(action) => Ok(action),
-            Err(e) => Err(locked.guest_failure("proxy_on_request_headers failed", e)),
+            Ok(action) => Ok(Some(action)),
+            Err(e) => {
+                self.guest_call_failed(position, locked, Callback::RequestHeaders, e)?;
+                Ok(None)
+            }
         }
     }
 

@@ -156,10 +156,10 @@ mod tests {
     use crate::runtime::pool::events::{GuestAddress, SlotIndex};
     use crate::test_support::callouts::{authz_services, callout_ctx_with_services, FixedSender};
     use crate::test_support::{
-        crate_log_lines_with, plugin, record_crate_logs, session, wat_guest, RecordedGuestLogs,
-        Wat, GET,
+        crate_log_lines_with, plugin, record_crate_logs, session, wat_guest, RecordedFailures,
+        RecordedGuestLogs, Wat, GET,
     };
-    use crate::{WasmRuntime, WasmServices};
+    use crate::{FailureOutcome, PluginFailure, WasmRuntime, WasmServices};
     use parking_lot::Mutex;
     use proxy_wasm_host::abi::v0_2_1::types::LogLevel;
     use proxy_wasm_host::abi::v0_2_1::CalloutId;
@@ -268,12 +268,25 @@ mod tests {
             tick: Some("unreachable"),
             ..Wat::default()
         };
-        let (runtime, _logs) = runtime_with_logs::<RecordedGuestLogs>("trap-in-tick", wat, 1);
+        let reports = Arc::new(RecordedFailures::default());
+        let services = WasmServices {
+            metric_sink: reports.clone(),
+            ..WasmServices::default()
+        };
+        let conf = plugin("trap-in-tick", wat_guest("trap-in-tick", wat), 1);
+        let runtime = WasmRuntime::new_with_services(vec![conf], services).unwrap();
 
         runtime.inner.start_threads().unwrap();
 
         let replaced = "wasm plugin trap-in-tick: guest in slot 0 replaced after failure";
         assert!(wait_until(|| !crate_log_lines_with(replaced).is_empty()));
+        let failed = "wasm plugin trap-in-tick: proxy_on_tick failed";
+        assert!(wait_until(|| crate_log_lines_with(failed).len() >= 2));
+        let (failure, outcome) = (PluginFailure::GuestError, FailureOutcome::Failed);
+        let tick = Some("proxy_on_tick".to_string());
+        let want = ("trap-in-tick".to_string(), failure, outcome, tick);
+        assert_eq!(reports.failures().first(), Some(&want));
+        assert_eq!(reports.replaced_guests()[0], "trap-in-tick");
     }
 
     #[test]

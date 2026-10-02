@@ -13,6 +13,10 @@
 // limitations under the License.
 
 use super::BodyDirection;
+use crate::chain::failure::FilterFailure;
+use crate::chain::WasmCtx;
+use bytes::Bytes;
+use pingora_error::Result;
 use std::mem;
 
 /// Body bytes held back for paused plugins, indexed by chain position.
@@ -64,12 +68,65 @@ impl HeldBodies {
         };
         list.get(position).map_or(0, Vec::len)
     }
+}
 
-    pub(crate) fn request_len(&self) -> usize {
-        self.request.iter().map(Vec::len).sum()
+/// Whether a plugin that paused on a body chunk keeps holding its bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BodyHold {
+    /// The plugin keeps holding them until a later chunk arrives.
+    Continues,
+    /// The plugin was skipped, so they move on to the next plugin.
+    EndedBySkip,
+}
+
+impl WasmCtx {
+    /// Check that the plugin at `position` may keep holding the bytes it paused on.
+    ///
+    /// At the end of the stream no later chunk can release the bytes, so a pause there is a
+    /// plugin failure. Returns [BodyHold::EndedBySkip] if the plugin was skipped for it, and the
+    /// caller then passes its bytes on to the next plugin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) for a pause at the end of the stream
+    /// if the plugin is not skipped. Returns the too-large error of `direction` if the plugin
+    /// holds more than its limit, under both fail policies.
+    pub(super) fn hold_body_or_skip_plugin(
+        &mut self,
+        direction: BodyDirection,
+        position: usize,
+        end_of_stream: bool,
+    ) -> Result<BodyHold> {
+        if end_of_stream {
+            let what = "paused on the last body chunk with no callout pending";
+            let failure = FilterFailure::paused(direction.callback(), what);
+            self.skip_plugin_or_fail_request(position, failure)?;
+            return Ok(BodyHold::EndedBySkip);
+        }
+        let size = self.held.len(direction, position);
+        let limit = direction.limit(&self.pool_at(position).phases);
+        if size > limit {
+            let failure = FilterFailure::body_limit(direction, size, limit);
+            return Err(self.failed_request_error(position, failure));
+        }
+        Ok(BodyHold::Continues)
     }
 
-    pub(crate) fn response_len(&self) -> usize {
-        self.response.iter().map(Vec::len).sum()
+    /// Return `chunk` preceded by the bytes held for the plugin at `position`.
+    ///
+    /// Used to pass on the bytes of a plugin that continued after a callout wait, and those of a
+    /// skipped plugin, which would otherwise never be released.
+    pub(super) fn prepend_held_bytes(
+        &mut self,
+        direction: BodyDirection,
+        position: usize,
+        chunk: Bytes,
+    ) -> Bytes {
+        let mut held = self.held.take(direction, position);
+        if held.is_empty() {
+            return chunk;
+        }
+        held.extend_from_slice(&chunk);
+        Bytes::from(held)
     }
 }

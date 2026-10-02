@@ -33,9 +33,10 @@ pub(crate) use service::GuestCalloutService;
 pub use upstreams::{CalloutTarget, CalloutUpstreams, StaticCalloutUpstreams};
 
 use bytes::Bytes;
+use headers::RejectedCalloutHeader;
 use log::warn;
 use pingora_http::RequestHeader;
-use proxy_wasm_host::abi::v0_2_1::CalloutId;
+use proxy_wasm_host::abi::v0_2_1::{Callback, CalloutId};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,9 +46,13 @@ pub(crate) struct PluginCalloutConf {
     pub(crate) plugin_name: String,
     pub(crate) upstreams: Arc<dyn CalloutUpstreams>,
     pub(crate) timeout_limit: Duration,
+    /// How long a filter may wait on the plugin's callouts in a single callout wait.
+    pub(crate) wait_limit: Duration,
     pub(crate) response_limit: usize,
-    timeout_warning_logged: AtomicBool,
+    zero_timeout_warning_logged: AtomicBool,
+    long_timeout_warning_logged: AtomicBool,
     overflow_warning_logged: AtomicBool,
+    rejected_header_warning_logged: AtomicBool,
 }
 
 impl PluginCalloutConf {
@@ -55,33 +60,46 @@ impl PluginCalloutConf {
         plugin_name: &str,
         upstreams: Arc<dyn CalloutUpstreams>,
         timeout_limit: Duration,
+        wait_limit: Duration,
         response_limit: usize,
     ) -> Self {
         PluginCalloutConf {
             plugin_name: plugin_name.to_string(),
             upstreams,
             timeout_limit,
+            wait_limit,
             response_limit,
-            timeout_warning_logged: AtomicBool::new(false),
+            zero_timeout_warning_logged: AtomicBool::new(false),
+            long_timeout_warning_logged: AtomicBool::new(false),
             overflow_warning_logged: AtomicBool::new(false),
+            rejected_header_warning_logged: AtomicBool::new(false),
         }
     }
 
     /// Return the timeout to apply to a callout for which the plugin requested `passed`.
     ///
-    /// A timeout of zero, or one longer than `timeout_limit`, is replaced by the limit. This is
-    /// logged the first time it happens for the plugin.
+    /// A timeout of zero, or one longer than `timeout_limit`, is replaced by the limit. Each of
+    /// the two cases is logged the first time it happens for the plugin.
     pub(crate) fn effective_timeout(&self, passed: Duration) -> Duration {
         if !passed.is_zero() && passed <= self.timeout_limit {
             return passed;
         }
-        if !self.timeout_warning_logged.swap(true, Ordering::Relaxed) {
-            warn!(
-                "wasm plugin {}: callout timeout {passed:?} is zero or over the limit, using callout_timeout_limit {:?}",
-                self.plugin_name, self.timeout_limit
-            );
+        let plugin = &self.plugin_name;
+        let limit = self.timeout_limit;
+        if passed.is_zero() {
+            if !self
+                .zero_timeout_warning_logged
+                .swap(true, Ordering::Relaxed)
+            {
+                warn!("wasm plugin {plugin}: callout timeout is zero, using callout_timeout_limit {limit:?}, further occurrences are not logged");
+            }
+        } else if !self
+            .long_timeout_warning_logged
+            .swap(true, Ordering::Relaxed)
+        {
+            warn!("wasm plugin {plugin}: callout timeout {passed:?} is over the limit, using callout_timeout_limit {limit:?}, further occurrences are not logged");
         }
-        self.timeout_limit
+        limit
     }
 
     /// Warn that a callout failed because `max_callouts_in_flight` was reached.
@@ -90,7 +108,22 @@ impl PluginCalloutConf {
     pub(crate) fn warn_of_overflow_once(&self) {
         if !self.overflow_warning_logged.swap(true, Ordering::Relaxed) {
             warn!(
-                "wasm plugin {}: max_callouts_in_flight reached, callout failed with a 503 response",
+                "wasm plugin {}: max_callouts_in_flight reached, callout failed with a 503 response, further occurrences are not logged",
+                self.plugin_name
+            );
+        }
+    }
+
+    /// Warn that a callout was rejected because of `header`.
+    ///
+    /// Only the first call for the plugin logs anything.
+    pub(crate) fn warn_of_rejected_header_once(&self, header: &RejectedCalloutHeader) {
+        if !self
+            .rejected_header_warning_logged
+            .swap(true, Ordering::Relaxed)
+        {
+            warn!(
+                "wasm plugin {}: callout rejected, {header}, further occurrences are not logged",
                 self.plugin_name
             );
         }
@@ -105,18 +138,21 @@ pub(crate) struct AcceptedCallout {
     pub(crate) request: Box<RequestHeader>,
     pub(crate) body: Bytes,
     pub(crate) timeout: Duration,
+    /// The callback the plugin sent the callout from, for log messages.
+    pub(crate) callback: Option<Callback>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{crate_log_lines_with, record_crate_logs};
 
     const LIMIT: Duration = Duration::from_secs(10);
 
     #[test]
     fn timeout_of_zero_or_over_limit_uses_limit() {
         let upstreams = Arc::new(StaticCalloutUpstreams::new());
-        let conf = PluginCalloutConf::new("a", upstreams, LIMIT, 1024);
+        let conf = PluginCalloutConf::new("a", upstreams, LIMIT, LIMIT, 1024);
         let negative = Duration::from_millis(u64::from(u32::MAX));
         let cases = [
             (Duration::from_secs(1), Duration::from_secs(1)),
@@ -129,5 +165,26 @@ mod tests {
         let got = cases.map(|(passed, _)| conf.effective_timeout(passed));
 
         assert_eq!(got, cases.map(|(_, timeout)| timeout));
+    }
+
+    #[test]
+    fn replaced_timeout_warns_once_per_cause() {
+        record_crate_logs();
+        let upstreams = Arc::new(StaticCalloutUpstreams::new());
+        let conf = PluginCalloutConf::new("replaced-timeout", upstreams, LIMIT, LIMIT, 1024);
+        let passed = [Duration::ZERO, Duration::from_secs(30)];
+
+        for timeout in passed.into_iter().chain(passed) {
+            conf.effective_timeout(timeout);
+        }
+
+        let lines = crate_log_lines_with("wasm plugin replaced-timeout: callout timeout");
+        let want = [
+            "wasm plugin replaced-timeout: callout timeout is zero, using \
+             callout_timeout_limit 10s, further occurrences are not logged",
+            "wasm plugin replaced-timeout: callout timeout 30s is over the limit, using \
+             callout_timeout_limit 10s, further occurrences are not logged",
+        ];
+        assert_eq!(lines, want);
     }
 }
