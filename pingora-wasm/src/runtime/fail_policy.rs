@@ -57,10 +57,6 @@ pub enum FailPolicy {
     Closed,
     /// The failure is logged, the plugin is skipped for the rest of the request, and the request
     /// continues with the next plugin.
-    ///
-    /// Use it for plugins a request can do without, such as one that collects statistics.
-    /// [WasmCtx::skipped_plugins](crate::WasmCtx::skipped_plugins) returns the plugins that
-    /// were skipped on a request.
     Open,
 }
 
