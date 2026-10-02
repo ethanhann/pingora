@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The direction of a body, and what differs between the request body and the response body.
+//! Body direction
+//!
+//! [BodyDirection] selects the request body or the response body, and provides everything that
+//! differs between the two in the shared body pass.
 
 use crate::chain::wait::PausedPhase;
 use crate::runtime::pool::PluginPhases;
@@ -62,8 +65,9 @@ impl BodyDirection {
         }
     }
 
-    /// Return the position in the chain of the plugin that runs at `step` of a pass over
-    /// `count` plugins.
+    /// Return the chain position of the plugin that runs at `step` of a pass over `count` plugins.
+    ///
+    /// Request bodies run in chain order and response bodies in reverse.
     pub(super) fn position_at_step(self, step: usize, count: usize) -> usize {
         match self {
             BodyDirection::Request => step,
@@ -73,8 +77,8 @@ impl BodyDirection {
 
     pub(super) fn failure(self) -> &'static str {
         match self {
-            BodyDirection::Request => "failed in on_request_body",
-            BodyDirection::Response => "failed in on_response_body",
+            BodyDirection::Request => "proxy_on_request_body failed",
+            BodyDirection::Response => "proxy_on_response_body failed",
         }
     }
 }

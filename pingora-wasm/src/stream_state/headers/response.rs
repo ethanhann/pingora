@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The response header map that a guest sees.
+//! Response header map
 
 use super::{classify, visit_headers, Name, Regular, WriteResult};
 use http::header::HeaderValue;
@@ -21,7 +21,7 @@ use proxy_wasm_host::{HeaderMap, NotAllowed, PairVisitor};
 use std::borrow::Cow;
 use std::ops::ControlFlow;
 
-/// The response header map of a guest.
+/// The response header map exposed to a guest.
 pub(crate) struct ResponseHeaders {
     pub(crate) header: ResponseHeader,
 }
@@ -40,7 +40,7 @@ fn set_status(header: &mut ResponseHeader, value: &[u8]) -> WriteResult {
     header.set_status(code).map_err(|_| NotAllowed)
 }
 
-/// In a response map `host` is an ordinary header.
+/// Classify a key for a response map, where `host` is an ordinary header.
 fn classify_response(key: &[u8]) -> Option<Name<'_>> {
     match classify(key)? {
         Name::Host => std::str::from_utf8(key).ok().map(Name::Regular),
@@ -117,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn response_reads_the_status() {
+    fn response_reads_status() {
         let map = response();
 
         let status = get(&map, ":status");
@@ -126,7 +126,7 @@ mod tests {
     }
 
     #[test]
-    fn response_writes_the_status() {
+    fn response_writes_status() {
         let mut map = response();
 
         map.set(b":status", b"404").unwrap();
@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn response_refuses_bad_status_writes() {
+    fn response_rejects_invalid_pseudo_writes() {
         let mut map = response();
 
         let refused = [
@@ -158,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn response_replace_all_keeps_the_status() {
+    fn replace_all_keeps_status() {
         let mut map = response();
 
         map.replace_all(&[(b"x-new", b"1")]).unwrap();
@@ -169,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn response_host_is_an_ordinary_header() {
+    fn host_is_ordinary_response_header() {
         let mut map = response();
 
         map.set(b"Host", b"origin.test").unwrap();

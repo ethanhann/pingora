@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The request header map that a guest sees.
+//! Request header map
 //!
-//! `:method`, `:path`, `:authority`, and `:scheme` are computed from the typed fields of the
-//! Pingora header. The map hides `host` and shows it as `:authority`, as Proxy-Wasm plugins
-//! expect.
+//! `:method`, `:path`, and `:authority` are derived from the typed fields of Pingora's
+//! `RequestHeader`. `:scheme` comes from the request URI, or from whether the downstream
+//! connection uses TLS when the URI has no scheme. `host` is left out of the listed pairs and
+//! reported as `:authority` instead, as Proxy-Wasm plugins expect. Reading or setting `host` by
+//! name acts on `:authority`.
 
 use super::{classify, value_of, visit_headers, Name, Regular, WriteResult};
 use http::header::{HeaderValue, HOST};
@@ -27,7 +29,7 @@ use proxy_wasm_host::{HeaderMap, NotAllowed, PairVisitor};
 use std::borrow::Cow;
 use std::ops::ControlFlow;
 
-/// The request header map of a guest.
+/// The request header map exposed to a guest.
 pub(crate) struct RequestHeaders {
     pub(crate) header: RequestHeader,
     scheme: Scheme,
@@ -52,8 +54,10 @@ impl RequestHeaders {
         }
     }
 
-    /// Return the path in origin form. For an absolute form target, return the path and query
-    /// of its URI.
+    /// Return the value of `:path`, in origin form.
+    ///
+    /// For an absolute-form target this is the path and query of its URI. Returns `None` for a
+    /// `CONNECT` request.
     fn path(&self) -> Option<&[u8]> {
         if self.header.method == Method::CONNECT {
             return None;
@@ -112,8 +116,10 @@ fn set_request_pseudo(
     }
 }
 
-/// Return `true` when a guest can write `value` as `:path`. It must be in origin form, or `*`, as an
-/// HTTP/2 `:path` must be.
+/// Return `true` if a guest may write `value` as `:path`.
+///
+/// Like an HTTP/2 `:path`, the value has to be in origin form or `*`. Spaces and control
+/// characters are rejected as well.
 fn is_origin_path(value: &[u8]) -> bool {
     (value.first() == Some(&b'/') || value == b"*")
         && !value.iter().any(|b| *b == b' ' || b.is_ascii_control())
@@ -201,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn request_reads_the_pseudo_headers() {
+    fn request_reads_pseudo_headers() {
         let map = request("POST", b"/a?b=1", Some("example.test"));
 
         let read: Vec<_> = [
@@ -249,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn pseudo_headers_follow_the_request_target() {
+    fn pseudo_headers_follow_request_target() {
         let mut h2 = RequestHeader::build("GET", b"/", None).unwrap();
         h2.set_uri("https://h2.test/x".parse().unwrap());
         h2.set_version(Version::HTTP_2);
@@ -271,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn request_writes_the_pseudo_headers() {
+    fn request_writes_pseudo_headers() {
         let mut map = request("GET", b"/", Some("example.test"));
         let writes: [(&[u8], &[u8]); 4] = [
             (b":method", b"PUT"),
@@ -291,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn request_path_write_keeps_the_http2_authority() {
+    fn path_write_keeps_http2_authority() {
         let mut header = RequestHeader::build("GET", b"/", None).unwrap();
         header.set_uri("https://h2.test/x".parse().unwrap());
         header.set_version(Version::HTTP_2);
@@ -303,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn request_refuses_bad_pseudo_writes() {
+    fn request_rejects_invalid_writes() {
         let mut map = request("GET", b"/", Some("example.test"));
 
         let refused = [
@@ -327,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn host_writes_change_the_authority() {
+    fn host_write_changes_authority() {
         let mut map = request("GET", b"/", Some("example.test"));
 
         map.set(b"Host", b"moved.test").unwrap();
@@ -336,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_ignore_ascii_case() {
+    fn header_reads_ignore_ascii_case() {
         let map = request("GET", b"/", None);
 
         let read = [
@@ -349,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_ignore_ascii_case() {
+    fn header_writes_ignore_ascii_case() {
         let mut map = request("GET", b"/", None);
         map.set(b"X-NEW", b"1").unwrap();
         map.add(b"x-new", b"2").unwrap();
@@ -362,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_keep_the_case_map_in_step() {
+    fn writes_keep_header_case_map_in_sync() {
         let mut map = request("GET", b"/", Some("example.test"));
 
         map.set(b"Wasm-Context", b"7").unwrap();
@@ -376,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_all_keeps_left_out_pseudo_headers_and_host() {
+    fn replace_all_keeps_omitted_pseudo_headers_and_host() {
         let mut map = request("GET", b"/keep", Some("example.test"));
 
         map.replace_all(&[(b"x-a", b"1"), (b"x-a", b"2"), (b":method", b"POST")])
@@ -391,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_all_with_a_refused_pair_changes_nothing() {
+    fn replace_all_with_rejected_pair_changes_nothing() {
         let mut map = request("GET", b"/", Some("example.test"));
 
         let refused = map.replace_all(&[(b"x-a", b"1"), (b":scheme", b"https")]);
@@ -402,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_all_round_trips_every_listed_pair() {
+    fn replace_all_round_trips_listed_pairs() {
         let mut map = request("POST", b"/a?b=1", Some("example.test"));
         let before = pairs(&map);
         let owned: Vec<(Vec<u8>, Vec<u8>)> = before

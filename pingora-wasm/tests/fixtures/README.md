@@ -1,9 +1,7 @@
 # Test fixtures
 
-These Proxy-Wasm guests are built from the `crates/test-guests` workspace of
-[proxy-wasm-host](https://github.com/ethanhann/proxy-wasm-host) at commit `0252ba5`, for the
-`wasm32-wasip1` target. `plugin-services.wasm` is built from commit `be279de`, which adds its
-source.
+The compiled Proxy-Wasm plugins in this directory are built for the `wasm32-wasip1` target from the `crates/test-guests` workspace of [proxy-wasm-host](https://github.com/ethanhann/proxy-wasm-host) at commit `0252ba5`.
+The one exception is `plugin-services.wasm`, which is built from commit `be279de`, the commit that added its source.
 
 | File | Source | License |
 |---|---|---|
@@ -15,4 +13,6 @@ source.
 | `plugin-services.wasm` | `crates/test-guests/plugin-services` | Apache-2.0, Copyright (c) 2026 Ethan Hann |
 | `sdk-http-config.wasm` | `crates/test-guests/sdk-http-config`, the `http_config` example of the Rust Proxy-Wasm SDK v0.2.5 | Apache-2.0, Copyright 2020 Google LLC |
 
-To update a fixture, build it in that workspace and copy the `.wasm` file here.
+To update a fixture, rebuild it in that workspace and copy the resulting `.wasm` file into this directory.
+
+`guest.wat` is the template for the small guests that the tests assemble at run time.

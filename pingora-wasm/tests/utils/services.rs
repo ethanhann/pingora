@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The services of the test server: the port, the runtime, and the chain of each one.
+//! Test server services
+//!
+//! Each service has a port, a runtime, and a chain of that runtime's plugins.
 
 use super::callout_origins::{CalloutOrigin, CalloutOriginPerPlugin};
 use super::{fixture, guests};
@@ -50,14 +52,14 @@ static CALLOUT_ORIGINS: Lazy<Arc<CalloutOriginPerPlugin>> = Lazy::new(|| {
     ])
 });
 
-/// The registry of the services that publish metrics, with the one sink that all of them use.
+/// The Prometheus registry for the test metrics, and the one sink every runtime publishes to.
 static METRIC_REGISTRY_AND_SINK: Lazy<(Registry, Arc<PrometheusMetricSink>)> = Lazy::new(|| {
     let registry = Registry::new();
     let sink = Arc::new(PrometheusMetricSink::new(registry.clone()).unwrap());
     (registry, sink)
 });
 
-/// Return the text that a Prometheus scrape of the test metrics returns.
+/// Return the test metrics in the Prometheus text format, as a scrape would.
 pub fn metrics_text() -> String {
     let mut buffer = Vec::new();
     TextEncoder::new()
@@ -66,7 +68,7 @@ pub fn metrics_text() -> String {
     String::from_utf8(buffer).unwrap()
 }
 
-/// Publish the metrics of a runtime, and give it the fixed property `node.name`.
+/// Attach the shared metric sink and set the fixed property `node.name` to `test-node`.
 fn add_metric_sink_and_node_name(services: &mut WasmServices) {
     services.metric_sink = METRIC_REGISTRY_AND_SINK.1.clone();
     let mut fixed = WasmProperties::new();
@@ -74,15 +76,15 @@ fn add_metric_sink_and_node_name(services: &mut WasmServices) {
     services.fixed_properties = fixed;
 }
 
-/// Return the origin that receives the callouts of `plugin`.
+/// Return the origin receiving the callouts of `plugin`.
 pub fn callout_origin(plugin: &str) -> Arc<CalloutOrigin> {
     CALLOUT_ORIGINS.origin(plugin)
 }
 
-/// The plugins of one runtime.
+/// The plugins and callout routing of one runtime.
 struct RuntimePlan {
     plugins: Vec<WasmPluginConf>,
-    /// Whether each plugin sends its callouts to its own origin.
+    /// Whether callouts are routed to the per-plugin origins.
     has_callout_origins: bool,
 }
 
@@ -98,16 +100,16 @@ impl RuntimePlan {
     }
 }
 
-/// The services to start, and the runtimes that they use.
+/// The services to start and the runtimes they run on.
 #[derive(Default)]
 struct ServicePlans {
     runtimes: Vec<RuntimePlan>,
-    /// The port, the index of the runtime, the chain, and the thread count of each service.
+    /// Port, runtime index, chain, and thread count of each service.
     services: Vec<(u16, usize, Vec<&'static str>, Option<usize>)>,
 }
 
 impl ServicePlans {
-    /// Add a runtime with `plugins`, and return its index.
+    /// Add a runtime with `plugins` and return its index.
     fn runtime(&mut self, plugins: Vec<WasmPluginConf>, has_callout_origins: bool) -> usize {
         self.runtimes.push(RuntimePlan {
             plugins,
@@ -116,14 +118,14 @@ impl ServicePlans {
         self.runtimes.len() - 1
     }
 
-    /// Add a service on `port` that runs a chain of all of `plugins`, in that order.
+    /// Add a service on `port` with its own runtime and a chain of all `plugins`, in order.
     fn service(&mut self, port: u16, plugins: Vec<WasmPluginConf>, threads: Option<usize>) {
         let chain = chain_of(&plugins);
         let runtime = self.runtime(plugins, false);
         self.services.push((port, runtime, chain, threads));
     }
 
-    /// Add a service on `port` with one plugin that sends its callouts to its own origin.
+    /// Add a service on `port` running one plugin whose callouts go to its own origin.
     fn service_with_callout_origin(&mut self, port: u16, plugin: WasmPluginConf) {
         let chain = chain_of(std::slice::from_ref(&plugin));
         let runtime = self.runtime(vec![plugin], true);
@@ -138,10 +140,9 @@ fn chain_of(plugins: &[WasmPluginConf]) -> Vec<&'static str> {
         .collect()
 }
 
-/// Return the port, the runtime, the chain, and the thread count of each service.
+/// Return the port, runtime, chain, and thread count of each service.
 ///
-/// A runtime compiles its plugins when it is built, so the runtimes are built on one thread
-/// each.
+/// Building a runtime compiles its plugins, so each runtime is built on its own thread.
 pub fn services() -> Vec<(u16, WasmRuntime, Vec<&'static str>, Option<usize>)> {
     let add = || plugin("add", fixture("add-request-header"), 2, "");
     let example = |slots| plugin("example", fixture("http-example"), slots, "");

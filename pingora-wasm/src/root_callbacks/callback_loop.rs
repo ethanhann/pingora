@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The state of the root callback thread: what it waits for, and what is due.
+//! Root callback loop state
+//!
+//! The loop tracks scheduled ticks, queue registrations, in-flight callouts, and work that has to
+//! be retried once a busy slot is free again.
 
 use super::queue_registrations::QueueRegistrations;
 use super::root_callouts::{FinishedCallout, RootCallbackCallouts};
@@ -26,25 +29,25 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-/// The wait before the thread retries work whose slot a request holds.
+/// How long to wait before retrying work whose slot is locked by a request.
 const BUSY_SLOT_RETRY_DELAY: Duration = Duration::from_millis(1);
 
-/// The state of the loop on the root callback thread.
+/// State of the root callback loop.
 #[derive(Default)]
 pub(super) struct RootCallbackLoop {
     pub(super) ticks: TickSchedule,
     pub(super) queues: QueueRegistrations,
     pub(super) callouts: RootCallbackCallouts,
-    /// Callouts that the next run starts, on the tokio runtime of the thread.
+    /// Callouts to start on the next run, once the thread's tokio runtime is entered.
     callouts_to_start: Vec<(GuestAddress, ContextId, AcceptedCallout)>,
     ready_work: VecDeque<Work>,
     retries: Vec<(Instant, Work)>,
 }
 
 impl RootCallbackLoop {
-    /// Wait until an event arrives, a callout ends, or a tick or a retry is due.
+    /// Wait for the next event, finished callout, or due tick or retry.
     ///
-    /// Return `false` when the channel closed, because the runtime of the plugins dropped.
+    /// Returns `false` once the channel is closed, which means the `WasmRuntime` was dropped.
     pub(super) async fn wait_for_work(
         &mut self,
         events: &mut UnboundedReceiver<RootCallbackEvent>,
@@ -60,9 +63,9 @@ impl RootCallbackLoop {
             }
             _ = sleep_until_due(due), if due.is_some() => {}
         }
-        // A guest call that registers a queue and puts an item on it sends the item event before
-        // the registration, so the thread takes every waiting event before it runs work, and the
-        // item finds its registrant
+        // A guest call that both registers a queue and enqueues to it sends the item event ahead
+        // of the registration. Drain everything already queued before running any work, so the
+        // registration is recorded before the item is delivered.
         while let Ok(event) = events.try_recv() {
             self.accept_event(event);
         }
@@ -138,16 +141,16 @@ impl RootCallbackLoop {
         }
     }
 
-    /// Schedule `work` to run again after `BUSY_SLOT_RETRY_DELAY`.
+    /// Queue `work` to be retried after `BUSY_SLOT_RETRY_DELAY`.
     pub(super) fn retry_later(&mut self, work: Work) {
         self.retries
             .push((Instant::now() + BUSY_SLOT_RETRY_DELAY, work));
     }
 
-    /// Start the callouts that arrived, and run each piece of work that is due.
+    /// Start pending callouts, then run all work that is due.
     ///
-    /// It runs after `block_on` returns, with the tokio runtime of the thread entered, so the
-    /// callouts that it starts run on that runtime.
+    /// Called after `block_on` returns, with the thread's tokio runtime entered so that the
+    /// callouts are spawned on it.
     pub(super) fn run_due_work(&mut self, runtime: &RuntimeInner) {
         for (address, context, callout) in self.callouts_to_start.drain(..) {
             self.callouts.start(runtime, address, context, callout);
@@ -156,8 +159,8 @@ impl RootCallbackLoop {
         let (due, waiting) = self.retries.drain(..).partition(|(at, _)| *at <= now);
         self.retries = waiting;
         for (_, work) in due {
-            // Drop a tick that waited for its slot when the guest set a new period in the meantime,
-            // because the schedule already holds the next tick of that slot
+            // A tick that was waiting for its slot is stale if the guest has set a new period
+            // since, as the schedule already holds that slot's next tick
             if let Work::Tick(address) = &work {
                 if self.ticks.has_next_tick(address.slot) {
                     continue;
@@ -188,7 +191,7 @@ mod tests {
     use proxy_wasm_host::abi::v0_2_1::{Changes, GuestId};
 
     #[test]
-    fn a_period_of_zero_removes_a_tick_that_waits_for_its_slot() {
+    fn zero_period_drops_tick_waiting_for_slot() {
         let mut callback_loop = RootCallbackLoop::default();
         let address = GuestAddress {
             slot: SlotIndex {

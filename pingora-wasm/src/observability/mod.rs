@@ -12,95 +12,113 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The metrics that plugins define, and where your proxy sends them.
+//! Plugin metrics and callout failure reporting
 
-mod prometheus_sink;
 mod log_sink;
+mod prometheus_sink;
 
-pub use prometheus_sink::PrometheusMetricSink;
 pub(crate) use log_sink::LogCrateSink;
+pub use prometheus_sink::PrometheusMetricSink;
 
-/// A receiver of the metrics that plugins define, and of a report for each failed callout.
+/// A sink for the metrics plugins define and for failed callouts.
 ///
-/// A plugin can read its own metrics whatever sink you pass, because the runtime keeps their
-/// values. Pass a sink in [WasmServices::metric_sink](crate::WasmServices::metric_sink) to publish the
-/// metrics, for example [PrometheusMetricSink].
+/// Implement this to publish plugin metrics to your own metrics system, or use
+/// [PrometheusMetricSink]. Set your sink in
+/// [WasmServices::metric_sink](crate::WasmServices::metric_sink). The runtime keeps the metric
+/// values itself, so plugins can read their metrics back whichever sink is set, including the
+/// default one, which publishes nothing.
+///
+/// When you replace a runtime to reload plugins, pass the same sink to the new runtime. The new
+/// runtime registers its metrics from scratch, so a shared sink will see
+/// [register_metric](Self::register_metric) again for a VM id and name it already knows. When the
+/// old runtime is dropped, it subtracts what its gauges added through their recorders, which
+/// leaves a gauge on a shared sink at the sum over the runtimes still alive.
 pub trait WasmMetricSink: Send + Sync {
-    /// Return the recorder of a metric that a plugin defined for the first time.
+    /// Return a recorder for a metric a plugin has defined.
     ///
-    /// The runtime calls this once for each VM id and name, and sends each later change of the
-    /// metric to the recorder. By default it returns `None`, and the metric is not published.
+    /// This is called the first time a runtime sees `proxy_define_metric` for a given VM id and
+    /// name. Every later change to the metric is passed to the recorder you return. Return `None`
+    /// to leave the metric unpublished, which is what the default implementation does.
     fn register_metric(&self, _metric: &WasmMetric) -> Option<Box<dyn WasmMetricRecorder>> {
         None
     }
 
-    /// Receive a callout of the plugin `plugin_name` that failed, with the reason in `failure`. By default it
+    /// Report a failed callout made by the plugin `plugin_name`.
+    ///
+    /// This is called for each callout that fails, with the reason in `failure`. By default it
     /// does nothing.
     fn callout_failed(&self, _plugin_name: &str, _failure: CalloutFailure) {}
 }
 
-/// The receiver of the changes that plugins make to one metric.
+/// A recorder for the changes plugins make to one metric.
+///
+/// You return one from [WasmMetricSink::register_metric]. A counter or gauge only calls
+/// [add](Self::add) and a histogram only calls [record](Self::record). Both do nothing by default.
 pub trait WasmMetricRecorder: Send + Sync {
-    /// Add `delta` to a counter or a gauge. A counter receives only positive deltas.
+    /// Add `delta` to a counter or gauge.
+    ///
+    /// A counter only gets positive deltas. A gauge gets negative ones as well, including
+    /// when its runtime is dropped and subtracts what it had added.
     fn add(&self, _delta: i64) {}
 
-    /// Record a value of a histogram.
+    /// Record one value in a histogram.
     fn record(&self, _value: u64) {}
 }
 
-/// A metric that a plugin defined.
+/// A metric defined by a plugin.
 ///
-/// The VM id and the name come from the plugin as bytes. Bytes that are not valid UTF-8 become
-/// the replacement character.
+/// The VM id and the name are raw bytes on the plugin side. They are converted lossily here, so
+/// any invalid UTF-8 becomes `U+FFFD`.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WasmMetric {
-    /// The VM id of the plugin. Plugins with the same VM id share their metrics.
+    /// The VM id of the plugin that defined the metric. Plugins with the same VM id share metrics.
     pub vm_id: String,
-    /// The name that the plugin passed to `proxy_define_metric`.
+    /// The name the plugin passed to `proxy_define_metric`.
     pub name: String,
-    /// The type of the metric.
+    /// The kind of metric.
     pub kind: WasmMetricKind,
 }
 
-/// The type of a [WasmMetric].
+/// The kind of a [WasmMetric].
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WasmMetricKind {
-    /// A value that only grows.
+    /// A value that only increases.
     Counter,
-    /// A value that grows and shrinks.
+    /// A gauge that plugins can raise, lower, or set.
     Gauge,
     /// A distribution of recorded values.
     Histogram,
 }
 
-/// Why a callout of a plugin failed.
+/// The reason a plugin's callout failed.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CalloutFailure {
-    /// The callout, or a read or a write of its connection, reached its timeout before the
-    /// response header.
+    /// The callout timed out before its response header was received, either as a whole or on a
+    /// single read or write.
     Timeout,
-    /// The [CalloutUpstreams](crate::CalloutUpstreams) returned no peer for the upstream name.
+    /// [CalloutUpstreams](crate::CalloutUpstreams) did not return a peer for the upstream.
     NoPeer,
-    /// The runtime was already sending
-    /// [max_callouts_in_flight](crate::WasmServices::max_callouts_in_flight) callouts.
+    /// The runtime already had
+    /// [max_callouts_in_flight](crate::WasmServices::max_callouts_in_flight) callouts in flight.
     Overflow,
-    /// The connection or the TLS handshake reached its timeout.
+    /// Connecting to the peer, or the TLS handshake with it, timed out.
     ConnectTimeout,
-    /// The connection failed for another reason.
+    /// Connecting to the peer failed for any other reason.
     ConnectFailed,
-    /// The peer sent a response that is not valid HTTP.
+    /// The peer's response was not valid HTTP.
     ProtocolError,
-    /// The connection closed before the response header.
+    /// The connection was closed, or failed in some other way, before the response header was
+    /// received.
     ConnectionClosed,
-    /// The callout failed after the response header.
+    /// The callout failed or timed out after the response header was received.
     FailedAfterHeader,
-    /// The response body is over
+    /// The response body exceeded
     /// [callout_response_limit](crate::WasmPluginConf::callout_response_limit).
     ResponseTooLarge,
-    /// The task that sends the callout panicked, or no tokio runtime was running.
+    /// The task sending the callout panicked, or there was no tokio runtime to spawn it on.
     TaskFailed,
 }
 
@@ -111,7 +129,9 @@ impl std::fmt::Display for CalloutFailure {
 }
 
 impl CalloutFailure {
-    /// Return the name of the failure in snake case, for example `connect_timeout`.
+    /// Return the failure as a snake_case string, e.g. `connect_timeout`.
+    ///
+    /// `Display` writes the same string.
     pub fn as_str(&self) -> &'static str {
         match self {
             CalloutFailure::Timeout => "timeout",
@@ -128,7 +148,7 @@ impl CalloutFailure {
     }
 }
 
-/// The default sink, which publishes no metric and counts no failed callout.
+/// The default sink, which publishes nothing.
 pub(crate) struct NoMetricSink;
 
 impl WasmMetricSink for NoMetricSink {}

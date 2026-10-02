@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The start of a guest: its root context, `proxy_on_vm_start`, and `proxy_on_configure`.
+//! Guest startup
+//!
+//! Starting a guest creates its root context, then runs `proxy_on_vm_start` and
+//! `proxy_on_configure`.
 
 use super::events::{GuestAddress, RootCallbackLink, SlotIndex};
 use super::{GuestPool, Loaded};
@@ -23,13 +26,13 @@ use pingora_error::Result;
 use proxy_wasm_host::abi::v0_2_1::{Callback, GuestError};
 use std::sync::Arc;
 
-/// A guest that started, with the callouts that its root sent while it started.
+/// A started guest and the callouts its root context sent during startup.
 pub(super) struct StartedGuest {
     pub(super) loaded: Loaded,
     pub(super) root_callouts: Vec<AcceptedCallout>,
 }
 
-/// How a start ended when the guest did not fail.
+/// The outcome of a startup in which no callback failed.
 enum StartOutcome {
     Started,
     Refused(Callback),
@@ -38,14 +41,20 @@ enum StartOutcome {
 impl GuestPool {
     /// Build a guest for `slot` and start it.
     ///
-    /// The start runs with the root stream state, so the plugin reads the fixed properties in
-    /// `proxy_on_configure`.
+    /// Startup runs under the root stream state, which lets the plugin read the fixed properties
+    /// from `proxy_on_vm_start` and `proxy_on_configure`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if the guest cannot be built, if
+    /// creating the root context or one of the two callbacks fails, or if one of the callbacks
+    /// returns `false`.
     pub(super) fn start_guest(&self, slot: usize) -> Result<StartedGuest> {
         let mut guest = self
             .spec
             .build()
-            .map_err(|e| plugin_failure(&self.name, "could not be built", e))?;
-        // Callout ids are unique only within one guest, so each guest needs its own service
+            .map_err(|e| plugin_failure(&self.name, "failed to build guest", e))?;
+        // Callout ids are only unique within a guest, so every guest gets its own service
         let callout_service = Arc::new(GuestCalloutService::new(self.callout_conf.clone()));
         let services = guest
             .services()
@@ -55,7 +64,13 @@ impl GuestPool {
         let mut scope = guest.enter(RootStream::new(self.root_callback_plugin.clone()));
         let root = match scope.on_context_create(None) {
             Ok(root) => root,
-            Err(e) => return Err(plugin_failure(&self.name, "failed to start", e)),
+            Err(e) => {
+                return Err(plugin_failure(
+                    &self.name,
+                    "failed to create root context",
+                    e,
+                ))
+            }
         };
         let plugin = self.plugin.clone();
         let (outcome, root_callouts) = callout_service.record_callouts(root, || {
@@ -73,10 +88,10 @@ impl GuestPool {
             Ok(StartOutcome::Refused(callback)) => {
                 return Err(plugin_unavailable(
                     &self.name,
-                    &format!("refused to start in {callback}"),
+                    &format!("{callback} returned false, guest not started"),
                 ))
             }
-            Err(e) => return Err(plugin_failure(&self.name, "failed to start", e)),
+            Err(e) => return Err(plugin_failure(&self.name, "guest failed to start", e)),
         }
         let address = GuestAddress {
             slot: SlotIndex {

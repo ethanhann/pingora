@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The properties that the crate reads from the session and the headers of a request.
+//! Built-in properties
+//!
+//! Properties resolved from the session and from the request and response headers.
 
 use crate::stream_state::RequestHeaders;
 use http::header::CONTENT_LENGTH;
@@ -22,7 +24,8 @@ use pingora_http::ResponseHeader;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime};
 
-/// Facts about a request that are not in its headers, recorded by the phases.
+/// Per-request values for the built-in properties that the headers do not have, recorded as
+/// the phases run.
 #[derive(Debug, Default)]
 pub(crate) struct RequestFacts {
     pub(crate) client_address: Option<SocketAddr>,
@@ -31,18 +34,18 @@ pub(crate) struct RequestFacts {
     pub(crate) start: Option<RequestStart>,
     pub(crate) request_body_bytes: usize,
     pub(crate) upstream_address: Option<SocketAddr>,
-    /// The status of the response, which `response_filter` records.
+    /// The response status, recorded in `response_filter`.
     pub(crate) response_code: Option<u16>,
-    /// Facts that are known only in `logging`.
+    /// Values only known once `logging` runs.
     pub(crate) logging: Option<LoggingFacts>,
 }
 
-/// The time that `request_filter` started.
+/// When `request_filter` started.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RequestStart {
-    /// The wall time, for `request.time`.
+    /// Wall-clock time, used for `request.time`.
     pub(crate) wall_time: SystemTime,
-    /// The monotonic time, for `request.duration`.
+    /// Monotonic time, used for `request.duration`.
     pub(crate) monotonic_time: Instant,
 }
 
@@ -56,27 +59,28 @@ impl TlsFacts {
     pub(crate) fn new(digest: &SslDigest) -> Self {
         TlsFacts {
             has_peer_certificate: !digest.cert_digest.is_empty(),
-            version: envoy_tls_version(&digest.version),
+            version: openssl_tls_version(&digest.version),
         }
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct LoggingFacts {
-    /// The time from the start of `request_filter`, or `None` when it did not run.
+    /// Time elapsed since `request_filter` started, or `None` if it never ran.
     pub(crate) duration: Option<Duration>,
     pub(crate) response_body_bytes: usize,
 }
 
-/// The headers that a plugin can read in the running callback.
+/// The headers present during the current callback, for the properties derived from them.
 pub(crate) struct ReadableHeaders<'a> {
     pub(crate) request: Option<&'a RequestHeaders>,
     pub(crate) response: Option<&'a ResponseHeader>,
 }
 
-/// Write the built-in property whose path segments are joined in `joined_path` to `out`.
+/// Append the value of a built-in property to `out`.
 ///
-/// Return `false` when the property is not a built-in one or has no value yet.
+/// `joined_path` is the property path with its segments joined by `\0`. Returns `false` if the
+/// path is not a built-in property or its value is not known yet.
 pub(crate) fn write_built_in_property(
     joined_path: &[u8],
     facts: &RequestFacts,
@@ -148,10 +152,10 @@ pub(crate) fn write_built_in_property(
     }
 }
 
-/// Return the TLS version in the form of Envoy and OpenSSL, such as `TLSv1.3`.
+/// Normalize a TLS version string to the form OpenSSL uses, e.g. `TLSv1.3`.
 ///
-/// rustls writes `TLSv1_3`, and s2n writes `TLS13`.
-fn envoy_tls_version(version: &str) -> String {
+/// rustls reports `TLSv1_3` and s2n reports `TLS13`. Anything else is passed through unchanged.
+fn openssl_tls_version(version: &str) -> String {
     match version {
         "TLSv1_3" | "TLS13" => "TLSv1.3".to_string(),
         "TLSv1_2" | "TLS12" => "TLSv1.2".to_string(),
@@ -235,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn the_tls_version_has_the_form_of_envoy_for_each_backend() {
+    fn tls_version_is_normalized_for_each_tls_backend() {
         for version in ["TLSv1_3", "TLSv1.3", "TLS13"] {
             let facts = RequestFacts {
                 tls: Some(tls(version, Vec::new())),
@@ -251,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn the_request_properties_come_from_the_header_and_the_facts() {
+    fn request_properties_come_from_header_and_facts() {
         let mut header = RequestHeader::build("POST", b"/a/b?c=d", None).unwrap();
         header.insert_header("host", "shop.test").unwrap();
         header.insert_header("content-length", "12").unwrap();
@@ -283,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn a_property_with_no_value_yet_is_not_found() {
+    fn property_without_value_is_not_found() {
         let facts = RequestFacts::default();
 
         for key in [
@@ -302,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn the_response_code_reads_in_a_phase_with_no_response_header() {
+    fn response_code_is_readable_without_response_header() {
         let facts = RequestFacts {
             response_code: Some(201),
             ..RequestFacts::default()
@@ -314,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn the_duration_is_not_found_for_a_request_with_no_start() {
+    fn duration_is_not_found_without_request_start() {
         let facts = RequestFacts {
             logging: Some(LoggingFacts {
                 duration: None,

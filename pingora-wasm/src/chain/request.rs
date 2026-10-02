@@ -26,28 +26,28 @@ use proxy_wasm_host::abi::v0_2_1::types::{Action, StreamType};
 use proxy_wasm_host::abi::v0_2_1::StreamKind;
 use std::time::{Instant, SystemTime};
 
-const PAUSED_A_REQUEST: &str = "paused a request";
+const PAUSED_A_REQUEST: &str = "paused on request headers with no callout pending";
 
 impl WasmCtx {
-    /// Run `proxy_on_request_headers` of each plugin, in chain order.
+    /// Run `proxy_on_request_headers` for each plugin, in chain order.
     ///
-    /// Call it from `request_filter`, after the checks your proxy runs itself. Plugins can read
-    /// and change the request headers.
+    /// Call this from your `request_filter`, after any checks your proxy does itself. Plugins can
+    /// read and change the request headers. This filter does nothing for a subrequest.
     ///
-    /// A plugin can pause the request while it waits for the response to a callout. This phase
-    /// then waits too, and passes the response to the `proxy_on_http_call_response` of the
-    /// plugin, where the plugin can change the request headers before it continues. The plugins
-    /// after it in the chain run once it continues.
+    /// A plugin may pause the request while waiting for a callout, in which case this filter
+    /// waits with it. The callout response is delivered to the plugin's
+    /// `proxy_on_http_call_response`, where it can still change the request headers. The rest of
+    /// the chain runs once the plugin continues.
     ///
-    /// When a plugin sends its own response, the later plugins do not run and the earlier
-    /// plugins see the response headers. The response comes back as [RequestOutcome::Respond].
-    ///
-    /// Subrequests do not run the plugins.
+    /// A plugin may send its own response instead. The plugins after it are not run, and it and
+    /// the plugins ahead of it run `proxy_on_response_headers` on that response before it is
+    /// returned as [RequestOutcome::Respond].
     ///
     /// # Errors
     ///
-    /// An error of type [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) when a plugin traps or
-    /// fails, or when a plugin pauses the request and has no callout to wait for.
+    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if a plugin traps or otherwise fails,
+    /// if a plugin has no guest available, or if a plugin pauses the request with no callout
+    /// pending. The same error is returned if the runtime's threads cannot be started.
     pub async fn request_filter<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -94,7 +94,7 @@ impl WasmCtx {
         Ok(RequestOutcome::Continue)
     }
 
-    /// Create the context of the plugin at `position`, and run its `proxy_on_request_headers`.
+    /// Create a context for the plugin at `position` and run its `proxy_on_request_headers`.
     fn run_request_headers_at<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -113,7 +113,7 @@ impl WasmCtx {
         });
         let context = match created {
             Ok(context) => context,
-            Err(e) => return Err(locked.guest_failure("could not create a context", e)),
+            Err(e) => return Err(locked.guest_failure("failed to create a context", e)),
         };
         pool.opened(slot);
         self.records[position] = Some(PluginRecord {
@@ -130,12 +130,14 @@ impl WasmCtx {
         self.request_out(session.req_header_mut());
         match action {
             Ok(action) => Ok(action),
-            Err(e) => Err(locked.guest_failure("failed in on_request_headers", e)),
+            Err(e) => Err(locked.guest_failure("proxy_on_request_headers failed", e)),
         }
     }
 
-    /// Return the response that the plugin at `position` sent to the request headers, after the
-    /// plugins before it ran on its header.
+    /// Turn the response sent by the plugin at `position` into a [RequestOutcome::Respond].
+    ///
+    /// That plugin and the ones ahead of it in the chain run `proxy_on_response_headers` on the
+    /// response first.
     fn respond_to_request_headers<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -151,7 +153,9 @@ impl WasmCtx {
 }
 
 impl WasmCtx {
-    /// Record the facts of the request that the headers do not have, for the properties.
+    /// Record what the built-in properties need and the request header does not have.
+    ///
+    /// These are the client and server addresses, the TLS digest, and the start time.
     fn record_request_facts<DS: DownstreamSession>(&mut self, session: &Session<DS>) {
         let facts = &mut self.stream().request_facts;
         facts.client_address = session.client_addr().and_then(|a| a.as_inet()).copied();
@@ -182,7 +186,7 @@ mod tests {
     use crate::{RequestOutcome, ERR_PLUGIN_FAILED};
 
     #[tokio::test]
-    async fn a_plugin_response_is_returned_to_the_caller() {
+    async fn plugin_response_is_returned_as_respond() {
         let (_runtime, mut ctx) = one_plugin(wat_plugin("respond-unit", TEAPOT));
         let (mut session, _client) = session(GET).await;
 
@@ -197,7 +201,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_guest_error_restores_the_session_header() {
+    async fn guest_error_restores_session_header() {
         let (_runtime, mut ctx) = one_plugin(wat_plugin("bad-unit", "i32.const 7"));
         let (mut session, _client) = session(GET).await;
 
@@ -209,18 +213,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pause_without_a_plugin_response_fails() {
+    async fn pause_without_callout_fails() {
         let (_runtime, mut ctx) = one_plugin(wat_plugin("pause-unit", "i32.const 1"));
         let (mut session, _client) = session(GET).await;
 
         let err = ctx.request_filter(&mut session).await.unwrap_err();
 
         assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
-        assert!(err.to_string().contains("paused a request"));
+        assert!(err.to_string().contains("paused on request headers"));
     }
 
     #[tokio::test]
-    async fn a_trap_logs_one_line_for_the_guest_that_was_replaced() {
+    async fn trap_logs_one_line_for_replaced_guest() {
         record_crate_logs();
         let mut conf = wat_plugin("trap-log-unit", "unreachable");
         conf.name = "replaced-once".to_string();
@@ -234,12 +238,12 @@ mod tests {
         let mut lines = crate_log_lines_with("replaced-once");
         lines.retain(|line| line.contains("guest"));
         assert_eq!(lines.len(), 1, "{lines:?}");
-        let want = "wasm plugin replaced-once replaced the guest of slot 0 after a failure: ";
+        let want = "wasm plugin replaced-once: guest in slot 0 replaced after failure: ";
         assert!(lines[0].starts_with(want), "{lines:?}");
     }
 
     #[tokio::test]
-    async fn a_trap_replaces_the_guest_and_resets_its_counts() {
+    async fn trap_replaces_guest_and_resets_open_contexts() {
         let (runtime, mut ctx) = one_plugin(wat_plugin("trap-unit", "unreachable"));
         let (mut session, _client) = session(GET).await;
 

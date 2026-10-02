@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Ticks, queue wakes, root callouts, held contexts, and metrics.
+//! Plugin services tests
+//!
+//! Covers ticks, shared queues, callouts from the root context, contexts kept after their
+//! request, and metrics.
 
 use super::get;
 use crate::utils::{echo_origin, eventually, guest_lines, init, metrics_text, runtime};
@@ -26,7 +29,7 @@ fn count_lines_with(text: &str) -> usize {
 }
 
 #[tokio::test]
-async fn a_plugin_logs_3_to_8_ticks_in_6_periods() {
+async fn plugin_ticks_at_configured_period() {
     init().await;
     let (origin, _) = echo_origin().await;
     get(6403, "/", origin.addr().port(), &[]).await;
@@ -40,7 +43,7 @@ async fn a_plugin_logs_3_to_8_ticks_in_6_periods() {
 }
 
 #[tokio::test]
-async fn a_queue_item_from_a_request_reaches_one_root() {
+async fn queue_item_from_request_reaches_one_root_context() {
     init().await;
     let (origin, _) = echo_origin().await;
 
@@ -52,7 +55,7 @@ async fn a_queue_item_from_a_request_reaches_one_root() {
 }
 
 #[tokio::test]
-async fn a_guest_counter_shows_in_the_prometheus_output() {
+async fn plugin_counter_is_published_to_prometheus() {
     init().await;
     let (origin, _) = echo_origin().await;
 
@@ -68,7 +71,7 @@ async fn a_guest_counter_shows_in_the_prometheus_output() {
 }
 
 #[tokio::test]
-async fn a_root_callout_from_a_tick_delivers_its_response() {
+async fn callout_from_tick_delivers_response() {
     init().await;
     let (origin, _) = echo_origin().await;
 
@@ -78,7 +81,7 @@ async fn a_root_callout_from_a_tick_delivers_its_response() {
 }
 
 #[tokio::test]
-async fn a_held_context_ends_after_the_guest_calls_proxy_done() {
+async fn held_context_ends_after_proxy_done() {
     init().await;
     let (origin, _) = echo_origin().await;
     let runtime = runtime(6410);
@@ -90,7 +93,7 @@ async fn a_held_context_ends_after_the_guest_calls_proxy_done() {
 }
 
 #[tokio::test]
-async fn a_held_context_receives_a_failure_for_a_callout_of_its_request() {
+async fn held_context_gets_failure_for_callout_of_ended_request() {
     init().await;
     let (origin, _) = echo_origin().await;
     let runtime = runtime(6412);
@@ -102,7 +105,7 @@ async fn a_held_context_receives_a_failure_for_a_callout_of_its_request() {
 }
 
 #[tokio::test]
-async fn a_callout_that_times_out_counts_as_a_failure() {
+async fn callout_timeout_counts_as_failure() {
     init().await;
     let (origin, _) = echo_origin().await;
 

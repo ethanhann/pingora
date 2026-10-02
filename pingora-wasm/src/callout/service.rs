@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The callout service of a guest.
+//! Per-guest callout service
 
 use super::headers::callout_request_header;
 use super::{AcceptedCallout, PluginCalloutConf};
@@ -25,21 +25,22 @@ use proxy_wasm_host::abi::v0_2_1::{
 use std::mem;
 use std::sync::Arc;
 
-/// The state of the guest call in progress.
+/// State of the guest call in progress.
 #[derive(Default)]
 struct GuestCallState {
-    /// The stream context that the call is for.
+    /// The context the call was made for, or `None` outside of a guest call.
     calling_context: Option<ContextId>,
+    /// Callouts accepted so far during the call.
     accepted: Vec<AcceptedCallout>,
 }
 
-/// The service that accepts the callouts of one guest.
+/// The callout service of one guest.
 ///
-/// Callout ids are unique only within one guest, so each guest has its own service. During a
-/// guest call, the service accepts callouts only from the context that the call is for, which
-/// is the root context for a tick or a queue wake. A stream callback that switches to its root
-/// context cannot send a callout, because the root receives the result on another thread while
-/// the request goes on.
+/// Callout ids are only unique within a guest, so each guest has its own service. A callout is
+/// accepted only during a guest call, and only from the context the call was made for, which is
+/// the root context for `proxy_on_tick` and `proxy_on_queue_ready`. A stream callback that
+/// switches to its root context therefore cannot make a callout. The result would be delivered
+/// to the root context on the root callback thread while the request continued without it.
 pub(crate) struct GuestCalloutService {
     conf: Arc<PluginCalloutConf>,
     call_in_progress: Mutex<GuestCallState>,
@@ -53,8 +54,10 @@ impl GuestCalloutService {
         }
     }
 
-    /// Run `guest_call` for `context`, and return its result with the callouts that the guest
-    /// sent from that context during the call.
+    /// Run `guest_call` on behalf of `context` and collect the callouts made from that context.
+    ///
+    /// Returns the result of `guest_call` together with the callouts accepted while it ran.
+    /// Callouts left behind by an earlier call that unwound are discarded.
     pub(crate) fn record_callouts<R>(
         &self,
         context: ContextId,
@@ -80,7 +83,7 @@ impl Callouts for GuestCalloutService {
         let plugin = &self.conf.plugin_name;
         let mut call_in_progress = self.call_in_progress.lock();
         if call_in_progress.calling_context != Some(call.context) {
-            warn!("wasm plugin {plugin} sent a callout from a context other than its current request, so the callout is refused");
+            warn!("wasm plugin {plugin}: callout rejected, not sent from the context of the current callback");
             return Err(HttpCallRefusal::Failed);
         }
         let upstream = std::str::from_utf8(&request.upstream)
@@ -88,7 +91,7 @@ impl Callouts for GuestCalloutService {
             .filter(|upstream| self.conf.upstreams.has_upstream(plugin, upstream));
         let Some(upstream) = upstream else {
             let upstream = String::from_utf8_lossy(&request.upstream);
-            warn!("wasm plugin {plugin} sent a callout to the upstream {upstream}, which is not in callout_upstreams");
+            warn!("wasm plugin {plugin}: callout rejected, upstream {upstream} is not in callout_upstreams");
             return Err(HttpCallRefusal::UnknownUpstream);
         };
         let header = callout_request_header(plugin, &request.headers, request.body.len());
@@ -96,7 +99,7 @@ impl Callouts for GuestCalloutService {
             return Err(HttpCallRefusal::UnknownUpstream);
         };
         if !request.trailers.is_empty() {
-            debug!("wasm plugin {plugin} passed callout trailers, which are not sent");
+            debug!("wasm plugin {plugin}: callout trailers dropped, not supported");
         }
         call_in_progress.accepted.push(AcceptedCallout {
             id: callout,
@@ -149,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn a_service_accepts_a_callout_from_the_calling_context_to_a_known_upstream() {
+    fn service_accepts_only_calling_context_and_known_upstream() {
         let mut bad_header = post_to_authz();
         bad_header.push(("bad name", "value"));
         let bad_header = HttpCall::new(&b"authz"[..]).with_headers(pairs(&bad_header));
@@ -173,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_for_an_unknown_upstream_logs_the_plugin_and_the_upstream_name() {
+    fn unknown_upstream_rejection_logs_plugin_and_upstream() {
         record_crate_logs();
         let conf = PluginCalloutConf::new(
             "refused-plugin",
@@ -188,13 +191,13 @@ mod tests {
 
         assert_eq!(refused, Err(HttpCallRefusal::UnknownUpstream));
         let lines = crate_log_lines_with("refused-plugin");
-        let want = "wasm plugin refused-plugin sent a callout to the upstream audit, \
-                    which is not in callout_upstreams";
+        let want = "wasm plugin refused-plugin: callout rejected, \
+                    upstream audit is not in callout_upstreams";
         assert_eq!(lines, [want]);
     }
 
     #[test]
-    fn an_accepted_callout_has_the_request_that_the_plugin_passed() {
+    fn accepted_callout_carries_plugin_request() {
         let service = authz_service();
 
         let (_, accepted) =
@@ -210,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn a_service_refuses_a_callout_outside_of_a_guest_call() {
+    fn service_rejects_callout_outside_guest_call() {
         let service = authz_service();
 
         let before = send_from(&service, 2, call_to(b"authz"));
@@ -222,12 +225,12 @@ mod tests {
     }
 
     #[test]
-    fn a_guest_call_starts_with_no_callout_of_an_earlier_call() {
+    fn callouts_of_unwound_guest_call_are_discarded() {
         let service = authz_service();
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             service.record_callouts(context(2), || {
                 send_from(&service, 2, call_to(b"authz")).unwrap();
-                panic!("the guest call unwinds");
+                panic!("simulated unwind of a guest call");
             })
         }));
 

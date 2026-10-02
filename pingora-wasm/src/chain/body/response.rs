@@ -20,38 +20,39 @@ use pingora_error::Result;
 use pingora_proxy::Session;
 
 impl WasmCtx {
-    /// Run `proxy_on_response_body` of each plugin, in reverse chain order.
+    /// Run `proxy_on_response_body` for each plugin, in reverse chain order.
     ///
-    /// Call it from `response_body_filter` with the arguments of that filter, and return `Ok(None)`
-    /// from the filter. Only plugins with [response_body](crate::WasmPluginConf::response_body)
-    /// turned on run. Plugins can read and replace the body, and can read the request headers.
+    /// Call this from your `response_body_filter`, pass its arguments through, and return
+    /// `Ok(None)` from the filter. Only plugins that have
+    /// [response_body](crate::WasmPluginConf::response_body) enabled and export the callback are
+    /// run. By default no plugin runs on response bodies and this filter does nothing. It also
+    /// does nothing for a subrequest, after an upgrade, and once a plugin has sent its own
+    /// response.
     ///
-    /// A plugin can pause to wait for more of the body. This phase then holds the bytes for the
-    /// plugin and leaves an empty chunk for the downstream. On the next chunk, the plugin reads the
-    /// bytes it paused on and the new bytes together. A plugin can hold up to
-    /// [response_body_limit](crate::WasmPluginConf::response_body_limit) bytes.
+    /// Plugins can read and replace the body, and can read the request headers. A plugin that
+    /// changes the body length must remove `content-length` in `proxy_on_response_headers`. If a
+    /// plugin changes the body of a range response, `content-range` will no longer match it.
     ///
-    /// A plugin can also pause a chunk while it waits for a callout, and this phase waits with
-    /// it. When the plugin continues, the bytes that it holds go to the next plugin.
+    /// A plugin may pause to buffer more of the body. Its bytes are then held back, up to
+    /// [response_body_limit](crate::WasmPluginConf::response_body_limit), and the filter leaves
+    /// an empty chunk in `body`, which Pingora does not write, so nothing reaches the downstream
+    /// for it. With the next chunk the plugin sees the held bytes followed by the new ones. A
+    /// plugin may also pause while waiting for a callout, in which case this filter waits with
+    /// it, and the bytes it was holding move on to the next plugin once it continues.
     ///
-    /// A plugin that changes the length of the body must remove `content-length` in
-    /// `proxy_on_response_headers`. A plugin that changes the body of a range response leaves a
-    /// `content-range` that does not match the body.
-    ///
-    /// A plugin cannot add trailers to a response. A plugin built with the Rust SDK panics when it
+    /// Plugins cannot add trailers to a response. A plugin built with the Rust SDK panics if it
     /// writes a trailer in `proxy_on_response_body`, because the write returns `BadArgument`.
-    ///
-    /// By default no plugin runs on response bodies, and this phase does nothing. It also does
-    /// nothing for a subrequest and after an upgrade.
     ///
     /// # Errors
     ///
-    /// An error of type [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) when a plugin traps or fails,
-    /// when a plugin pauses the last chunk of a body and does not continue, or when a plugin sends
-    /// its own response. An error of type
-    /// [ERR_RESPONSE_BODY_TOO_LARGE](crate::ERR_RESPONSE_BODY_TOO_LARGE) when a plugin holds more
-    /// bytes than its limit. Pingora sent the response header before this phase,
-    /// so after an error the downstream receives a response that ends early.
+    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if a plugin traps or otherwise fails,
+    /// if a plugin pauses on the last chunk of the body and does not continue, or if a plugin
+    /// sends its own response. The same error is returned if an earlier phase of this request was
+    /// cancelled while a plugin was waiting for a callout. Returns
+    /// [ERR_RESPONSE_BODY_TOO_LARGE](crate::ERR_RESPONSE_BODY_TOO_LARGE) if a plugin holds more
+    /// bytes than its limit. Pingora has usually sent the response header before this phase, so
+    /// after an error the downstream receives a response that ends early. If the header has not
+    /// been sent yet, the default `fail_to_proxy` responds with the status of the error.
     pub async fn response_body_filter<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -89,7 +90,7 @@ mod tests {
     use crate::ERR_PLUGIN_FAILED;
 
     #[tokio::test]
-    async fn a_plugin_reads_the_chunks_it_held_as_one_body() {
+    async fn plugin_reads_held_chunks_as_one_body() {
         let plugins = vec![body_plugin("a", Wat::response_body(HOLD_THEN_REPLACE))];
         let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
         let mut chunks = [body_chunk("aaa"), body_chunk("bbb"), body_chunk("cc")];
@@ -107,7 +108,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_response_from_the_response_body_fails() {
+    async fn plugin_response_from_response_body_fails() {
         let plugins = vec![body_plugin("a", Wat::response_body(TEAPOT))];
         let (_runtime, mut ctx, mut session, mut client) = start_request(plugins, POST).await;
 
@@ -119,7 +120,7 @@ mod tests {
         assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
         assert!(err
             .to_string()
-            .contains("sent a response after the response header"));
+            .contains("response rejected, sent after the response header"));
         assert!(!ctx.plugin_responded());
         let written = read_downstream_after_marker(&mut session, &mut client).await;
         assert!(written.starts_with(MARKER_RESPONSE), "{written}");

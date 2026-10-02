@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The body phases and the trailer phase, and the pass over the plugins that the body phases use.
+//! Body and trailer filters
+//!
+//! The request body, response body, and response trailer filters are in this module, along with the
+//! pass over the chain that the two body filters share.
 
 mod direction;
 mod held;
@@ -36,25 +39,26 @@ use pingora_proxy::Session;
 use proxy_wasm_host::Buffer;
 use std::mem;
 
-/// The result of the body callbacks of a chain on one chunk.
+/// Outcome of running a chain's body callbacks on one chunk.
 pub(super) enum BodyOutcome {
-    /// The bytes that the last plugin returned.
+    /// The bytes to pass on, which are empty if a plugin is holding them back.
     Released(Bytes),
     /// The plugin at this position sent its own response.
     Respond(usize, Box<PluginResponse>),
 }
 
-/// The result of [WasmCtx::run_body_callbacks_from].
+/// Outcome of [WasmCtx::run_body_callbacks_from].
 enum BodyCallbacksOutcome {
-    /// Every plugin ran, or a plugin held its bytes or sent its own response.
+    /// The pass is over. Either every plugin ran, or one held its bytes or sent its own response.
     Finished(BodyOutcome),
-    /// The plugin at this step paused and has a callout to wait for.
+    /// The plugin at this step paused with a callout pending.
     WaitsForCallout(usize),
 }
 
-/// Return what a body filter leaves in `body` for Pingora.
+/// Convert the output of a body pass into what the filter leaves in `body`.
 ///
-/// Pingora ends the body on `None`, so an empty chunk stays `Some` until the end of the stream.
+/// Pingora treats `None` from `request_body_filter` as the end of the request body, so empty
+/// output only becomes `None` at the end of the stream.
 pub(super) fn filter_output(output: Bytes, end_of_stream: bool) -> Option<Bytes> {
     if output.is_empty() && end_of_stream {
         None
@@ -64,7 +68,10 @@ pub(super) fn filter_output(output: Bytes, end_of_stream: bool) -> Option<Bytes>
 }
 
 impl WasmCtx {
-    /// Return `true` when a body phase does not run for this request.
+    /// Return `true` if the body filter for `direction` has nothing to do for this request.
+    ///
+    /// That is the case when no plugin in the chain runs on that body, once a plugin has sent its
+    /// own response, for a subrequest, and after an upgrade.
     pub(super) fn skips_body<DS: DownstreamSession>(
         &self,
         session: &Session<DS>,
@@ -80,8 +87,11 @@ impl WasmCtx {
             || session.was_upgraded()
     }
 
-    /// Run the body callback of each plugin on `chunk`, in the order of `direction`, and wait
-    /// for the callouts of a plugin that pauses to wait for them.
+    /// Run the body callback of each plugin on `chunk`, waiting for callouts along the way.
+    ///
+    /// Plugins run in the order given by `direction`. When a plugin pauses with a callout pending,
+    /// the pass waits for it. Once the plugin continues, the bytes it was holding are passed to
+    /// the plugins after it.
     pub(super) async fn run_body_callbacks<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -122,7 +132,13 @@ impl WasmCtx {
         }
     }
 
-    /// Return an error when the plugin at `position` cannot hold the bytes that it paused on.
+    /// Check that the plugin at `position` may keep holding the bytes it paused on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) at the end of the stream, where no
+    /// later chunk can release the bytes, and the too-large error of `direction` if the plugin
+    /// holds more than its limit.
     fn check_body_can_be_held(
         &self,
         direction: BodyDirection,
@@ -130,7 +146,10 @@ impl WasmCtx {
         end_of_stream: bool,
     ) -> Result<()> {
         if end_of_stream {
-            return Err(self.plugin_error(position, "paused a body at its end"));
+            return Err(self.plugin_error(
+                position,
+                "paused on the last body chunk with no callout pending",
+            ));
         }
         let pool = self.pool_at(position);
         let size = self.held.len(direction, position);
@@ -138,7 +157,7 @@ impl WasmCtx {
             return Error::e_explain(
                 direction.too_large(),
                 format!(
-                    "wasm plugin {} holds {size} body bytes, more than its limit",
+                    "wasm plugin {}: {size} held body bytes exceed its limit",
                     pool.name
                 ),
             );
@@ -146,10 +165,12 @@ impl WasmCtx {
         Ok(())
     }
 
-    /// Run the body callback of each plugin on `chunk`, from `first_step` of the pass.
+    /// Run the body callbacks on `chunk`, starting at `first_step` of the pass.
     ///
-    /// Each plugin receives what the plugin before it returned. When a plugin pauses, it holds the
-    /// bytes, and the plugins after it do not run.
+    /// Each plugin gets the output of the one before it, preceded by any bytes it was already
+    /// holding. The pass stops early when a plugin pauses, which leaves its bytes held, when a
+    /// plugin sends its own response, and when there is nothing left to pass on before the end of
+    /// the stream. The bytes of a plugin whose callback fails stay held as well.
     fn run_body_callbacks_from<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -250,7 +271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_held_chunk_leaves_empty_bytes() {
+    async fn held_chunk_leaves_empty_bytes() {
         let plugins = vec![body_plugin("a", Wat::request_body(HOLD))];
         let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
         let mut body = body_chunk("abc");
@@ -264,7 +285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_request_body_runs_the_plugins_in_chain_order() {
+    async fn request_body_runs_plugins_in_chain_order() {
         let plugins = vec![
             body_plugin("a", Wat::request_body(MARK_A_REQUEST)),
             body_plugin("b", Wat::request_body(MARK_B_REQUEST)),
@@ -280,7 +301,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_response_body_runs_the_plugins_in_reverse_order() {
+    async fn response_body_runs_plugins_in_reverse_order() {
         let plugins = vec![
             body_plugin("a", Wat::response_body(MARK_A_RESPONSE)),
             body_plugin("b", Wat::response_body(MARK_B_RESPONSE)),
@@ -296,7 +317,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_that_holds_gives_the_next_plugin_nothing_until_it_continues() {
+    async fn next_plugin_runs_once_held_bytes_are_released() {
         let plugins = vec![
             body_plugin("hold", Wat::request_body(HOLD)),
             body_plugin("mark", Wat::request_body(MARK_B_REQUEST)),
@@ -317,7 +338,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_chunk_of_zero_bytes_runs_no_plugin() {
+    async fn empty_chunk_runs_no_plugin() {
         let plugins = vec![body_plugin("a", Wat::request_body(MARK_AND_HOLD))];
         let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
         let mut chunks = [body_chunk("x"), body_chunk(""), body_chunk("y")];
@@ -332,7 +353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_with_its_body_setting_off_does_not_run() {
+    async fn plugin_with_request_body_disabled_does_not_run() {
         let mut conf = body_plugin("a", Wat::request_body(MARK_A_REQUEST));
         conf.request_body = false;
         let (_runtime, mut ctx, mut session, _client) = start_request(vec![conf], POST).await;
@@ -346,7 +367,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_chain_with_its_body_settings_off_takes_no_slot_lock() {
+    async fn chain_with_body_phases_disabled_takes_no_slot_lock() {
         let mut conf = body_plugin("a", both(MARK_A_REQUEST, MARK_A_RESPONSE));
         conf.request_body = false;
         conf.response_body = false;
@@ -375,7 +396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pause_at_the_end_of_the_stream_fails() {
+    async fn pause_at_end_of_stream_fails() {
         let plugins = vec![body_plugin("a", Wat::response_body(PAUSE))];
         let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
 
@@ -385,11 +406,11 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
-        assert!(err.to_string().contains("paused a body at its end"));
+        assert!(err.to_string().contains("paused on the last body chunk"));
     }
 
     #[tokio::test]
-    async fn a_held_request_body_over_its_limit_fails() {
+    async fn held_request_body_over_limit_fails() {
         let (_runtime, mut ctx, mut session, _client) =
             start_request(hold_with_a_limit_of_4(), POST).await;
 
@@ -402,7 +423,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_held_response_body_over_its_limit_fails() {
+    async fn held_response_body_over_limit_fails() {
         let (_runtime, mut ctx, mut session, _client) =
             start_request(hold_with_a_limit_of_4(), POST).await;
 
@@ -415,7 +436,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_releases_a_body_over_its_limit() {
+    async fn limit_does_not_apply_to_released_body() {
         let (_runtime, mut ctx, mut session, _client) =
             start_request(hold_with_a_limit_of_4(), POST).await;
         let mut last = body_chunk("cdef");
@@ -431,7 +452,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn none_ends_a_request_body() {
+    async fn none_ends_request_body() {
         let plugins = vec![body_plugin("a", Wat::request_body(HOLD))];
         let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
         ctx.request_body_filter(&mut session, &mut body_chunk("held"), false)
@@ -447,7 +468,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn none_does_not_end_a_response_body() {
+    async fn none_does_not_end_response_body() {
         let plugins = vec![body_plugin("a", Wat::response_body(HOLD))];
         let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
         ctx.response_body_filter(&mut session, &mut body_chunk("held"), false)
@@ -464,7 +485,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_request_with_no_body_runs_no_plugin() {
+    async fn request_without_body_runs_no_plugin() {
         let plugins = vec![body_plugin("a", Wat::request_body(MARK_A_REQUEST))];
         let (_runtime, mut ctx, mut session, _client) = start_request(plugins, GET).await;
         let mut body = None;
@@ -477,7 +498,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_upgraded_connection_runs_no_plugin() {
+    async fn upgraded_connection_runs_no_plugin() {
         let plugins = vec![body_plugin("a", both(MARK_A_REQUEST, MARK_A_RESPONSE))];
         let (_runtime, mut ctx, mut session, _client) = start_request(plugins, UPGRADE).await;
         ctx.request_body.expect_body();
@@ -503,7 +524,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_trap_rebuilds_the_guest_and_keeps_the_held_bytes() {
+    async fn trap_rebuilds_guest_and_keeps_held_bytes() {
         let plugins = vec![body_plugin("a", Wat::request_body(HOLD_THEN_TRAP))];
         let (runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
         ctx.request_body_filter(&mut session, &mut body_chunk("ab"), false)
@@ -516,7 +537,7 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
-        assert!(err.to_string().contains("failed in on_request_body"));
+        assert!(err.to_string().contains("proxy_on_request_body failed"));
         assert_eq!(ctx.held.take(BodyDirection::Request, 0), b"abcd");
         assert_eq!(session.req_header().raw_path(), b"/original");
         let slot = runtime.inner.pools[0].lock_slot(0);
@@ -524,7 +545,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_body_on_a_replaced_guest_fails() {
+    async fn body_fails_after_guest_is_replaced() {
         let plugins = vec![body_plugin("a", Wat::request_body(HOLD))];
         let (runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
         runtime.inner.pools[0].replace_slot(0);
@@ -535,6 +556,6 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
-        assert!(err.to_string().contains("lost the guest of this request"));
+        assert!(err.to_string().contains("guest for this request is gone"));
     }
 }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The sink that publishes plugin metrics in a Prometheus registry.
+//! Prometheus metric sink
 
 use super::{CalloutFailure, WasmMetric, WasmMetricKind, WasmMetricRecorder, WasmMetricSink};
 use log::warn;
@@ -26,26 +26,34 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 const CALLOUT_FAILURES_NAME: &str = "wasm_callout_failures_total";
-const CALLOUT_FAILURES_HELP: &str = "Callouts of wasm plugins that failed";
-const PLUGIN_METRIC_HELP: &str = "A metric of a wasm plugin";
+const CALLOUT_FAILURES_HELP: &str = "Total number of failed wasm plugin callouts";
+const PLUGIN_METRIC_HELP: &str = "Metric defined by a wasm plugin";
 const VM_ID_LABEL: &str = "vm_id";
 const PLUGIN_LABEL: &str = "plugin";
 const FAILURE_LABEL: &str = "failure";
-// The default buckets of Envoy, so a plugin written for Envoy gets the same distribution
+// The ABI gives a plugin no way to choose buckets, so every histogram gets this fixed set
 const HISTOGRAM_BUCKETS: [f64; 19] = [
     0.5, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0,
     60000.0, 300000.0, 600000.0, 1800000.0, 3600000.0,
 ];
 
-/// A [WasmMetricSink] that registers the metrics of plugins in a Prometheus registry.
+/// A [WasmMetricSink] that publishes plugin metrics to a Prometheus registry.
 ///
-/// Each plugin metric gets the label `vm_id`. A character that Prometheus does not permit in a
-/// name becomes `_`, so the name `waf.tx.total` of a plugin is `waf_tx_total` in Prometheus.
-/// Failed callouts are counted in `wasm_callout_failures_total`, with the labels `plugin` and
+/// Every plugin metric has a `vm_id` label. Characters Prometheus does not allow in a metric
+/// name are replaced with `_`, so a plugin's `waf.tx.total` is published as `waf_tx_total`.
+/// Failed callouts are counted in `wasm_callout_failures_total`, labeled with `plugin` and
 /// `failure`.
 ///
-/// Create one sink and pass it to each runtime that you build, including the runtimes that you
-/// build to reload plugins, because a registry accepts each name once.
+/// A metric is left unpublished, with one warning logged for its name, if its name is empty or
+/// rejected by Prometheus, if the registry already holds a collector under that name, if another
+/// plugin metric already maps to the same Prometheus name, or if it was first defined with a
+/// different kind. The plugin can still use such a metric as usual.
+///
+/// Create one sink and pass it to every runtime you build, including the ones you build to
+/// reload plugins. A registry accepts each metric name only once, so a second sink on the same
+/// registry cannot be created. With a shared sink, a reloaded plugin keeps reporting into the
+/// existing series. Counters and histograms continue from where they were, and a gauge drops by
+/// whatever the old runtime had added once that runtime is dropped.
 ///
 /// ```no_run
 /// use pingora_wasm::{PrometheusMetricSink, WasmServices};
@@ -62,7 +70,7 @@ pub struct PrometheusMetricSink {
     skipped_names: Mutex<HashSet<String>>,
 }
 
-/// The Prometheus vector of one cleaned name, and the plugin metric name it was created for.
+/// The vector registered under one Prometheus name, and the plugin metric name that claimed it.
 struct Family {
     name_in_plugin: String,
     vector: FamilyVector,
@@ -139,8 +147,8 @@ impl PrometheusMetricSink {
     ///
     /// # Errors
     ///
-    /// An error when `registry` already has `wasm_callout_failures_total`, for example from a
-    /// second sink on the same registry.
+    /// Returns an error if `wasm_callout_failures_total` is already registered in `registry`,
+    /// e.g. by another sink using the same registry.
     pub fn new(registry: Registry) -> prometheus::Result<Self> {
         let callout_failures = IntCounterVec::new(
             Opts::new(CALLOUT_FAILURES_NAME, CALLOUT_FAILURES_HELP),
@@ -155,10 +163,12 @@ impl PrometheusMetricSink {
         })
     }
 
-    /// Log once that the metric `name` of a plugin is not published, and why.
+    /// Warn, once per metric name, that a plugin metric is not being published.
+    ///
+    /// Always returns `None` so the caller can return it from `register_metric`.
     fn skip_metric(&self, name: &str, reason: &str) -> Option<Box<dyn WasmMetricRecorder>> {
         if self.skipped_names.lock().insert(name.to_string()) {
-            warn!("the wasm plugin metric {name} is not published in Prometheus, because {reason}");
+            warn!("wasm plugin metric {name} not published to Prometheus: {reason}");
         }
         None
     }
@@ -167,7 +177,7 @@ impl PrometheusMetricSink {
 impl WasmMetricSink for PrometheusMetricSink {
     fn register_metric(&self, metric: &WasmMetric) -> Option<Box<dyn WasmMetricRecorder>> {
         let Some(prometheus_name) = prometheus_name(&metric.name) else {
-            return self.skip_metric(&metric.name, "its name is empty");
+            return self.skip_metric(&metric.name, "name is empty");
         };
         let mut families = self.families.lock();
         let family = match families.entry(prometheus_name) {
@@ -176,12 +186,12 @@ impl WasmMetricSink for PrometheusMetricSink {
                 let vector = match FamilyVector::new(entry.key(), metric.kind) {
                     Ok(vector) => vector,
                     Err(e) => {
-                        let reason = format!("its name is not valid: {e}");
+                        let reason = format!("invalid name: {e}");
                         return self.skip_metric(&metric.name, &reason);
                     }
                 };
                 if let Err(e) = self.registry.register(vector.collector()) {
-                    let reason = format!("the registry refused it: {e}");
+                    let reason = format!("registration failed: {e}");
                     return self.skip_metric(&metric.name, &reason);
                 }
                 entry.insert(Family {
@@ -193,11 +203,11 @@ impl WasmMetricSink for PrometheusMetricSink {
         if family.name_in_plugin != metric.name {
             return self.skip_metric(
                 &metric.name,
-                "another plugin metric maps to the same Prometheus name",
+                "Prometheus name already taken by another plugin metric",
             );
         }
         if family.vector.kind() != metric.kind {
-            return self.skip_metric(&metric.name, "a plugin defined it with another type");
+            return self.skip_metric(&metric.name, "already defined with a different kind");
         }
         Some(family.vector.recorder(&metric.vm_id))
     }
@@ -209,10 +219,10 @@ impl WasmMetricSink for PrometheusMetricSink {
     }
 }
 
-/// Return `name` as a valid Prometheus name, or `None` for an empty name.
+/// Convert a plugin metric name into a valid Prometheus name.
 ///
-/// Each character that Prometheus does not permit becomes `_`, and a leading digit gets `_`
-/// before it.
+/// Characters Prometheus does not allow are replaced with `_`, and a name starting with a digit
+/// is prefixed with `_`. Returns `None` for an empty name.
 fn prometheus_name(name: &str) -> Option<String> {
     if name.is_empty() {
         return None;
@@ -253,7 +263,7 @@ struct HistogramRecorder(Histogram);
 
 impl WasmMetricRecorder for HistogramRecorder {
     fn record(&self, value: u64) {
-        // A Prometheus histogram holds f64 values, which lose precision only above 2^53
+        // Prometheus histograms take f64, which is exact for integers up to 2^53
         #[allow(clippy::cast_precision_loss)]
         self.0.observe(value as f64);
     }
@@ -298,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn two_vm_ids_on_one_sink_share_a_family_with_the_vm_id_as_label() {
+    fn vm_ids_share_family_with_vm_id_label() {
         let registry = Registry::new();
         let sink = PrometheusMetricSink::new(registry.clone()).unwrap();
         let first = sink.register_metric(&metric("a", "requests", WasmMetricKind::Counter));
@@ -313,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn a_metric_whose_type_or_prometheus_name_conflicts_is_not_published() {
+    fn conflicting_kind_or_prometheus_name_is_not_published() {
         let sink = PrometheusMetricSink::new(Registry::new()).unwrap();
         sink.register_metric(&metric("a", "a.b", WasmMetricKind::Counter));
 
@@ -326,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn a_second_sink_on_one_registry_is_an_error() {
+    fn second_sink_on_same_registry_fails() {
         let registry = Registry::new();
         let _first = PrometheusMetricSink::new(registry.clone()).unwrap();
 
@@ -336,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_callout_counts_with_its_plugin_and_failure() {
+    fn failed_callout_is_counted_by_plugin_and_failure() {
         let registry = Registry::new();
         let sink = PrometheusMetricSink::new(registry.clone()).unwrap();
 

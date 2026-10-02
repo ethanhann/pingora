@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The properties that plugins read.
+//! Property tests
+//!
+//! Covers the properties a plugin can read in the request, response, and logging phases.
 
 use super::{get, header};
 use crate::utils::{echo_origin, eventually, guest_messages, init};
@@ -23,7 +25,7 @@ fn decode_i64(bytes: &[u8]) -> Option<i64> {
 }
 
 #[tokio::test]
-async fn a_plugin_reads_the_request_properties() {
+async fn plugin_reads_request_properties() {
     init().await;
     let (origin, _) = echo_origin().await;
 
@@ -60,7 +62,7 @@ async fn a_plugin_reads_the_request_properties() {
 }
 
 #[tokio::test]
-async fn a_plugin_reads_the_upstream_and_the_response_code_in_the_response_phase() {
+async fn response_phase_reads_upstream_address_and_response_code() {
     init().await;
     let (origin, _) = echo_origin().await;
     let port = origin.addr().port();
@@ -80,7 +82,7 @@ async fn a_plugin_reads_the_upstream_and_the_response_code_in_the_response_phase
 }
 
 #[tokio::test]
-async fn a_plugin_reads_the_sizes_and_the_duration_in_proxy_on_log() {
+async fn proxy_on_log_reads_sizes_and_duration() {
     init().await;
     let (origin, _) = echo_origin().await;
 
@@ -91,7 +93,7 @@ async fn a_plugin_reads_the_sizes_and_the_duration_in_proxy_on_log() {
     let logged = guest_messages("logging-properties");
     let logged: Vec<_> = logged.iter().map(|value| decode_i64(value)).collect();
     let [request_size, response_size, duration] = logged[logged.len() - 3..] else {
-        unreachable!("three values were logged");
+        unreachable!("a slice of three values always matches");
     };
     assert_eq!((request_size, response_size), (Some(0), Some(body_size)));
     assert!(duration.is_some_and(|nanos| nanos > 0), "{duration:?}");

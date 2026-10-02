@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The header maps and the trailer map that a plugin reads and writes, with the handling of
-//! header names and values that they share.
+//! Header and trailer maps
+//!
+//! The maps a plugin reads and writes, along with the header name and value handling they share.
 
 mod request;
 mod response;
@@ -30,7 +31,7 @@ use std::ops::ControlFlow;
 
 pub(super) type WriteResult = Result<(), NotAllowed>;
 
-/// What a key refers to, found without an allocation.
+/// The kind of header a key refers to, classified without allocating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Name<'a> {
     Method,
@@ -68,7 +69,7 @@ pub(super) fn header_name(key: &[u8]) -> Result<HeaderName, NotAllowed> {
     HeaderName::from_bytes(key).map_err(|_| NotAllowed)
 }
 
-/// Return `key` as a header name, with the case that the guest used.
+/// Validate `key` as a header name and return it with the guest's casing preserved.
 fn name_of(key: &[u8]) -> Result<String, NotAllowed> {
     header_name(key)?;
     String::from_utf8(key.to_vec()).map_err(|_| NotAllowed)

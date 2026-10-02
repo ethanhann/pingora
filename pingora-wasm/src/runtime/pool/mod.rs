@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The guests of one plugin.
+//! Guest pool
 //!
-//! A guest runs one callback at a time, so a plugin keeps several guests, one in each slot. A
-//! request stays on the slot it started on, because its plugin context is in that guest.
+//! A guest runs one callback at a time, so each plugin gets a pool of guests, one per slot. A
+//! request stays on the slot it started on because its context is in that slot's guest.
 
 pub(crate) mod events;
 mod guest_start;
@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 const REBUILD_BACKOFF: Duration = Duration::from_secs(1);
 
-/// The body and trailer settings of a plugin.
+/// The body and trailer phases a plugin runs in, and its body limits.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PluginPhases {
     pub(crate) request: bool,
@@ -49,7 +49,7 @@ pub(crate) struct PluginPhases {
 }
 
 impl PluginPhases {
-    /// Return the names of the phases that the plugin runs on, for the log.
+    /// Return the phases the plugin runs in as a comma-separated list for logging.
     fn list(&self) -> String {
         let phases = [
             (true, "headers"),
@@ -75,16 +75,16 @@ struct Slot {
     failed_at: Mutex<Option<Instant>>,
 }
 
-/// The result of an attempt to lock the slot of a guest.
+/// The outcome of a non-blocking attempt to lock a guest's slot.
 pub(crate) enum SlotLockAttempt<'a> {
     LockedGuest(SlotGuard<'a>),
-    /// Another thread holds the slot.
+    /// The slot is locked by another thread.
     Busy,
-    /// The slot has another guest, or none.
+    /// The slot now holds a different guest, or none.
     GuestGone,
 }
 
-/// The settings of a pool and of the guests that it starts.
+/// Settings for a pool and the guests it starts.
 pub(crate) struct GuestPoolConf {
     pub(crate) pool_index: usize,
     pub(crate) name: String,
@@ -130,7 +130,7 @@ impl GuestPool {
             let mut guard = pool.slots[index].guest.lock();
             install_started_guest(&mut guard, started);
         }
-        // A guest that does not export the callback of a phase has nothing to run in it
+        // A phase is only worth running if the plugin exports its callback
         if let Some(loaded) = pool.slots[0].guest.lock().as_ref() {
             let exports = |callback| loaded.guest.exports_callback(callback);
             phases.request &= exports(Callback::RequestBody);
@@ -138,14 +138,19 @@ impl GuestPool {
             phases.trailers &= exports(Callback::ResponseTrailers);
         }
         pool.phases = phases;
-        info!("wasm plugin {} runs on {}", pool.name, phases.list());
+        info!("wasm plugin {}: runs on {}", pool.name, phases.list());
         Ok(pool)
     }
 
-    /// Pick a slot for a new request and lock it.
+    /// Lock a slot for a new request.
     ///
-    /// A free slot with a guest comes first. If there is none, one slot whose guest was lost is
-    /// rebuilt when its backoff has passed. When every slot is busy, this waits for one.
+    /// Slots are tried round-robin, and the first unlocked slot with a guest wins. Failing that,
+    /// one slot that lost its guest is rebuilt if its backoff has elapsed. Otherwise this blocks
+    /// until a slot with a guest is unlocked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if no slot has a guest.
     pub(crate) fn pick(&self) -> Result<(usize, SlotGuard<'_>)> {
         let count = self.slots.len();
         let first = self.next.fetch_add(1, Ordering::Relaxed) % count;
@@ -171,10 +176,10 @@ impl GuestPool {
                 return Ok((index, guard));
             }
         }
-        Err(plugin_unavailable(&self.name, "has no guest"))
+        Err(plugin_unavailable(&self.name, "no guest available"))
     }
 
-    /// Try to lock the slot of `guest` with no wait.
+    /// Try to lock the slot holding `guest` without blocking.
     pub(crate) fn try_lock_guest(&self, index: usize, guest: GuestId) -> SlotLockAttempt<'_> {
         let Some(guard) = self.slots[index].guest.try_lock() else {
             return SlotLockAttempt::Busy;
@@ -185,9 +190,9 @@ impl GuestPool {
         }
     }
 
-    /// Lock the slot of a request.
+    /// Lock the slot a request is running on.
     ///
-    /// Return `None` when a new guest replaced the guest that holds the context of the request.
+    /// Returns `None` if the guest holding the request's context is no longer in the slot.
     pub(crate) fn lock(&self, index: usize, guest: GuestId) -> Option<SlotGuard<'_>> {
         let guard = self.slots[index].guest.lock();
         match guard.as_ref() {
@@ -196,10 +201,11 @@ impl GuestPool {
         }
     }
 
-    /// Replace the guest of a slot when `err` leaves it unusable.
+    /// Replace the guest in a slot if `err` left it unusable.
     ///
-    /// A trap leaves a guest unusable, and so does a guest with no context ids left. Return
-    /// whether the guest left its slot, which is also the case when the rebuild fails.
+    /// A guest is unusable once it has stopped serving, e.g. after a trap, or has run out of
+    /// context ids. Returns `true` if the guest was removed from its slot, even when building its
+    /// replacement failed.
     pub(crate) fn replace_if_unusable(
         &self,
         index: usize,
@@ -232,10 +238,10 @@ impl GuestPool {
         due && slot.guest.try_lock().is_some_and(|guard| guard.is_none())
     }
 
-    /// Build a new guest for a slot that has none.
+    /// Start a new guest in an empty slot.
     ///
-    /// `failure` is the error that made the slot lose its guest, when the rebuild follows it
-    /// directly.
+    /// `failure` is the error that emptied the slot when the rebuild immediately follows it, and
+    /// is only used for logging. A failed rebuild starts the slot's backoff.
     fn rebuild(&self, index: usize, failure: Option<&GuestError>) {
         let slot = &self.slots[index];
         let name = &self.name;
@@ -249,9 +255,9 @@ impl GuestPool {
                     *slot.failed_at.lock() = None;
                     match failure {
                         Some(failure) => warn!(
-                            "wasm plugin {name} replaced the guest of slot {index} after a failure: {failure}"
+                            "wasm plugin {name}: guest in slot {index} replaced after failure: {failure}"
                         ),
-                        None => warn!("wasm plugin {name} rebuilt the guest of slot {index}"),
+                        None => warn!("wasm plugin {name}: guest in slot {index} rebuilt"),
                     }
                 }
             }
@@ -259,9 +265,9 @@ impl GuestPool {
                 *slot.failed_at.lock() = Some(Instant::now());
                 match failure {
                     Some(failure) => error!(
-                        "wasm plugin {name} lost the guest of slot {index} after a failure: {failure}, and could not rebuild it: {e}"
+                        "wasm plugin {name}: guest in slot {index} lost after failure: {failure}, rebuild failed: {e}"
                     ),
-                    None => error!("wasm plugin {name} could not rebuild slot {index}: {e}"),
+                    None => error!("wasm plugin {name}: failed to rebuild slot {index}: {e}"),
                 }
             }
         }
@@ -292,8 +298,8 @@ impl GuestPool {
     }
 }
 
-/// Put a started guest in its slot, and send what its start changed to the root callback
-/// thread.
+/// Install a started guest in its slot and forward the ticks, queues, and callouts it set up
+/// during startup to the root callback thread.
 fn install_started_guest(guard: &mut SlotGuard<'_>, started: StartedGuest) {
     let mut loaded = started.loaded;
     loaded.report_to_root_callbacks();
@@ -310,7 +316,7 @@ mod tests {
             self.slots.len()
         }
 
-        /// Return `true` when no task holds the lock of the slot.
+        /// Return `true` if the slot is not currently locked.
         pub(crate) fn is_slot_free(&self, index: usize) -> bool {
             self.slots[index].guest.try_lock().is_some()
         }
@@ -319,7 +325,7 @@ mod tests {
             self.slots[index].guest.lock()
         }
 
-        /// Replace the guest of a slot, as a trap does.
+        /// Replace the guest in a slot, as a trap would.
         pub(crate) fn replace_slot(&self, index: usize) {
             self.slots[index].guest.lock().take();
             self.rebuild(index, None);
@@ -336,7 +342,7 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn the_phases_of_a_plugin_are_listed_for_the_log() {
+    fn phase_list_has_headers_and_enabled_phases() {
         let headers = PluginPhases {
             request: false,
             response: false,
@@ -370,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plugin_runs_a_body_phase_that_is_on_and_exported() {
+    fn body_phase_runs_only_when_enabled_and_exported() {
         let exported = Wat {
             request_body: Some(HOLD),
             response_trailers: Some(CONTINUE),
@@ -382,13 +388,13 @@ mod tests {
         let runtime = WasmRuntime::new(vec![conf]).unwrap();
 
         let phases = runtime.inner.pools[0].phases;
-        assert!(phases.request, "on and exported");
-        assert!(!phases.response, "on and not exported");
-        assert!(!phases.trailers, "off and exported");
+        assert!(phases.request, "enabled and exported");
+        assert!(!phases.response, "enabled but not exported");
+        assert!(!phases.trailers, "exported but disabled");
     }
 
     #[test]
-    fn pick_skips_a_locked_slot_and_a_slot_with_no_guest() {
+    fn pick_skips_locked_and_empty_slots() {
         let runtime =
             WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 3)]).unwrap();
         let pool = &runtime.inner.pools[0];
@@ -402,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn pick_waits_for_a_busy_slot_while_a_lost_guest_is_in_its_backoff() {
+    fn pick_waits_for_busy_slot_during_rebuild_backoff() {
         let runtime =
             WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 2)]).unwrap();
         let pool = &runtime.inner.pools[0];
@@ -421,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plugin_reads_a_fixed_property_when_it_is_configured() {
+    fn plugin_reads_fixed_property_in_configure() {
         let wat = Wat {
             data_segments: r#"(data (i32.const 700) "node\00name")"#,
             configure: "(call $log_property (i32.const 700) (i32.const 9)) i32.const 1",

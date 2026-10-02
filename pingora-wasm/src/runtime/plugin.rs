@@ -26,79 +26,100 @@ const BODY_LIMIT: usize = 1024 * 1024;
 const CALLOUT_TIMEOUT_LIMIT: Duration = Duration::from_secs(10);
 const CALLOUT_RESPONSE_LIMIT: usize = 1024 * 1024;
 
-/// The configuration of one Proxy-Wasm plugin.
+/// Configuration for one Proxy-Wasm plugin.
 ///
-/// Start from [WasmPluginConf::new] and set the fields you need.
+/// Create one with [WasmPluginConf::new], then set the fields you need.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct WasmPluginConf {
-    /// A name that is unique in the runtime. Chains refer to the plugin by this name, and guest
-    /// log lines start with it.
+    /// The name of the plugin, which must be unique within a runtime.
+    ///
+    /// Chains refer to the plugin by this name, and the default log sink puts it in front of
+    /// every guest log line.
     pub name: String,
-    /// The path of the compiled `.wasm` file.
+    /// The path to the compiled `.wasm` file.
     pub path: PathBuf,
-    /// The root id that the plugin receives when it is configured. Proxy-Wasm SDKs use it to
-    /// select the root context of the plugin.
+    /// The root id passed to the plugin when it is configured. Default empty.
+    ///
+    /// Proxy-Wasm SDKs use it to select the plugin's root context.
     pub root_id: String,
-    /// The VM id. Plugins with the same VM id share data and queues.
+    /// The VM id. Defaults to the plugin's name.
+    ///
+    /// Plugins with the same VM id share data, queues, and metrics.
     pub vm_id: String,
-    /// Bytes that the plugin reads when its VM starts.
+    /// The VM configuration, which the plugin can read when its VM starts. Default empty.
     pub vm_configuration: Vec<u8>,
-    /// Bytes that the plugin reads when it is configured, for example a JSON document.
+    /// The plugin configuration, which the plugin can read when it is configured, e.g. a JSON
+    /// document. Default empty.
     pub configuration: Vec<u8>,
-    /// The level that the plugin receives when it asks the host for its log level. Most SDKs
-    /// set their own level and do not ask.
+    /// The log level reported to the plugin when it asks the host for one. Default `Info`.
+    ///
+    /// The Rust SDK sets its own level and never asks.
     pub log_level: LogLevel,
-    /// The memory and CPU time limits of each guest. Fuel limits are not supported.
+    /// The resource limits of each guest, such as its memory and its CPU time per callback.
+    ///
+    /// Fuel limits are not supported, and a configuration that sets one is rejected.
     pub limits: Limits,
-    /// The number of guests. A guest runs one callback at a time, so set this to the thread
-    /// count of the service that uses the plugin.
+    /// The number of guests to run. Default 1.
+    ///
+    /// A guest runs one callback at a time, so set this to the thread count of the service that
+    /// uses the plugin. Must be at least 1.
     pub slots: usize,
     /// Whether to run the plugin on request bodies. Default `false`.
     ///
-    /// The plugin runs `proxy_on_request_body` once for each chunk of a request body. A guest runs
-    /// one callback at a time, so a chunk waits while another request runs a callback in the same
-    /// guest. The wait can be as long as the CPU time in [limits](Self::limits). Turn this on only
-    /// for a plugin that reads request bodies, and set [slots](Self::slots) to the thread count of
-    /// the service.
+    /// When enabled, `proxy_on_request_body` is called once for each chunk of a request body. A
+    /// guest runs one callback at a time, so a chunk has to wait while another request is running
+    /// a callback in the same guest. In the worst case the wait lasts as long as the CPU time
+    /// allowed by [limits](Self::limits). Only enable this for a plugin that reads request
+    /// bodies, and set [slots](Self::slots) to the thread count of the service.
     ///
-    /// When the runtime starts, it logs the phases that each plugin runs on.
+    /// The phases each plugin runs on are logged when the runtime is built.
     pub request_body: bool,
     /// Whether to run the plugin on response bodies. Default `false`.
     ///
-    /// The plugin runs `proxy_on_response_body` once for each chunk of a response body, with the
-    /// same wait as [request_body](Self::request_body).
+    /// When enabled, `proxy_on_response_body` is called once for each chunk of a response body.
+    /// A chunk may have to wait for its guest in the same way as with
+    /// [request_body](Self::request_body).
     pub response_body: bool,
     /// Whether to run the plugin on response trailers. Default `false`.
     pub response_trailers: bool,
-    /// The most request body bytes that the plugin can hold while it pauses the body. Default 1
-    /// MiB.
+    /// The maximum number of request body bytes the plugin may hold while it pauses the body.
+    /// Default 1 MiB.
+    ///
+    /// A request whose plugin holds more fails with
+    /// [ERR_REQUEST_BODY_TOO_LARGE](crate::ERR_REQUEST_BODY_TOO_LARGE). Must be greater than
+    /// zero.
     pub request_body_limit: usize,
-    /// The most response body bytes that the plugin can hold while it pauses the body. Default 1
-    /// MiB.
+    /// The maximum number of response body bytes the plugin may hold while it pauses the body.
+    /// Default 1 MiB.
+    ///
+    /// A request whose plugin holds more fails with
+    /// [ERR_RESPONSE_BODY_TOO_LARGE](crate::ERR_RESPONSE_BODY_TOO_LARGE). Must be greater than
+    /// zero.
     pub response_body_limit: usize,
-    /// The longest time that one callout of the plugin can take. Default 10 seconds.
+    /// The longest a single callout from the plugin may take. Default 10 seconds.
     ///
-    /// Each callout uses the timeout that the plugin passes to `proxy_http_call`. When that
-    /// timeout is zero, which some hosts read as no timeout, or longer than this limit, the
-    /// callout uses this limit, and the runtime logs a warning the first time. A request whose
-    /// plugin waits for a callout stays open for up to this time.
+    /// A callout normally uses the timeout the plugin passes to `proxy_http_call`. If that
+    /// timeout is zero, which some hosts treat as no timeout, or longer than this limit, the
+    /// limit is used instead and a warning is logged the first time it happens. A request can
+    /// therefore stay open for up to this long while its plugin waits for a callout.
     ///
-    /// For a plugin that sends callouts from a body phase or from the response headers phase,
-    /// keep this limit below the `read_timeout` of your upstream peers.
+    /// If the plugin sends callouts from a body phase or from the response headers phase, keep
+    /// this limit below the `read_timeout` of your upstream peers. Must be greater than zero.
     pub callout_timeout_limit: Duration,
-    /// The most body bytes that the response to a callout can have. Default 1 MiB.
+    /// The maximum size in bytes of a callout response body. Default 1 MiB.
     ///
-    /// When a response body is larger, the callout fails, and the plugin receives a result
-    /// with no headers and no body.
+    /// A callout with a larger response body fails, and the plugin receives a result with no
+    /// headers and no body. Must be greater than zero.
     pub callout_response_limit: usize,
 }
 
 impl WasmPluginConf {
-    /// Create the configuration of the plugin at `path`.
+    /// Create the configuration for the plugin at `path`.
     ///
-    /// The plugin has one slot, its name as the VM id, no configuration, the log level `Info`,
-    /// and the default limits. It runs on headers and not on bodies.
+    /// The plugin starts out with one slot, its name as the VM id, an empty root id, no
+    /// configuration, the log level `Info`, and the default limits. It runs on request and
+    /// response headers only.
     pub fn new(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
         let name = name.into();
         WasmPluginConf {
@@ -125,26 +146,29 @@ impl WasmPluginConf {
         if self.slots == 0 {
             return Error::e_explain(
                 ErrorType::InternalError,
-                format!("wasm plugin {} has zero slots", self.name),
+                format!("wasm plugin {}: slots must be at least 1", self.name),
             );
         }
         if self.limits.fuel().is_some() {
             return Error::e_explain(
                 ErrorType::InternalError,
-                format!("wasm plugin {} sets a fuel limit", self.name),
+                format!("wasm plugin {}: fuel limits are not supported", self.name),
             );
         }
         if self.request_body_limit == 0 || self.response_body_limit == 0 {
             return Error::e_explain(
                 ErrorType::InternalError,
-                format!("wasm plugin {} has a body limit of zero", self.name),
+                format!(
+                    "wasm plugin {}: request_body_limit and response_body_limit must be greater than zero",
+                    self.name
+                ),
             );
         }
         if self.callout_timeout_limit.is_zero() {
             return Error::e_explain(
                 ErrorType::InternalError,
                 format!(
-                    "wasm plugin {} has a callout_timeout_limit of zero",
+                    "wasm plugin {}: callout_timeout_limit must be greater than zero",
                     self.name
                 ),
             );
@@ -153,7 +177,7 @@ impl WasmPluginConf {
             return Error::e_explain(
                 ErrorType::InternalError,
                 format!(
-                    "wasm plugin {} has a callout_response_limit of zero",
+                    "wasm plugin {}: callout_response_limit must be greater than zero",
                     self.name
                 ),
             );
@@ -205,7 +229,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_sets_the_defaults() {
+    fn new_sets_defaults() {
         let conf = WasmPluginConf::new("auth", "/plugins/auth.wasm");
 
         assert_eq!(conf.name, "auth");
@@ -224,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn check_refuses_zero_slots_a_fuel_limit_and_zero_limits() {
+    fn check_rejects_zero_slots_fuel_and_zero_limits() {
         let mut zero = WasmPluginConf::new("zero", "zero.wasm");
         zero.slots = 0;
         let mut fuel = WasmPluginConf::new("fuel", "fuel.wasm");
@@ -248,16 +272,16 @@ mod tests {
         ]
         .map(|r| r.unwrap_err().to_string());
 
-        assert!(errors[0].contains("wasm plugin zero has zero slots"));
-        assert!(errors[1].contains("wasm plugin fuel sets a fuel limit"));
-        assert!(errors[2].contains("wasm plugin request has a body limit of zero"));
-        assert!(errors[3].contains("wasm plugin response has a body limit of zero"));
-        assert!(errors[4].contains("wasm plugin timeout has a callout_timeout_limit of zero"));
-        assert!(errors[5].contains("wasm plugin callout has a callout_response_limit of zero"));
+        assert!(errors[0].contains("wasm plugin zero: slots must be at least 1"));
+        assert!(errors[1].contains("wasm plugin fuel: fuel limits are not supported"));
+        assert!(errors[2].contains("request: request_body_limit and response_body_limit must be"));
+        assert!(errors[3].contains("response: request_body_limit and response_body_limit must be"));
+        assert!(errors[4].contains("timeout: callout_timeout_limit must be greater than zero"));
+        assert!(errors[5].contains("callout: callout_response_limit must be greater than zero"));
     }
 
     #[test]
-    fn plugin_config_maps_the_fields() {
+    fn plugin_config_carries_name_root_id_and_configuration() {
         let mut conf = WasmPluginConf::new("auth", "auth.wasm");
         conf.root_id = "root".to_string();
         conf.configuration = b"conf".to_vec();

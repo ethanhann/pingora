@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! HTTP callouts from plugins.
+//! HTTP callouts from plugins
 //!
-//! A plugin sends a callout with `proxy_http_call`. The callout service of its guest accepts
-//! the callout, and a task sends it to a peer. The phase that ran the plugin delivers the result
-//! to the plugin, and the root callback thread delivers the result of a callout that a root
-//! context sent.
+//! A plugin makes a callout with `proxy_http_call`. The call is checked and recorded by the
+//! guest's callout service, and a spawned task then sends the request to a peer of the chosen
+//! upstream. The result is delivered to `proxy_on_http_call_response` by the phase that ran the
+//! plugin, or by the root callback thread when the callout was made from a root context.
 
 mod client;
 pub(crate) mod headers;
@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The callout settings of one plugin. All guests of the plugin share them.
+/// Callout settings for one plugin, shared by all of its guests.
 pub(crate) struct PluginCalloutConf {
     pub(crate) plugin_name: String,
     pub(crate) upstreams: Arc<dyn CalloutUpstreams>,
@@ -67,32 +67,37 @@ impl PluginCalloutConf {
         }
     }
 
-    /// Return the timeout to use for a callout, given the timeout that the plugin passed.
+    /// Return the timeout to apply to a callout for which the plugin requested `passed`.
+    ///
+    /// A timeout of zero, or one longer than `timeout_limit`, is replaced by the limit. This is
+    /// logged the first time it happens for the plugin.
     pub(crate) fn effective_timeout(&self, passed: Duration) -> Duration {
         if !passed.is_zero() && passed <= self.timeout_limit {
             return passed;
         }
         if !self.timeout_warning_logged.swap(true, Ordering::Relaxed) {
             warn!(
-                "wasm plugin {} passed a callout timeout of {passed:?}, so its callout_timeout_limit of {:?} applies",
+                "wasm plugin {}: callout timeout {passed:?} is zero or over the limit, using callout_timeout_limit {:?}",
                 self.plugin_name, self.timeout_limit
             );
         }
         self.timeout_limit
     }
 
-    /// Warn once that the plugin sent a callout over the limit of the runtime.
+    /// Warn that a callout failed because `max_callouts_in_flight` was reached.
+    ///
+    /// Only the first call for the plugin logs anything.
     pub(crate) fn warn_of_overflow_once(&self) {
         if !self.overflow_warning_logged.swap(true, Ordering::Relaxed) {
             warn!(
-                "wasm plugin {} sent a callout over max_callouts_in_flight, and receives a 503 response for it",
+                "wasm plugin {}: max_callouts_in_flight reached, callout failed with a 503 response",
                 self.plugin_name
             );
         }
     }
 }
 
-/// A callout that a plugin sent with `proxy_http_call` and that no task has started yet.
+/// A callout accepted from `proxy_http_call` whose task has not been started yet.
 pub(crate) struct AcceptedCallout {
     pub(crate) id: CalloutId,
     pub(crate) plugin_conf: Arc<PluginCalloutConf>,
@@ -109,7 +114,7 @@ mod tests {
     const LIMIT: Duration = Duration::from_secs(10);
 
     #[test]
-    fn the_limit_replaces_a_timeout_that_is_zero_or_longer() {
+    fn timeout_of_zero_or_over_limit_uses_limit() {
         let upstreams = Arc::new(StaticCalloutUpstreams::new());
         let conf = PluginCalloutConf::new("a", upstreams, LIMIT, 1024);
         let negative = Duration::from_millis(u64::from(u32::MAX));

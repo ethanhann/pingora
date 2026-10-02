@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Sessions for tests, and what their downstream receives.
+//! Test sessions
+//!
+//! In-memory H1 sessions, and helpers for reading what their downstream received.
 
 use pingora_proxy::Session;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
-/// Build a session that has read `request`, and return it with the client end of its
+/// Create an H1 session that has already read `request`, along with the client end of its
 /// connection.
 pub(crate) async fn session(request: &[u8]) -> (Session, DuplexStream) {
     let (mut client, server) = tokio::io::duplex(4096);
@@ -35,9 +37,9 @@ pub(crate) const HEAD: &[u8] = b"HEAD /original HTTP/1.1\r\nHost: example.test\r
 pub(crate) const UPGRADE: &[u8] = b"GET /original HTTP/1.1\r\nHost: example.test\r\n\
 Connection: upgrade\r\nUpgrade: websocket\r\n\r\n";
 
-/// Write a response with the status 204 to the session, and return what the downstream received.
+/// Write a 204 response to the session and return everything the downstream received.
 ///
-/// When the text starts with [MARKER_RESPONSE], nothing was written before the 204.
+/// If the returned text starts with [MARKER_RESPONSE], nothing had been written before the 204.
 pub(crate) async fn read_downstream_after_marker(
     session: &mut Session,
     client: &mut DuplexStream,
@@ -52,7 +54,7 @@ pub(crate) async fn read_downstream_after_marker(
 
 pub(crate) const MARKER_RESPONSE: &str = "HTTP/1.1 204";
 
-/// Return what the downstream received so far, as text.
+/// Return what the downstream has received so far as a string.
 pub(crate) async fn read_downstream(client: &mut DuplexStream) -> String {
     let mut all = Vec::new();
     let mut part = [0u8; 1024];

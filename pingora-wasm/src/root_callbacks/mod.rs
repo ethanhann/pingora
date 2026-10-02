@@ -12,13 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The thread that calls the guests when no request runs: ticks, queue wakes, the results of
-//! the callouts that no request waits for, and the end of the contexts that guests held.
+//! Root callback thread
 //!
-//! The thread has its own single-thread tokio runtime, so a tick never blocks a thread of a
-//! Pingora service. After each guest call, the thread that made the call sends an event on a
-//! single channel. The root callback thread is the only reader, so it keeps its state without
-//! locks.
+//! A dedicated thread runs the plugin callbacks that happen outside of a request. These are
+//! `proxy_on_tick`, `proxy_on_queue_ready`, callout responses no request is waiting for, and the
+//! teardown of contexts a guest kept after its request ended.
+//!
+//! The thread owns a single-threaded tokio runtime, so a tick runs off the Pingora service
+//! threads. A request that needs the same slot still waits for the tick to finish. Threads that
+//! make guest calls report the resulting tick, queue, and callout changes as events on one
+//! channel. Only the root callback thread reads that channel, which lets it keep its state
+//! without locks.
 
 mod callback_loop;
 mod queue_registrations;
@@ -40,10 +44,10 @@ use std::thread;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
-// Linux truncates a thread name to 15 bytes
+// Thread names are limited to 15 bytes on Linux
 const THREAD_NAME: &str = "wasm-root-calls";
 
-/// The event channel of the root callback thread, and the means to start the thread.
+/// The root callback thread's event channel, created before the thread itself is started.
 pub(crate) struct RootCallbackThread {
     sender: RootCallbackSender,
     receiver: Arc<Mutex<Option<UnboundedReceiver<RootCallbackEvent>>>>,
@@ -66,11 +70,16 @@ impl RootCallbackThread {
         self.sender.clone()
     }
 
-    /// Start the thread.
+    /// Spawn the thread and wait for it to build its tokio runtime.
     ///
-    /// The events that guests sent before the start wait in the channel. The thread ends when the
-    /// `WasmRuntime` drops, because it holds every sender of the channel. When the thread cannot
-    /// start, this returns an error, and the events stay in the channel for the next call.
+    /// Events sent before this call stay queued in the channel and are handled once the thread is
+    /// running. The thread exits when the `WasmRuntime` is dropped, since it holds every sender
+    /// of the channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [ERR_PLUGIN_FAILED] if the thread cannot be spawned or its tokio runtime cannot be
+    /// built. The queued events are kept in both cases, so a later call can try again.
     pub(crate) fn start(&self, runtime: Weak<RuntimeInner>) -> Result<()> {
         let receiver = self.receiver.clone();
         let (build_result_sender, build_result_receiver) = mpsc::channel();
@@ -79,9 +88,8 @@ impl RootCallbackThread {
         thread::Builder::new()
             .name(THREAD_NAME.to_string())
             .spawn(move || {
-                // The thread builds its own tokio runtime, because a tokio runtime that drops
-                // inside an async context panics, and the calling thread can be inside the async
-                // context of a request
+                // Build the tokio runtime on this thread. The caller may be inside a request's
+                // async context, where dropping a tokio runtime panics.
                 let tokio_runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -105,25 +113,25 @@ impl RootCallbackThread {
             })
             .or_err(
                 ERR_PLUGIN_FAILED,
-                "failed to start the wasm root callback thread",
+                "failed to spawn wasm root callback thread",
             )?;
         let build_result = build_result_receiver.recv().or_err(
             ERR_PLUGIN_FAILED,
-            "the wasm root callback thread stopped before it built its runtime",
+            "wasm root callback thread exited before it finished starting",
         )?;
         build_result.or_err(
             ERR_PLUGIN_FAILED,
-            "failed to build the runtime of the wasm root callback thread",
+            "failed to build tokio runtime for wasm root callback thread",
         )
     }
 }
 
-/// Run the loop of the root callback thread until the `WasmRuntime` drops.
+/// Run the root callback loop until the `WasmRuntime` is dropped.
 ///
-/// The thread waits for work inside `block_on` and runs the work outside it. When the thread
-/// holds the last reference to the `WasmRuntime`, the runtime drops outside `block_on`, where
-/// a service of the proxy that owns a tokio runtime, such as a log sink, can drop without a
-/// panic.
+/// Waiting happens inside `block_on` and the work itself runs outside of it. If this thread ends
+/// up holding the last reference to the `WasmRuntime`, the runtime is therefore dropped outside
+/// of `block_on` as well, where anything in it that owns a tokio runtime of its own, such as a
+/// log sink, can be dropped without panicking.
 fn run_root_callback_loop(
     tokio_runtime: &Runtime,
     runtime: &Weak<RuntimeInner>,
@@ -166,7 +174,7 @@ mod tests {
     const TICK_EVERY_20_MS: &str = "(drop (call $set_tick_period (i32.const 20))) i32.const 1";
     const LOG_TICK: &str = "(call $log_tick)";
 
-    /// The guest log lines, with the guest that wrote each one.
+    /// Guest log lines, each paired with the guest that wrote it.
     #[derive(Default)]
     struct LinesByGuest(Mutex<Vec<(GuestId, String)>>);
 
@@ -230,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tick_waits_for_a_slot_that_a_request_holds() {
+    fn tick_waits_for_busy_slot() {
         let wat = Wat {
             configure: TICK_EVERY_20_MS,
             tick: Some(LOG_TICK),
@@ -253,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn a_guest_that_traps_in_a_tick_is_replaced() {
+    fn guest_trapping_in_tick_is_replaced() {
         record_crate_logs();
         let wat = Wat {
             configure: TICK_EVERY_20_MS,
@@ -264,12 +272,12 @@ mod tests {
 
         runtime.inner.start_threads().unwrap();
 
-        let replaced = "wasm plugin trap-in-tick replaced the guest of slot 0 after a failure";
+        let replaced = "wasm plugin trap-in-tick: guest in slot 0 replaced after failure";
         assert!(wait_until(|| !crate_log_lines_with(replaced).is_empty()));
     }
 
     #[test]
-    fn a_tick_reads_empty_header_pairs_and_proxy_continue_stream_returns_ok() {
+    fn tick_reads_empty_header_pairs_and_continue_stream_returns_ok() {
         let wat = Wat {
             data_segments: r#"(data (i32.const 700) "pairs ok") (data (i32.const 710) "continue ok")"#,
             configure: TICK_EVERY_20_MS,
@@ -291,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn the_thread_ends_when_the_runtime_drops() {
+    fn thread_exits_when_runtime_is_dropped() {
         let (runtime, _logs) =
             runtime_with_logs::<RecordedGuestLogs>("thread-end", Wat::default(), 1);
         runtime.inner.start_threads().unwrap();
@@ -303,8 +311,8 @@ mod tests {
         assert!(wait_until(|| !running.load(Ordering::Relaxed)));
     }
 
-    /// A log sink that owns a tokio runtime, and that keeps a guest call that logs from
-    /// returning until the test releases it.
+    /// A log sink that owns a tokio runtime and blocks any guest call that logs until the test
+    /// releases it.
     struct BlockingSinkWithTokioRuntime {
         _tokio_runtime: tokio::runtime::Runtime,
         in_guest_call: Arc<AtomicBool>,
@@ -319,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn a_runtime_that_drops_during_a_tick_ends_the_thread_with_no_panic() {
+    fn runtime_dropped_during_tick_exits_thread_without_panic() {
         let in_guest_call = Arc::new(AtomicBool::new(false));
         let released = Arc::new(AtomicBool::new(false));
         let services = WasmServices {
@@ -348,7 +356,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_held_context_whose_ctx_drops_gets_proxy_on_delete_and_no_proxy_on_log() {
+    async fn held_context_of_dropped_ctx_is_deleted_without_on_log() {
         let wat = Wat {
             data_segments: r#"(data (i32.const 700) "logged") (data (i32.const 710) "deleted")"#,
             configure: TICK_EVERY_20_MS,
@@ -376,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn a_root_callout_result_for_a_replaced_guest_is_dropped() {
+    fn root_callout_result_for_replaced_guest_is_dropped() {
         let gate = Arc::new(Notify::new());
         let sender = FixedSender::responds_after("ok", gate.clone());
         let wat = Wat {
@@ -403,7 +411,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugins_with_one_vm_id_share_a_queue_and_a_counter() {
+    async fn plugins_with_same_vm_id_share_queue_and_counter() {
         let configure = "(drop (call $register_queue (i32.const 700) (i32.const 1) (i32.const 640)))
             (drop (call $define_metric (i32.const 0) (i32.const 720) (i32.const 14) (i32.const 644)))
             i32.const 1";
@@ -457,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn a_result_for_a_callout_that_is_no_longer_open_is_dropped_with_no_warning() {
+    fn result_for_closed_callout_is_dropped_without_warning() {
         record_crate_logs();
         let wat = Wat::default();
         let (runtime, _logs) = runtime_with_logs::<RecordedGuestLogs>("closed-callout", wat, 1);
@@ -485,12 +493,12 @@ mod tests {
             &super::work::Work::DeliverCalloutResult(finished),
         );
 
-        let warnings = crate_log_lines_with("closed-callout failed in proxy_on_http_call_response");
+        let warnings = crate_log_lines_with("closed-callout: proxy_on_http_call_response failed");
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
-    fn a_slot_whose_guest_was_lost_gets_no_tick() {
+    fn slot_without_guest_gets_no_tick() {
         record_crate_logs();
         let wat = Wat {
             configure: TICK_EVERY_20_MS,
@@ -506,11 +514,11 @@ mod tests {
         let when_lost = count_lines_with(&logs, "tick");
         thread::sleep(Duration::from_millis(100));
         assert_eq!(count_lines_with(&logs, "tick"), when_lost);
-        assert!(crate_log_lines_with("lost-guest-tick failed in").is_empty());
+        assert!(crate_log_lines_with("lost-guest-tick: proxy_on_tick failed").is_empty());
     }
 
     #[tokio::test]
-    async fn a_queue_item_skips_a_lost_registrant_for_the_one_that_registered_before_it() {
+    async fn queue_item_skips_lost_registrant() {
         let logs = Arc::new(RecordedGuestLogs::default());
         let services = WasmServices {
             log_sink: logs.clone(),

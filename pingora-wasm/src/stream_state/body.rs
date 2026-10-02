@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The body buffer that a guest reads and writes.
+//! Body buffer
 
 use bytes::Bytes;
 use proxy_wasm_host::{Buffer, NotAllowed};
 
-/// The body bytes that a guest reads and writes in one callback.
+/// The body bytes a guest can read and write during one callback.
 ///
-/// A chunk stays a shared `Bytes` until a guest writes to it or holds it, so a guest that only
-/// reads a chunk makes no copy.
+/// A chunk stays a shared `Bytes` until a guest writes to it or its bytes are held, so reading a
+/// chunk never copies it.
 #[derive(Debug)]
 pub(crate) enum BodyBuffer {
     Shared(Bytes),
@@ -34,7 +34,10 @@ impl Default for BodyBuffer {
 }
 
 impl BodyBuffer {
-    /// Create the buffer from the bytes that the plugin holds and the new chunk.
+    /// Create a buffer from the bytes held from earlier chunks, followed by the new chunk.
+    ///
+    /// With nothing held the chunk is used as is. Otherwise it is appended to `held`, reusing
+    /// that allocation.
     pub(crate) fn new(mut held: Vec<u8>, chunk: Bytes) -> Self {
         if held.is_empty() {
             return BodyBuffer::Shared(chunk);
@@ -90,7 +93,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_read_keeps_the_shared_chunk() {
+    fn read_keeps_shared_chunk() {
         let chunk = Bytes::from_static(b"0123456789");
         let buffer = BodyBuffer::new(Vec::new(), chunk.clone());
 
@@ -102,7 +105,7 @@ mod tests {
     }
 
     #[test]
-    fn held_bytes_come_before_the_chunk() {
+    fn held_bytes_precede_chunk() {
         let buffer = BodyBuffer::new(b"held ".to_vec(), Bytes::from_static(b"chunk"));
 
         assert_eq!(buffer.len(), 10);
@@ -122,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn a_write_gives_the_bytes_that_a_vector_gives() {
+    fn write_matches_vec_replace() {
         let writes: [(usize, usize, &[u8]); 4] =
             [(0, 0, b"<"), (10, 0, b">"), (3, 0, b"-"), (3, 4, b"xy")];
 

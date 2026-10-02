@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The stream state that a plugin reads and writes during a callback. It holds the headers,
-//! the body, the response trailers, and the response that a plugin can send in place of the
-//! upstream response.
+//! Per-request stream state
+//!
+//! This is what a plugin reads and writes from inside a callback. It covers the request and
+//! response headers, the body, the response trailers, the properties, and a response the plugin
+//! sends itself in place of the upstream's.
 
 mod body;
 mod headers;
@@ -32,10 +34,10 @@ use proxy_wasm_host::abi::v0_2_1::{Access, Callback, Invocation, LocalResponse, 
 use proxy_wasm_host::{Buffer, HeaderMap, VecHeaderMap};
 use std::sync::Arc;
 
-/// The state that a guest can read and write during one callback.
+/// The state a guest can read and write during a single callback.
 ///
-/// Each filter moves the Pingora headers, the body bytes, and the trailers into it before each
-/// callback, and back after it.
+/// A filter moves Pingora's headers, body bytes, and trailers in before each callback and takes
+/// them back out afterwards.
 #[derive(Default)]
 pub(crate) struct PingoraStream {
     pub(crate) request: Option<RequestHeaders>,
@@ -45,13 +47,13 @@ pub(crate) struct PingoraStream {
     pub(crate) plugin_response: Option<PluginResponse>,
     asked_to_continue_request: bool,
     asked_to_continue_response: bool,
-    /// The callback whose access applies while the plugin receives the result of a callout.
+    /// The callback the plugin is paused in while a callout response is being delivered to it.
     pub(crate) delivery_callback: Option<Callback>,
     empty: VecHeaderMap,
     pub(crate) request_facts: RequestFacts,
-    /// The request properties that the proxy set, which a plugin cannot change.
+    /// Per-request properties set by the proxy. Plugins cannot change them.
     pub(crate) proxy_properties: WasmProperties,
-    /// The request properties that the plugins wrote.
+    /// Per-request properties written by plugins.
     pub(crate) guest_properties: WasmProperties,
     fixed_properties: Arc<WasmProperties>,
     joined_path: Vec<u8>,
@@ -72,13 +74,14 @@ impl PingoraStream {
         }
     }
 
-    /// Forget the directions that the plugin asked to continue in the last guest call.
+    /// Clear the continue flags left by the previous guest call.
     pub(crate) fn clear_continue_requests(&mut self) {
         self.asked_to_continue_request = false;
         self.asked_to_continue_response = false;
     }
 
-    /// Return whether the plugin asked to continue `direction` in the last guest call.
+    /// Return `true` if the plugin called `proxy_continue_stream` for `direction` during the last
+    /// guest call.
     pub(crate) fn continue_requested(&self, direction: StreamType) -> bool {
         match direction {
             StreamType::HttpRequest => self.asked_to_continue_request,
@@ -87,10 +90,10 @@ impl PingoraStream {
         }
     }
 
-    /// Return the callback whose access applies to a host call of the plugin.
+    /// Return the callback whose access rules apply to a host call.
     ///
-    /// While a plugin receives the result of a callout, it has the access of the callback that
-    /// it waits in.
+    /// This is the callback being run, except in `proxy_on_http_call_response`, where the plugin
+    /// gets the access of the callback it is paused in.
     fn access_callback(&self, call: Invocation) -> Option<Callback> {
         match call.callback {
             Some(Callback::HttpCallResponse) => self.delivery_callback,
@@ -126,8 +129,8 @@ impl StreamState for PingoraStream {
                     None => Err(Status::BadArgument),
                 }
             }
-            // A guest built with the Rust SDK panics on an error status, and reads an empty map
-            // as a missing value
+            // An empty map instead of an error, since a guest built with the Rust SDK panics on
+            // an error status and treats an empty map as a missing value
             (
                 MapType::HttpResponseHeaders
                 | MapType::HttpRequestTrailers
@@ -185,13 +188,13 @@ impl StreamState for PingoraStream {
         let plugin_response = PluginResponse::build(&response).ok_or(Status::BadArgument)?;
         if !response.status_code_details.is_empty() {
             debug!(
-                "plugin response {}: {}",
+                "wasm plugin response {}: {}",
                 response.status_code,
                 String::from_utf8_lossy(&response.status_code_details)
             );
         }
         if let Some(grpc_status) = response.grpc_status {
-            warn!("the gRPC status {grpc_status} of a wasm plugin response is not sent");
+            warn!("gRPC status {grpc_status} of a wasm plugin response dropped, not supported");
         }
         self.plugin_response = Some(plugin_response);
         Ok(())
@@ -226,9 +229,9 @@ impl StreamState for PingoraStream {
         }
     }
 
-    // A guest built with the Rust SDK panics on a status other than `Ok`, so a write to a path
-    // that the proxy or a built-in value provides still returns `Ok`, as in Envoy. A read of
-    // that path still returns the value of the proxy or the built-in value
+    // Always returns `Ok`, even for a path the proxy or a built-in property already provides,
+    // because a guest built with the Rust SDK panics on any other status. Reads of such a path
+    // keep returning the proxy's or the built-in value.
     fn set_property(
         &mut self,
         _call: Invocation,
@@ -287,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn header_map_allows_each_map_only_in_the_callbacks_that_can_use_it() {
+    fn header_map_access_depends_on_callback() {
         use Access::{Read, Write};
         use Callback::*;
         use MapType::{
@@ -346,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn a_delivery_has_the_access_of_the_callback_that_waits() {
+    fn callout_delivery_has_access_of_paused_callback() {
         use Access::{Read, Write};
         use BufferType::{HttpRequestBody, HttpResponseBody};
         use MapType::{
@@ -395,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn a_delivery_cannot_write_what_its_callback_cannot_write() {
+    fn callout_delivery_cannot_write_beyond_paused_callback() {
         let mut s = stream(true);
         s.delivery_callback = Some(Callback::RequestBody);
         let call = call(Callback::HttpCallResponse);
@@ -406,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn continue_stream_records_a_continue_for_each_http_direction() {
+    fn continue_stream_records_each_http_direction() {
         use StreamType::{Downstream, HttpRequest, HttpResponse, Upstream};
         let cases = [
             (vec![HttpRequest], Ok(()), (true, false)),
@@ -435,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn header_map_refuses_request_trailers_in_proxy_on_request_headers() {
+    fn header_map_rejects_request_trailers_in_request_headers() {
         let mut s = stream(true);
 
         let trailers = is_available(
@@ -449,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn a_map_that_is_not_available_reads_as_an_empty_map() {
+    fn unavailable_map_reads_as_empty() {
         let cases = [
             (Callback::RequestBody, MapType::HttpResponseHeaders),
             (Callback::ResponseBody, MapType::HttpResponseHeaders),
@@ -467,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn buffer_allows_a_body_only_in_its_own_body_callback() {
+    fn buffer_is_available_only_in_matching_body_callback() {
         use BufferType::{HttpRequestBody as Req, HttpResponseBody as Resp};
         let cases = [
             (Callback::RequestBody, Req, true),
@@ -497,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn send_local_response_records_the_response() {
+    fn send_local_response_records_response() {
         let mut s = stream(false);
 
         let result = s.send_local_response(call(Callback::RequestHeaders), local(403));
@@ -509,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn a_second_send_local_response_replaces_the_first_response() {
+    fn second_send_local_response_replaces_first() {
         let mut s = stream(false);
         s.send_local_response(call(Callback::RequestHeaders), local(403))
             .unwrap();
@@ -521,8 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn send_local_response_is_allowed_only_in_the_request_and_response_callbacks_with_a_valid_status(
-    ) {
+    fn send_local_response_needs_request_or_response_callback_and_final_status() {
         let cases = [
             (Callback::RequestHeaders, 403, Ok(())),
             (Callback::RequestBody, 403, Ok(())),
@@ -547,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn a_guest_write_returns_ok_and_does_not_hide_a_value_of_the_proxy_or_the_session() {
+    fn guest_property_write_cannot_shadow_proxy_or_built_in_value() {
         let mut stream = stream(false);
         stream
             .proxy_properties

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The callouts that no request waits for.
+//! Callouts made outside of a request
 
 use crate::callout::{AcceptedCallout, CalloutResult, PendingResult};
 use crate::runtime::pool::events::GuestAddress;
@@ -22,7 +22,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
 use proxy_wasm_host::abi::v0_2_1::{CalloutId, ContextId};
 
-/// The result of a callout that no request waits for.
+/// A callout result to be delivered by the root callback thread.
 pub(super) struct FinishedCallout {
     pub(super) address: GuestAddress,
     pub(super) context: ContextId,
@@ -30,14 +30,17 @@ pub(super) struct FinishedCallout {
     pub(super) result: CalloutResult,
 }
 
-/// The callouts in flight whose results go to a root, or to a context that the guest held.
+/// In-flight callouts made from a root context or from a context kept after its request ended.
 #[derive(Default)]
 pub(super) struct RootCallbackCallouts {
     results: FuturesUnordered<BoxFuture<'static, FinishedCallout>>,
 }
 
 impl RootCallbackCallouts {
-    /// Start `callout` on the connector of the root callback thread.
+    /// Start `callout` with the root callback thread's callout sender.
+    ///
+    /// Must be called with the thread's tokio runtime entered. Without one the callout is dropped
+    /// and no result is delivered for it.
     pub(super) fn start(
         &mut self,
         runtime: &RuntimeInner,
@@ -66,9 +69,9 @@ impl RootCallbackCallouts {
         );
     }
 
-    /// Wait for the next result.
+    /// Wait for the next callout to finish.
     ///
-    /// When no callout is in flight, the future never completes.
+    /// Never resolves while no callout is in flight, so it can be used in a `select!` branch.
     pub(super) async fn next_finished(&mut self) -> Option<FinishedCallout> {
         if self.results.is_empty() {
             return std::future::pending().await;

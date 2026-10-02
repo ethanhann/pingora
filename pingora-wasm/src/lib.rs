@@ -91,7 +91,7 @@
 //! If the future of a phase is dropped while a plugin waits for a callout, the request cannot
 //! continue. Pingora drops the future of a body filter when the upstream fails, and you may drop
 //! one with a timeout of your own. Every later phase of that request except [WasmCtx::logging]
-//! then returns an error of type [ERR_PLUGIN_FAILED], so end the request.
+//! then returns an [ERR_PLUGIN_FAILED] error, so end the request.
 //!
 //! A plugin can also send a callout and continue, for example to report a request to an audit
 //! service. The callout is sent, but the plugin does not receive its response. It receives a
@@ -115,9 +115,9 @@
 //! thread of its own, named `wasm-root-calls`, so it never runs on the threads of your Pingora
 //! services. The thread starts with the first request and stops when the runtime is dropped.
 //!
-//! Each slot of a plugin is a separate guest, so each slot gets its own ticks, as each worker
-//! of Envoy does. A tick waits while a request runs in the same slot, and a request waits while
-//! a tick runs. When a queue gets an item, the guest that registered the queue last receives
+//! Each slot of a plugin is a separate guest, so each slot gets its own ticks. A tick will wait
+//! for a request that is running in the same slot, and a request will wait for a running tick.
+//! When a queue gets an item, the guest that registered the queue last receives
 //! `proxy_on_queue_ready`.
 //!
 //! Plugins with the same [VM id](WasmPluginConf::vm_id) share data, queues, and metrics, and
@@ -125,8 +125,8 @@
 //!
 //! A plugin can keep its context after the request ends, for example to wait for the response
 //! to a callout that it sent from `proxy_on_done`. Its `proxy_on_done` then returns `false`,
-//! and the plugin calls `proxy_done` later. The runtime delivers the results of the callouts of
-//! such a context on the same thread, and then runs its `proxy_on_log` and `proxy_on_delete`.
+//! and the plugin calls `proxy_done` later. Callout results for such a context are delivered on
+//! the same thread, and the runtime then runs its `proxy_on_log` and `proxy_on_delete`.
 //! [WasmRuntime::held_contexts] counts the contexts that plugins hold.
 //!
 //! # Metrics
@@ -170,12 +170,13 @@
 //! ```
 //!
 //! For facts that do not change, such as the name of the node, use
-//! [WasmServices::fixed_properties]. A plugin cannot change a property that your proxy set or
-//! one that the runtime provides. Ticks and the other callbacks that run with no request read
-//! only the fixed properties.
+//! [WasmServices::fixed_properties]. A plugin cannot change a property that your proxy set on
+//! the request or one that the runtime provides, and it can override a fixed property for its
+//! own request. Ticks and the other callbacks that run with no request read only the fixed
+//! properties.
 //!
-//! The runtime provides these properties, with the encoding of Envoy, where an integer is 8
-//! little-endian bytes and a bool is one byte:
+//! The runtime provides these properties, where an integer is 8 little-endian bytes and a bool is
+//! one byte:
 //!
 //! - `source.address`, `source.port`, `destination.address`, and `destination.port`
 //! - `request.path`, `request.url_path`, `request.host`, `request.scheme`, `request.method`,
@@ -193,17 +194,18 @@
 //!
 //! # When a plugin fails
 //!
-//! A phase returns an error of type [ERR_PLUGIN_FAILED] when a plugin traps or returns an error,
-//! and Pingora responds with 503.
+//! A phase returns an [ERR_PLUGIN_FAILED] error when a plugin traps or returns an error, and
+//! Pingora responds with 503.
 //!
 //! A plugin that pauses and has no callout to wait for cannot continue, so the phase returns
 //! the same error. The body phases are different. A plugin can pause a body to hold its bytes
 //! until the last chunk arrives, up to a limit. Past
-//! [WasmPluginConf::request_body_limit], [WasmCtx::request_body_filter] returns an error of type
-//! [ERR_REQUEST_BODY_TOO_LARGE], and Pingora responds with 413. Past
-//! [WasmPluginConf::response_body_limit], [WasmCtx::response_body_filter] returns an error of
-//! type [ERR_RESPONSE_BODY_TOO_LARGE]. Pingora sent the response header before that point, so
-//! the downstream receives a response that ends early.
+//! [WasmPluginConf::request_body_limit], [WasmCtx::request_body_filter] returns an
+//! [ERR_REQUEST_BODY_TOO_LARGE] error, and Pingora responds with 413. Past
+//! [WasmPluginConf::response_body_limit], [WasmCtx::response_body_filter] returns an
+//! [ERR_RESPONSE_BODY_TOO_LARGE] error. Pingora has usually sent the response header before that
+//! point, so the downstream receives a response that ends early. If the header has not been sent
+//! yet, Pingora responds with 500.
 //!
 //! ```no_run
 //! use async_trait::async_trait;
@@ -324,8 +326,9 @@ pub use observability::{
     CalloutFailure, PrometheusMetricSink, WasmMetric, WasmMetricKind, WasmMetricRecorder,
     WasmMetricSink,
 };
-/// The `prometheus` crate that [PrometheusMetricSink] uses, so that you pass a registry of the
-/// same version.
+/// Re-export of the `prometheus` crate that [PrometheusMetricSink] is built against.
+///
+/// Create your registry through this re-export to make sure its version matches.
 pub use prometheus;
 pub use properties::{WasmProperties, WasmPropertyValue};
 pub use proxy_wasm_host::abi::v0_2_1::types::LogLevel;
@@ -337,38 +340,39 @@ use http::StatusCode;
 use pingora_error::{Error, ErrorType};
 use proxy_wasm_host::abi::v0_2_1::GuestError;
 
-/// The error type that a phase returns when a plugin fails.
+/// The error type returned by a phase when a plugin fails.
 ///
-/// The default `fail_to_proxy` of `ProxyHttp` responds with 503 for this type. Check for it in
-/// your own `fail_to_proxy` to send a different response.
+/// The default `fail_to_proxy` of `ProxyHttp` responds with 503 for this type. Match on it in
+/// your own `fail_to_proxy` if you want to send a different response.
 ///
-/// A plugin can send its own response with the status 503, and the error for that response has this
-/// type too. Check [WasmCtx::plugin_responded] before you treat the error as a failure.
+/// The error returned after a plugin sends its own 503 response has the same type, so check
+/// [WasmCtx::plugin_responded] before treating the error as a failure.
 pub const ERR_PLUGIN_FAILED: ErrorType =
     ErrorType::HTTPStatus(StatusCode::SERVICE_UNAVAILABLE.as_u16());
 
-/// The error type for a request body that a plugin holds past its limit.
+/// The error type returned when a plugin holds more of a request body than its limit allows.
 ///
-/// [WasmCtx::request_body_filter] returns it, and the default `fail_to_proxy` responds with 413.
+/// Returned by [WasmCtx::request_body_filter]. The default `fail_to_proxy` responds with 413.
 pub const ERR_REQUEST_BODY_TOO_LARGE: ErrorType =
     ErrorType::HTTPStatus(StatusCode::PAYLOAD_TOO_LARGE.as_u16());
 
-/// The error type for a response body that a plugin holds past its limit.
+/// The error type returned when a plugin holds more of a response body than its limit allows.
 ///
-/// [WasmCtx::response_body_filter] returns it. Pingora sent the response header before the body, so
-/// the default `fail_to_proxy` sends nothing, and the downstream receives a response that ends
-/// early.
+/// Returned by [WasmCtx::response_body_filter]. The response header has usually been sent by
+/// then, in which case the default `fail_to_proxy` writes nothing and the downstream sees the
+/// response end early. If the header has not been sent yet, the default `fail_to_proxy` responds
+/// with 500.
 pub const ERR_RESPONSE_BODY_TOO_LARGE: ErrorType =
     ErrorType::HTTPStatus(StatusCode::INTERNAL_SERVER_ERROR.as_u16());
 
 pub(crate) fn plugin_failure(name: &str, what: &str, cause: GuestError) -> Box<Error> {
     Error::because(
         ERR_PLUGIN_FAILED,
-        format!("wasm plugin {name} {what}"),
+        format!("wasm plugin {name}: {what}"),
         cause,
     )
 }
 
 pub(crate) fn plugin_unavailable(name: &str, what: &str) -> Box<Error> {
-    Error::explain(ERR_PLUGIN_FAILED, format!("wasm plugin {name} {what}"))
+    Error::explain(ERR_PLUGIN_FAILED, format!("wasm plugin {name}: {what}"))
 }

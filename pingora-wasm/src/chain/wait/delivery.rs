@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The delivery of a callout result to the plugin that waits for it.
+//! Callout result delivery
+//!
+//! A callout result is delivered by running `proxy_on_http_call_response` on the paused plugin,
+//! with the stream state set up as it was in the callback the plugin paused in.
 
 use crate::callout::CalloutResult;
 use crate::chain::body::BodyDirection;
@@ -28,9 +31,10 @@ use proxy_wasm_host::abi::v0_2_1::types::StreamType;
 use proxy_wasm_host::abi::v0_2_1::{Callback, CalloutId};
 use std::mem;
 
-/// The phase that a plugin paused in.
+/// The phase a plugin is paused in.
 ///
-/// A response phase has the response header or the trailers, which are not in the session.
+/// The response header and trailer variants hold what their filter was given, since neither can
+/// be reached through the session.
 pub(in crate::chain) enum PausedPhase<'a> {
     RequestHeaders,
     RequestBody,
@@ -40,8 +44,9 @@ pub(in crate::chain) enum PausedPhase<'a> {
 }
 
 impl PausedPhase<'_> {
-    /// Return the callback of the phase. During a delivery, the plugin has the access that it
-    /// has in this callback.
+    /// Return the callback that belongs to the phase.
+    ///
+    /// While a result is being delivered, the plugin gets the access it has in this callback.
     fn callback(&self) -> Callback {
         match self {
             PausedPhase::RequestHeaders => Callback::RequestHeaders,
@@ -52,7 +57,7 @@ impl PausedPhase<'_> {
         }
     }
 
-    /// Return the direction that the plugin must continue to end its pause.
+    /// Return the stream the plugin has to continue for the phase to resume.
     pub(super) fn direction(&self) -> StreamType {
         match self {
             PausedPhase::RequestHeaders | PausedPhase::RequestBody => StreamType::HttpRequest,
@@ -60,7 +65,7 @@ impl PausedPhase<'_> {
         }
     }
 
-    /// Return the direction of the body that the plugin holds, for a body phase.
+    /// Return which body the plugin is holding, or `None` outside of a body phase.
     fn body_direction(&self) -> Option<BodyDirection> {
         match self {
             PausedPhase::RequestBody => Some(BodyDirection::Request),
@@ -71,8 +76,10 @@ impl PausedPhase<'_> {
 }
 
 impl WasmCtx {
-    /// Run `proxy_on_http_call_response` of the plugin at `position` with the result of callout
-    /// `id`.
+    /// Deliver the result of callout `id` to the plugin at `position`.
+    ///
+    /// Runs `proxy_on_http_call_response` with the access of the phase the plugin paused in. A
+    /// failed callback is treated like any other guest failure, so the guest may be replaced.
     pub(super) fn deliver_callout_result<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -84,7 +91,7 @@ impl WasmCtx {
         let runtime = self.chain.runtime.clone();
         let pool = &runtime.pools[self.chain.plugins[position]];
         let Some(record) = self.records[position] else {
-            return Err(self.plugin_error(position, "has no context for a callout result"));
+            return Err(self.plugin_error(position, "no context for callout result"));
         };
         let mut locked = LockedSlot::of_request(pool, &record)?;
         let loaded = locked.loaded()?;
@@ -95,12 +102,15 @@ impl WasmCtx {
         });
         match delivery {
             Ok(()) => Ok(()),
-            Err(e) => Err(locked.guest_failure("failed in on_http_call_response", e)),
+            Err(e) => Err(locked.guest_failure("proxy_on_http_call_response failed", e)),
         }
     }
 
-    /// Run `guest_call` while the stream state has what the plugin can read and write in
-    /// `phase`.
+    /// Run `guest_call` with the stream state set up for `phase`.
+    ///
+    /// The request header, the response header or trailers of the phase, and the body bytes held
+    /// for the plugin at `position` are moved into the stream state for the call and moved back
+    /// afterwards.
     fn with_phase_in_stream<DS: DownstreamSession, R>(
         &mut self,
         session: &mut Session<DS>,

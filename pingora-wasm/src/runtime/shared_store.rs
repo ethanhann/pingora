@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The store of shared data, queues, and metrics that all plugins of a runtime use.
+//! Shared data, queues, and metrics
+//!
+//! All plugins of a runtime use the same store.
 
 use crate::observability::{WasmMetric, WasmMetricKind, WasmMetricRecorder, WasmMetricSink};
 use parking_lot::Mutex;
@@ -24,11 +26,12 @@ use proxy_wasm_host::abi::v0_2_1::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// The shared services of a runtime.
+/// The [SharedServices] implementation of a runtime.
 ///
-/// Shared data and queues are kept in an [InMemoryStore], and this type keeps the metrics.
-/// `proxy_record_metric` adds to a counter, as in Envoy, where [InMemoryStore] would replace
-/// the value. Each change is also sent to the metric sink.
+/// Shared data and queues are delegated to an [InMemoryStore]. Metrics are kept here instead,
+/// for two reasons. Plugins expect `proxy_record_metric` to add to a counter, whereas
+/// [InMemoryStore] would overwrite the value. Every change also has to be forwarded to the
+/// metric sink.
 pub(crate) struct SharedStore {
     data_and_queues: InMemoryStore,
     metrics: Mutex<Metrics>,
@@ -50,10 +53,11 @@ struct MetricEntry {
 }
 
 impl SharedStore {
-    /// Create a store with `limits`.
+    /// Create a store with the given limits.
     ///
-    /// The store calls `enqueue_observer` for each queue item and sends each metric change to
-    /// `metric_sink`.
+    /// `enqueue_observer` is called for every item enqueued on a shared queue. Each metric a
+    /// plugin defines is registered with `metric_sink`, which may return a recorder to receive
+    /// the metric's changes.
     pub(crate) fn new(
         limits: InMemoryStoreLimits,
         enqueue_observer: Arc<dyn Fn(QueueEnqueued<'_>) + Send + Sync>,
@@ -69,9 +73,10 @@ impl SharedStore {
         }
     }
 
-    /// Apply `change` to `metric`, and pass its result to the recorder of the metric.
+    /// Apply `change` to `metric` and forward the outcome to the metric's recorder, if any.
     ///
-    /// The recorder runs after the lock is released, so a slow recorder does not hold the lock.
+    /// The recorder is called after the lock has been released, so a slow recorder cannot stall
+    /// other metric calls. A delta of zero is not forwarded.
     fn change_metric(
         &self,
         metric: MetricId,
@@ -93,9 +98,9 @@ impl SharedStore {
     }
 }
 
-// A runtime that replaces this one can share its recorders. When the store drops, each gauge
-// takes back the value that it added, so a gauge in the sink is the sum over the runtimes
-// that are alive, as in Envoy
+// A runtime that replaces this one may be given the same sink, and with it the same recorders.
+// Subtract what each gauge has added when the store is dropped, so that a gauge in the sink is
+// the sum over the runtimes still alive.
 impl Drop for SharedStore {
     fn drop(&mut self) {
         let metrics = self.metrics.get_mut();
@@ -112,9 +117,9 @@ enum RecorderCall {
     Record(u64),
 }
 
-/// Return the total of the deltas that a gauge at `value` sent to its recorder.
+/// Return the sum of the deltas a gauge at `value` has sent to its recorder.
 ///
-/// The total stops at `i64::MAX`, because a recorder takes an `i64` delta.
+/// The sum is capped at `i64::MAX` because a recorder takes `i64` deltas.
 fn gauge_total_sent(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
@@ -287,7 +292,7 @@ mod tests {
     use super::*;
     use proxy_wasm_host::abi::v0_2_1::{ContextId, GuestId};
 
-    /// A sink that records each metric definition and each change.
+    /// A metric sink that records every metric definition and every change.
     #[derive(Default)]
     struct RecordingSink {
         events: Arc<Mutex<Vec<String>>>,
@@ -341,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn a_recorded_counter_adds_and_a_gauge_sends_its_delta() {
+    fn record_metric_adds_to_counter_and_sets_gauge() {
         let cases = [
             (MetricType::Counter, 7, ["add vm/m 2", "add vm/m 5"]),
             (MetricType::Gauge, 5, ["add vm/m 2", "add vm/m 3"]),
@@ -366,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn a_histogram_records_values_and_has_no_value_to_read() {
+    fn histogram_records_values_and_cannot_be_read() {
         let (store, events) = store_with_recorded_events();
         let histogram = store
             .define_metric(invocation(), b"vm", MetricType::Histogram, b"latency")
@@ -385,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn plugins_with_one_vm_id_share_a_metric_that_is_defined_once() {
+    fn metric_is_defined_once_per_vm_id_and_name() {
         let (store, events) = store_with_recorded_events();
         let first = store.define_metric(invocation(), b"vm", MetricType::Counter, b"requests");
         let second = store.define_metric(invocation(), b"vm", MetricType::Counter, b"requests");
@@ -400,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn a_counter_refuses_an_increment_that_is_not_positive() {
+    fn counter_rejects_non_positive_increment() {
         let (store, _events) = store_with_recorded_events();
         let counter = store
             .define_metric(invocation(), b"vm", MetricType::Counter, b"c")
@@ -415,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn a_gauge_delta_over_the_range_of_i64_saturates() {
+    fn gauge_delta_saturates_at_i64_max() {
         let (store, events) = store_with_recorded_events();
         let gauge = store
             .define_metric(invocation(), b"vm", MetricType::Gauge, b"g")
@@ -430,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_store_takes_back_the_value_of_each_gauge() {
+    fn dropped_store_subtracts_its_gauge_values() {
         let cases = [(5, -5), (u64::MAX, -i64::MAX)];
 
         for (recorded, taken_back) in cases {

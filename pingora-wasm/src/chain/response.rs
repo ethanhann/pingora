@@ -26,41 +26,43 @@ use pingora_proxy::Session;
 use proxy_wasm_host::abi::v0_2_1::types::StreamType;
 
 const CHUNKED: &str = "chunked";
-const PAUSED_A_RESPONSE: &str = "paused a response";
+const PAUSED_A_RESPONSE: &str = "paused on response headers with no callout pending";
 
-/// The source of the response header in a response pass.
+/// Where the response header given to [WasmCtx::response_pass] came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ResponseSource {
     Upstream,
-    /// A plugin. A response that another plugin sends in its place is dropped.
+    /// A plugin sent it. A response another plugin sends during the pass is dropped.
     Plugin,
 }
 
 impl WasmCtx {
-    /// Run `proxy_on_response_headers` of each plugin that saw the request, in reverse chain order.
+    /// Run `proxy_on_response_headers` for each plugin that saw the request, in reverse chain order.
     ///
-    /// Call it from `response_filter`. Plugins can read the request headers, and can read and
-    /// change the response headers before they go to the downstream. Informational (1xx) responses
-    /// other than 101 do not run the plugins.
+    /// Call this from your `response_filter`. Plugins can read the request headers, and can read
+    /// and change the response headers before they are sent downstream. This filter does nothing
+    /// for a subrequest, for an informational (1xx) response other than 101, and once a plugin has
+    /// sent its own response.
     ///
-    /// A plugin that changes the length of the body removes `content-length` here. This phase then
-    /// adds `transfer-encoding: chunked`, as Pingora does for a response with no length, so that
-    /// the downstream connection stays open after the response.
+    /// A plugin that changes the body length must remove `content-length` here. The response is
+    /// then sent with `transfer-encoding: chunked`, as Pingora does for any response without a
+    /// length, so that the downstream connection can be reused.
     ///
-    /// A plugin can pause the response while it waits for a callout, and this phase waits until
-    /// the plugin continues or sends its own response.
+    /// A plugin may pause the response while waiting for a callout, in which case this filter
+    /// waits until the plugin continues or sends its own response.
     ///
-    /// A plugin can send its own response in place of the upstream response. The plugins that did
-    /// not run yet are skipped, and this phase writes the response to the downstream. The phase
-    /// then returns an error with the status of the response to stop the request, and
-    /// [WasmCtx::plugin_responded] returns `true`. The downstream connection closes after the
-    /// response.
+    /// A plugin may send its own response in place of the upstream's. The remaining plugins are
+    /// skipped and the response is written to the downstream, which is closed afterwards. This
+    /// filter then returns an error with the response status to stop the request, and
+    /// [WasmCtx::plugin_responded] returns `true`.
     ///
     /// # Errors
     ///
-    /// An error of type [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) when a plugin traps or
-    /// fails, when a plugin pauses the response and has no callout to wait for, or when the
-    /// guest that held this request was replaced after a failure.
+    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if a plugin traps or otherwise fails,
+    /// if a plugin pauses the response with no callout pending, or if the guest holding this
+    /// request was replaced after a failure. The same error is returned if an earlier phase of
+    /// this request was cancelled while a plugin was waiting for a callout, or if the runtime's
+    /// threads cannot be started.
     pub async fn response_filter<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -108,11 +110,17 @@ impl WasmCtx {
         frame_if_length_removed(resp, had_length, end_of_stream)
     }
 
-    /// Run `proxy_on_response_headers` of the plugins at `positions`, in that order, on `resp`.
+    /// Run `proxy_on_response_headers` on `resp` for the plugins at `positions`, in that order.
     ///
-    /// Stop at the plugin that sends a response in place of the upstream response, and at the
-    /// plugin that pauses to wait for a callout. A plugin cannot wait for a callout on the
-    /// response of a plugin, so the pass does not send the callouts that it receives there.
+    /// Positions without a context for this request are skipped. The pass stops early at a
+    /// plugin that pauses with a callout pending, or that sends its own response while `origin`
+    /// is the upstream. Callouts are only started for an upstream response, because the phases
+    /// that pass a plugin's response along cannot wait on one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if a plugin fails, if its guest is
+    /// gone, or if it pauses with no callout pending.
     pub(super) fn response_pass<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -140,7 +148,7 @@ impl WasmCtx {
             let sent = self.stream().plugin_response.take();
             let action = match action {
                 Ok(action) => action,
-                Err(e) => return Err(locked.guest_failure("failed in on_response_headers", e)),
+                Err(e) => return Err(locked.guest_failure("proxy_on_response_headers failed", e)),
             };
             drop(locked);
             let paused =
@@ -153,7 +161,7 @@ impl WasmCtx {
                     return Ok(ResponsePassOutcome::Respond(position, Box::new(response)))
                 }
                 (Some(_), ResponseSource::Plugin) => warn!(
-                    "wasm plugin {} sent a response in place of a plugin response",
+                    "wasm plugin {}: response dropped, another plugin already responded",
                     pool.name
                 ),
                 (None, _) if paused && self.waits_for_callout(position) => {
@@ -167,17 +175,17 @@ impl WasmCtx {
     }
 }
 
-/// The result of [WasmCtx::response_pass].
+/// How a [WasmCtx::response_pass] ended.
 pub(super) enum ResponsePassOutcome {
-    /// Every plugin ran.
+    /// Every plugin in the pass ran and none of them stopped it.
     Finished,
     /// The plugin at this position sent a response in place of the upstream response.
     Respond(usize, Box<PluginResponse>),
-    /// The plugin at this position paused and has a callout to wait for.
+    /// The plugin at this position paused with a callout pending.
     WaitsForCallout(usize),
 }
 
-/// Add chunked framing to a response whose `content-length` a plugin removed.
+/// Frame the response as chunked if a plugin removed its `content-length` and a body follows.
 pub(super) fn frame_if_length_removed(
     resp: &mut ResponseHeader,
     had_length: bool,
@@ -189,8 +197,10 @@ pub(super) fn frame_if_length_removed(
     Ok(())
 }
 
-/// Add `transfer-encoding: chunked` to a response with no length, as Pingora does before
-/// `response_filter`.
+/// Add `transfer-encoding: chunked` to a response that has no framing header.
+///
+/// Pingora does the same for an upstream response without a length before `response_filter`
+/// runs, which keeps the downstream connection reusable.
 fn frame_as_chunked(resp: &mut ResponseHeader) -> Result<()> {
     let framed =
         resp.headers.contains_key(CONTENT_LENGTH) || resp.headers.contains_key(TRANSFER_ENCODING);
@@ -201,12 +211,12 @@ fn frame_as_chunked(resp: &mut ResponseHeader) -> Result<()> {
     resp.insert_header(TRANSFER_ENCODING, CHUNKED)
 }
 
-/// Return `true` for an informational response other than 101.
+/// Return `true` for an informational (1xx) status other than 101, which plugins never see.
 fn skips_response(status: StatusCode) -> bool {
     status.is_informational() && status != StatusCode::SWITCHING_PROTOCOLS
 }
 
-/// Return `true` for a response that has no body.
+/// Return `true` if no body will follow the response header.
 fn response_ends(method: &Method, resp: &ResponseHeader) -> bool {
     *method == Method::HEAD
         || resp.status == StatusCode::NO_CONTENT
@@ -236,7 +246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_response_on_a_replaced_guest_fails() {
+    async fn response_fails_after_guest_is_replaced() {
         let (runtime, mut ctx) = one_plugin(add_request_header());
         let (mut session, _client) = session(GET).await;
         ctx.request_filter(&mut session).await.unwrap();
@@ -249,11 +259,11 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
-        assert!(err.to_string().contains("lost the guest of this request"));
+        assert!(err.to_string().contains("guest for this request is gone"));
     }
 
     #[tokio::test]
-    async fn a_plugin_response_replaces_the_upstream_response() {
+    async fn plugin_response_replaces_upstream_response() {
         let plugins = vec![
             body_plugin("first", Wat::response_headers(TRAP)),
             body_plugin("last", Wat::response_headers(TEAPOT)),
@@ -275,7 +285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_response_that_is_not_written_is_a_failure() {
+    async fn unwritten_plugin_response_is_a_failure() {
         let plugins = vec![body_plugin("a", Wat::response_headers(TEAPOT))];
         let (_runtime, mut ctx, mut session, client) = start_request(plugins, GET).await;
         drop(client);
@@ -291,7 +301,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_response_to_a_head_request_has_no_body() {
+    async fn plugin_response_to_head_request_has_no_body() {
         let plugins = vec![body_plugin("a", Wat::response_headers(TEAPOT))];
         let (_runtime, mut ctx, mut session, mut client) = start_request(plugins, HEAD).await;
         let mut upstream = response(200, Some("6"));
@@ -309,7 +319,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_response_with_no_length_is_framed_as_chunked() {
+    async fn plugin_response_without_length_is_chunked() {
         let plugins = vec![
             body_plugin("first", Wat::response_headers(REMOVE_LENGTH)),
             body_plugin("last", Wat::request_body(TEAPOT)),
@@ -329,7 +339,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_removed_length_is_framed_as_chunked() {
+    async fn removed_length_is_chunked_only_when_body_follows() {
         let cases = [
             (GET, 200, Some(CHUNKED)),
             (HEAD, 200, None),
@@ -353,7 +363,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_length_that_stays_adds_no_framing() {
+    async fn kept_length_adds_no_framing() {
         let (_runtime, mut ctx) = one_plugin(add_request_header());
         let (mut session, _client) = session(GET).await;
         ctx.request_filter(&mut session).await.unwrap();
@@ -368,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_response_for_informational_other_than_101() {
+    fn informational_responses_except_101_are_skipped() {
         let statuses = [100, 101, 103, 199, 200, 404];
 
         let skipped: Vec<_> = statuses
@@ -380,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn response_ends_follows_the_rule() {
+    fn response_ends_for_bodiless_responses() {
         let cases = [
             (Method::GET, response(200, None), false),
             (Method::GET, response(200, Some("10")), false),

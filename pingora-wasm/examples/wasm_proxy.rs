@@ -144,19 +144,19 @@ impl ProxyHttp for PluginProxy {
 // RUST_LOG=INFO cargo run --example wasm_proxy -- tests/fixtures/add-request-header.wasm
 // curl 127.0.0.1:6190/headers
 //
-// Plugins after --body also run on bodies and trailers
+// Plugins you list after --body also run on request bodies, response bodies, and response trailers
 // RUST_LOG=INFO cargo run --example wasm_proxy -- --body tests/fixtures/sdk-http-body.wasm
 // curl -d 'a secret' 127.0.0.1:6190/anything
 //
-// --callout-upstream name=address sends the callouts for an upstream name to an address
+// Use --callout-upstream name=address to tell the proxy where callouts to an upstream name go
 // RUST_LOG=INFO cargo run --example wasm_proxy -- --callout-upstream httpbin=127.0.0.1:8080 \
 //     tests/fixtures/sdk-http-auth-random.wasm
 // curl -i 127.0.0.1:6190/headers
 //
-// When a plugin fails, the host crate logs a warning too. To hide it, use
-// RUST_LOG=info,proxy_wasm_host=error
+// A failing plugin is also logged as a warning by the proxy_wasm_host crate. You can silence
+// that with RUST_LOG=info,proxy_wasm_host=error
 //
-// The metrics of the plugins are at 127.0.0.1:6192/metrics
+// Plugin metrics are served at 127.0.0.1:6192/metrics
 fn main() {
     env_logger::init();
 
@@ -167,7 +167,7 @@ fn main() {
     if args.is_empty() {
         args.push(DEFAULT_PLUGIN.into());
     }
-    // A body phase runs a plugin on every chunk, so turn it on only for a plugin that reads bodies
+    // Body phases cost a plugin call per chunk, so only enable them for plugins that need the body
     let mut body = false;
     let mut plugins = Vec::new();
     let mut upstreams = StaticCalloutUpstreams::new();
@@ -178,8 +178,12 @@ fn main() {
             continue;
         }
         if arg == CALLOUT_UPSTREAM_FLAG {
-            let upstream = args.next().expect("a callout upstream as name=address");
-            let (name, address) = upstream.split_once('=').expect("name=address");
+            let upstream = args
+                .next()
+                .expect("callout upstream flag needs a value of the form name=address");
+            let (name, address) = upstream
+                .split_once('=')
+                .expect("callout upstream must be given as name=address");
             upstreams.insert(name, HttpPeer::new(address, false, String::new()));
             continue;
         }

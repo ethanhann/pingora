@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The plugins of a proxy and their guests, built once and shared by every request.
+//! Wasm runtime
+//!
+//! A [WasmRuntime] holds the compiled plugins of a proxy and their guest pools. It is built once
+//! and shared by every request.
 
 mod build;
 use build::{build_pool, checked_plugin_indexes, new_shared_store, PoolInputs};
@@ -43,14 +46,14 @@ use std::fmt;
 use std::sync::Arc;
 use ticker::{with_ticker, Ticker};
 
-/// The compiled plugins of a proxy and their guests.
+/// The compiled plugins of a proxy and the guests that run them.
 ///
-/// Build it once, before the server starts, and clone it where you need it. Clones share the
-/// same plugins. All plugins share one data store, and plugins with the same VM id see the same
-/// data.
+/// Build one before the server starts and clone it wherever you need it. All clones refer to
+/// the same plugins and guests. The plugins of a runtime share one store for shared data,
+/// queues, and metrics, in which plugins with the same VM id see the same data.
 ///
-/// To reload plugins, build a new runtime and use it for new requests. A request that started
-/// on the old runtime finishes on it.
+/// To reload plugins, build a new runtime and switch new requests over to it. Requests that
+/// started on the old runtime will finish on it.
 #[derive(Clone)]
 pub struct WasmRuntime {
     pub(crate) inner: Arc<RuntimeInner>,
@@ -68,40 +71,44 @@ pub(crate) struct RuntimeInner {
 }
 
 impl WasmRuntime {
-    /// Compile each plugin and start its guests.
+    /// Compile the plugins and start their guests.
     ///
-    /// Guest log lines go to the `log` crate with the target `pingora_wasm::guest`.
+    /// Guest log lines are written to the `log` crate under the target `pingora_wasm::guest`,
+    /// and plugins cannot send callouts. Use [WasmRuntime::new_with_services] to change either.
     ///
     /// # Errors
     ///
-    /// The error message names the plugin. The build fails when a file cannot be read, when a
-    /// file is not a Proxy-Wasm module, when a plugin refuses to start or traps while it starts,
-    /// when two plugins have the same name, when a plugin has zero slots, when its limits set
-    /// fuel, or when one of its body or callout limits is zero.
+    /// Returns an error if `plugins` is empty or two plugins have the same name. Also returns an
+    /// error, with the plugin's name in its message, if a plugin's file cannot be read or is not
+    /// a supported Proxy-Wasm module, if the plugin traps or otherwise fails during startup, if
+    /// its `proxy_on_vm_start` or `proxy_on_configure` returns `false`, or if its configuration
+    /// is invalid. A configuration is invalid when [slots](WasmPluginConf::slots) is zero, when
+    /// [limits](WasmPluginConf::limits) sets a fuel limit, or when one of the body or callout
+    /// limits is zero.
     pub fn new(plugins: Vec<WasmPluginConf>) -> Result<Self> {
         Self::new_with_services(plugins, WasmServices::default())
     }
 
-    /// Compile each plugin and start its guests, with the services of your proxy.
+    /// Compile the plugins and start their guests, using your proxy's services.
     ///
-    /// Use it when your plugins send callouts, or to send guest log lines to your own logger,
-    /// for example to keep them in the `tracing` span of the request. Otherwise it is the same
-    /// as [WasmRuntime::new].
+    /// Use this when your plugins send callouts, define metrics, or read fixed properties, or
+    /// when guest log lines should go to your own logger, e.g. to keep them in the request's
+    /// `tracing` span. With [WasmServices::default] this is the same as [WasmRuntime::new].
     ///
     /// # Errors
     ///
-    /// The errors of [WasmRuntime::new], and an error when
-    /// [max_callouts_in_flight](WasmServices::max_callouts_in_flight) is zero or over its
-    /// maximum.
+    /// Returns the same errors as [WasmRuntime::new]. Also returns an error if
+    /// [max_callouts_in_flight](WasmServices::max_callouts_in_flight) is zero or greater than
+    /// `tokio::sync::Semaphore::MAX_PERMITS`.
     pub fn new_with_services(plugins: Vec<WasmPluginConf>, services: WasmServices) -> Result<Self> {
         let connector = services
             .callout_connector
             .clone()
             .unwrap_or_else(|| Arc::new(Connector::new(None)));
         let request_sender = Arc::new(ConnectorSender::new(connector, &services));
-        // A callout from the root callback thread opens its connections on the tokio runtime of
-        // that thread. That tokio runtime stops when this `WasmRuntime` drops, so the root
-        // callouts use a connector of their own
+        // Callouts sent from the root callback thread open their connections on that thread's
+        // tokio runtime, which is shut down when this `WasmRuntime` is dropped. Give them a
+        // connector of their own so that requests never reuse one of those connections.
         let root_callback_connector = Arc::new(Connector::new(None));
         let root_callback_sender =
             Arc::new(ConnectorSender::new(root_callback_connector, &services));
@@ -143,8 +150,10 @@ impl WasmRuntime {
             .with_external_ticks(true)
             .build()
             .or_err(ErrorType::InternalError, "failed to build the wasm engine")?;
-        let host =
-            Host::new(&engine).or_err(ErrorType::InternalError, "failed to link the host")?;
+        let host = Host::new(&engine).or_err(
+            ErrorType::InternalError,
+            "failed to link the Proxy-Wasm host functions",
+        )?;
         let root_callback_thread = RootCallbackThread::new();
         let shared_store = new_shared_store(&root_callback_thread, services.metric_sink.clone());
         let fixed_properties = Arc::new(services.fixed_properties);
@@ -177,31 +186,34 @@ impl WasmRuntime {
         })
     }
 
-    /// Build a chain of the plugins in `names`.
+    /// Build a chain from the plugins listed in `names`.
     ///
-    /// The request phase runs the plugins in this order, and the response phase runs them in
-    /// reverse. A plugin can be in several chains, and all of them use its guests.
+    /// Plugins run in the given order on the request and in reverse order on the response. A
+    /// plugin may be part of several chains, which then share its guests.
     ///
     /// # Errors
     ///
-    /// An error when `names` is empty, when a name is not in the runtime, or when a name is listed
-    /// twice.
+    /// Returns an error if `names` is empty, if a name does not belong to a plugin of this
+    /// runtime, or if a name is listed more than once.
     pub fn chain(&self, names: &[&str]) -> Result<WasmChain> {
         if names.is_empty() {
-            return Error::e_explain(ErrorType::InternalError, "a wasm chain needs a plugin");
+            return Error::e_explain(
+                ErrorType::InternalError,
+                "wasm chain needs at least one plugin",
+            );
         }
         let mut plugins = Vec::with_capacity(names.len());
         for name in names {
             let Some(index) = self.inner.names.get(*name) else {
                 return Error::e_explain(
                     ErrorType::InternalError,
-                    format!("wasm plugin {name} is not in the runtime"),
+                    format!("wasm plugin {name}: not in the runtime"),
                 );
             };
             if plugins.contains(index) {
                 return Error::e_explain(
                     ErrorType::InternalError,
-                    format!("wasm plugin {name} is in the chain twice"),
+                    format!("wasm plugin {name}: listed twice in the chain"),
                 );
             }
             plugins.push(*index);
@@ -209,27 +221,27 @@ impl WasmRuntime {
         Ok(WasmChain::new(self.inner.clone(), plugins))
     }
 
-    /// Return the number of plugin contexts that are open.
+    /// Return the number of open plugin contexts.
     ///
-    /// Each plugin of a chain opens one context for each request, and
-    /// [WasmCtx::logging](crate::WasmCtx::logging) closes it. The number returns to zero when no
-    /// request is in progress.
+    /// Each plugin in a chain opens one context per request, which is closed by
+    /// [WasmCtx::logging](crate::WasmCtx::logging). The count drops back to zero once no request
+    /// is in progress.
     pub fn open_contexts(&self) -> usize {
         self.inner.pools.iter().map(GuestPool::open_contexts).sum()
     }
 
-    /// Return the number of plugin contexts that a guest holds after its request ended.
+    /// Return the number of plugin contexts kept open after their requests ended.
     ///
-    /// A guest holds a context when its `proxy_on_done` returns `false`, and it releases the
-    /// context later with `proxy_done`, for example when the response to a callout arrives.
+    /// A plugin keeps a context by returning `false` from `proxy_on_done` and releases it later
+    /// by calling `proxy_done`, e.g. once a callout response has arrived.
     pub fn held_contexts(&self) -> usize {
         self.inner.pools.iter().map(GuestPool::held_contexts).sum()
     }
 
     /// Return the number of callouts in flight.
     ///
-    /// A callout counts until it receives its response or reaches its timeout, even when its
-    /// request has already ended.
+    /// A callout is counted until its response has been received or it has timed out, even if
+    /// the request that sent it has already ended.
     pub fn callouts_in_flight(&self) -> usize {
         self.inner.callout_launcher.in_flight_count()
     }
@@ -244,11 +256,16 @@ impl fmt::Debug for WasmRuntime {
 }
 
 impl RuntimeInner {
-    /// Start the root callback thread and the epoch ticker on the first call.
+    /// Start the root callback thread and the epoch ticker if they are not running yet.
     ///
-    /// The threads do not start in [WasmRuntime::new], because in daemon mode Pingora forks
-    /// after the runtime is built, and the forked process has no threads of its parent. If a
-    /// thread cannot start, this returns an error and the next call tries again.
+    /// The threads cannot be started in [WasmRuntime::new]. When daemonizing, Pingora forks after
+    /// the runtime has been built, and threads do not survive a fork. This is called on the
+    /// request path instead, where only the first successful call does any work.
+    ///
+    /// # Errors
+    ///
+    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if a thread cannot be started. The
+    /// next call will try again.
     pub(crate) fn start_threads(self: &Arc<Self>) -> Result<()> {
         self.threads_started.get_or_try_init(|| {
             self.root_callback_thread.start(Arc::downgrade(self))?;
@@ -271,7 +288,7 @@ mod tests {
     use proxy_wasm_host::Limits;
 
     #[test]
-    fn new_with_services_refuses_a_limit_that_it_cannot_apply() {
+    fn new_with_services_rejects_invalid_callout_limit() {
         let cases = [0, usize::MAX];
 
         for limit in cases {
@@ -294,30 +311,33 @@ mod tests {
     }
 
     #[test]
-    fn new_refuses_each_bad_input() {
+    fn new_rejects_invalid_input() {
         let text = std::env::temp_dir().join(format!("pingora-wasm-text-{}", std::process::id()));
         std::fs::write(&text, "not wasm").unwrap();
         let mut fuel = plugin("fuel", fixture("add-request-header"), 1);
         fuel.limits = Limits::default().with_fuel(10);
         let cases = [
-            (vec![], "no wasm plugin to run"),
+            (vec![], "wasm runtime needs at least one plugin"),
             (
                 vec![
                     plugin("a", fixture("add-request-header"), 1),
                     plugin("a", fixture("add-request-header"), 1),
                 ],
-                "wasm plugin a is listed twice",
+                "wasm plugin a: duplicate plugin name",
             ),
             (
                 vec![plugin("zero", fixture("add-request-header"), 0)],
-                "zero has zero slots",
+                "zero: slots must be at least 1",
             ),
-            (vec![fuel], "fuel sets a fuel limit"),
+            (vec![fuel], "fuel: fuel limits are not supported"),
             (
                 vec![plugin("gone", "/no/such/file.wasm".into(), 1)],
                 "failed to read wasm plugin gone",
             ),
-            (vec![plugin("text", text, 1)], "text does not compile"),
+            (
+                vec![plugin("text", text, 1)],
+                "failed to compile wasm plugin text",
+            ),
             (
                 vec![plugin(
                     "noabi",
@@ -330,7 +350,7 @@ mod tests {
                     ),
                     1,
                 )],
-                "noabi is not a supported module",
+                "noabi: not a supported Proxy-Wasm module",
             ),
             (
                 vec![plugin(
@@ -344,7 +364,7 @@ mod tests {
                     ),
                     1,
                 )],
-                "refused refused to start",
+                "refused: proxy_on_vm_start returned false, guest not started",
             ),
             (
                 vec![plugin(
@@ -358,19 +378,19 @@ mod tests {
                     ),
                     1,
                 )],
-                "trapped failed to start",
+                "trapped: guest failed to start",
             ),
         ];
 
         for (plugins, message) in cases {
             let err = refusal(plugins);
 
-            assert!(err.contains(message), "{err} lacks {message}");
+            assert!(err.contains(message), "{message} not found in {err}");
         }
     }
 
     #[test]
-    fn chain_refuses_bad_names() {
+    fn chain_rejects_invalid_names() {
         let runtime =
             WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 1)]).unwrap();
 
@@ -379,13 +399,13 @@ mod tests {
             .map(|names| runtime.chain(names).err().unwrap().to_string())
             .collect();
 
-        assert!(errors[0].contains("a wasm chain needs a plugin"));
-        assert!(errors[1].contains("wasm plugin missing is not in the runtime"));
-        assert!(errors[2].contains("wasm plugin a is in the chain twice"));
+        assert!(errors[0].contains("wasm chain needs at least one plugin"));
+        assert!(errors[1].contains("wasm plugin missing: not in the runtime"));
+        assert!(errors[2].contains("wasm plugin a: listed twice in the chain"));
     }
 
     #[test]
-    fn every_plugin_holds_the_same_store() {
+    fn all_guests_share_one_store() {
         let runtime = WasmRuntime::new(vec![
             plugin("a", fixture("add-request-header"), 2),
             plugin("b", fixture("http-example"), 1),
@@ -420,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn new_with_services_sends_guest_lines_to_the_sink() {
+    fn guest_log_lines_go_to_configured_sink() {
         let sink = Arc::new(Recording::default());
 
         let services = WasmServices {
@@ -439,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn the_public_types_are_send_and_sync() {
+    fn public_types_are_send_and_sync() {
         fn send_sync<T: Send + Sync>() {}
 
         send_sync::<WasmRuntime>();

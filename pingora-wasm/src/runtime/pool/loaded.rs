@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A started guest in its slot, and what it reports to the root callback thread after each
-//! call.
+//! Loaded guest
+//!
+//! A started guest in its slot, and the reporting to the root callback thread that follows each
+//! guest call.
 
 use super::events::{RootCallbackEvent, RootCallbackLink};
 use crate::callout::{AcceptedCallout, GuestCalloutService};
@@ -22,23 +24,23 @@ use proxy_wasm_host::abi::v0_2_1::{CallScope, ContextId, ContextState, Guest};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// A stream context that the guest holds after its request ended, because its
-/// `proxy_on_done` returned `false`.
+/// A stream context whose guest returned `false` from `proxy_on_done` to keep it after its
+/// request ended.
 struct HeldContext {
     context: ContextId,
-    /// Whether the context ended in `logging`, which means that it still owes `proxy_on_log`.
+    /// Whether the context ended in `logging` and therefore still needs `proxy_on_log`.
     needs_on_log: bool,
 }
 
-/// A started guest, the root context of its plugin, and its callout service.
+/// A started guest with its plugin's root context and its callout service.
 pub(crate) struct Loaded {
     pub(crate) guest: Guest,
     pub(crate) root: ContextId,
     pub(crate) callout_service: Arc<GuestCalloutService>,
     root_callback_link: RootCallbackLink,
     held_contexts: Vec<HeldContext>,
-    /// The number of held contexts of the slot, which `held_contexts` of the runtime reads
-    /// with no lock.
+    /// The slot's count of held contexts, kept in an atomic so that
+    /// `WasmRuntime::held_contexts` can read it without locking the slot.
     held_context_count: Arc<AtomicUsize>,
 }
 
@@ -60,10 +62,10 @@ impl Loaded {
         }
     }
 
-    /// Report to the root callback thread what the last guest call changed.
+    /// Report the effects of the last guest call to the root callback thread.
     ///
-    /// The report has the tick period and the queues of the root, and each held context that the
-    /// guest finished with `proxy_done`.
+    /// This covers changes to the root context's tick period and queue registrations, and every
+    /// held context the guest has since finished with `proxy_done`.
     pub(crate) fn report_to_root_callbacks(&mut self) {
         let changes = self.guest.take_changes();
         if !changes.is_empty() {
@@ -92,11 +94,11 @@ impl Loaded {
         }
     }
 
-    /// Record that the guest holds `context` after its request ended.
+    /// Record that the guest is keeping `context` after its request ended.
     ///
-    /// `callouts` are the callouts that the context sent while it ended, and the root callback
-    /// thread delivers their results. Every other callout that the context still has open gets
-    /// a failure, because the request that sent it no longer reads its result.
+    /// `callouts` are the ones the context sent while it was ending. They are passed to the root
+    /// callback thread, which delivers their results. Any other callout the context still has
+    /// open is failed, since the request that would have received its result is gone.
     pub(crate) fn hold_context(
         &mut self,
         context: ContextId,
@@ -127,9 +129,9 @@ impl Loaded {
         }
     }
 
-    /// Send the callouts that no request waits for to the root callback thread.
+    /// Hand callouts no request is waiting for to the root callback thread.
     ///
-    /// The thread delivers their results to `context`.
+    /// The thread starts them and delivers their results to `context`.
     pub(crate) fn send_callouts_to_root_callbacks(
         &self,
         context: ContextId,
@@ -145,10 +147,10 @@ impl Loaded {
         }
     }
 
-    /// Run `body` for `context` with no request, under the root stream state.
+    /// Run `body` for `context` outside of a request, under the root stream state.
     ///
-    /// Return the result with the callouts that the guest sent from `context`, after the changes
-    /// of the call are reported to the root callback thread.
+    /// Returns the result of `body` together with the callouts the guest sent from `context`.
+    /// The effects of the call are reported to the root callback thread before this returns.
     pub(crate) fn run_root_callback<R>(
         &mut self,
         context: ContextId,

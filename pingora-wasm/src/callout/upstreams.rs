@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The upstreams that plugins can send callouts to.
+//! Callout upstreams
 
 use async_trait::async_trait;
 use pingora_core::upstreams::peer::HttpPeer;
@@ -20,15 +20,15 @@ use pingora_error::{Error, ErrorType, Result};
 use pingora_http::RequestHeader;
 use std::collections::HashMap;
 
-/// The interface that maps the upstream names of callouts to peers.
+/// Resolver of callout upstream names to peers.
 ///
-/// A plugin passes an upstream name, such as `authz`, with each callout. Envoy calls this name
-/// a cluster. Implement this trait to resolve the names with your own service discovery and
-/// load balancing, and set it as
-/// [WasmServices::callout_upstreams](crate::WasmServices::callout_upstreams). If each upstream
-/// has one fixed peer, use [StaticCalloutUpstreams].
+/// Every callout a plugin makes has an upstream name, such as `authz`. Implement this trait
+/// to resolve those names with your own service discovery and load balancing, and set your
+/// implementation as
+/// [WasmServices::callout_upstreams](crate::WasmServices::callout_upstreams). If every upstream
+/// has a single fixed peer, you can use [StaticCalloutUpstreams] instead.
 ///
-/// For example, to select a backend of a load balancer by the `host` of the callout:
+/// For example, to pick a load balancer backend by the callout's `host` header:
 ///
 /// ```
 /// use async_trait::async_trait;
@@ -62,48 +62,49 @@ use std::collections::HashMap;
 /// ```
 #[async_trait]
 pub trait CalloutUpstreams: Send + Sync {
-    /// Return whether the plugin can send callouts to the upstream.
+    /// Return whether the plugin may send callouts to the upstream.
     ///
-    /// The runtime calls this method inside the plugin's call to `proxy_http_call`, so it must
-    /// not block. When it returns `false`, the plugin receives `BAD_ARGUMENT` and no callout is
+    /// This is called from inside the plugin's `proxy_http_call`, so it must not block. If it
+    /// returns `false`, `proxy_http_call` returns `BAD_ARGUMENT` to the plugin and no callout is
     /// sent.
     fn has_upstream(&self, plugin_name: &str, upstream_name: &str) -> bool;
 
     /// Select the peer for one callout.
     ///
-    /// The runtime calls this method in the task that sends the callout, after
-    /// [Self::has_upstream] returned `true`. The time it takes counts against the timeout of the
-    /// callout, and the runtime drops the future when that timeout expires.
+    /// This is called from the task that sends the callout, after [Self::has_upstream] has
+    /// returned `true` for it. The time spent here counts against the callout's timeout, and the
+    /// future is dropped if that timeout expires.
     ///
-    /// `HttpPeer::new` resolves a host name with a blocking call, so build your peers before the
-    /// server starts or pass an IP address. A peer with TLS needs a TLS feature of this crate,
-    /// such as `openssl` or `rustls`. Without one, the callout fails at its timeout.
+    /// `HttpPeer::new` resolves a hostname with a blocking call, so build your peers before the
+    /// server starts or pass an IP address. A TLS peer needs one of this crate's TLS features,
+    /// such as `openssl` or `rustls`, to be enabled. Without one, the callout fails when its
+    /// timeout expires.
     ///
     /// # Errors
     ///
-    /// Return an error when the upstream has no peer to offer, for example when every backend
-    /// is unhealthy. The plugin then receives a 503 response with the body
-    /// `no healthy upstream`.
+    /// Return an error if the upstream has no peer to offer, e.g. because every backend is
+    /// unhealthy. The plugin then gets a 503 response with the body `no healthy upstream`.
     async fn callout_peer(&self, target: &CalloutTarget<'_>) -> Result<Box<HttpPeer>>;
 }
 
-/// A callout that needs a peer.
+/// The callout a peer is being selected for.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub struct CalloutTarget<'a> {
-    /// The name of the plugin that sent the callout.
+    /// The name of the plugin that made the callout.
     pub plugin_name: &'a str,
-    /// The upstream name that the plugin passed.
+    /// The upstream name the plugin passed to `proxy_http_call`.
     pub upstream_name: &'a str,
-    /// The request header of the callout. Its `host` header has the `:authority` that the
-    /// plugin passed, which you can use as a load balancing key.
+    /// The request header of the callout. Its `host` header holds the `:authority` the plugin
+    /// passed, which you can use as a load balancing key.
     pub request: &'a RequestHeader,
 }
 
 impl<'a> CalloutTarget<'a> {
-    /// Create a target, for example to test your own [CalloutUpstreams].
+    /// Create a target, e.g. to test your own [CalloutUpstreams].
     ///
-    /// Fields that are added later get a default value.
+    /// The struct is non-exhaustive, so this is how you build one outside of this crate. Any
+    /// field added in a later version will be given a default value here.
     pub fn new(plugin_name: &'a str, upstream_name: &'a str, request: &'a RequestHeader) -> Self {
         CalloutTarget {
             plugin_name,
@@ -113,9 +114,9 @@ impl<'a> CalloutTarget<'a> {
     }
 }
 
-/// A fixed map from upstream names to peers.
+/// A fixed map of upstream names to peers.
 ///
-/// Every plugin of the runtime can send callouts to every upstream in the map.
+/// Every plugin in the runtime may send callouts to every upstream in the map.
 #[derive(Debug, Clone, Default)]
 pub struct StaticCalloutUpstreams {
     peers: HashMap<String, HttpPeer>,
@@ -127,12 +128,14 @@ impl StaticCalloutUpstreams {
         Self::default()
     }
 
-    /// Add an upstream. Return the peer that the upstream had before, if any.
+    /// Add an upstream, or replace the peer of one already in the map.
+    ///
+    /// Returns the peer the upstream had before, if any.
     pub fn insert(&mut self, upstream_name: impl Into<String>, peer: HttpPeer) -> Option<HttpPeer> {
         self.peers.insert(upstream_name.into(), peer)
     }
 
-    /// Return the peer of an upstream.
+    /// Return the peer of an upstream, or `None` if the upstream is not in the map.
     pub fn peer(&self, upstream_name: &str) -> Option<&HttpPeer> {
         self.peers.get(upstream_name)
     }
@@ -149,7 +152,10 @@ impl CalloutUpstreams for StaticCalloutUpstreams {
             Some(peer) => Ok(Box::new(peer.clone())),
             None => Error::e_explain(
                 ErrorType::ConnectNoRoute,
-                format!("callout upstream {} has no peer", target.upstream_name),
+                format!(
+                    "no peer configured for callout upstream {}",
+                    target.upstream_name
+                ),
             ),
         }
     }
@@ -164,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_returns_the_peer_that_it_replaced() {
+    fn insert_returns_replaced_peer() {
         let mut upstreams = StaticCalloutUpstreams::new();
         let first = upstreams.insert("authz", peer(8181));
 
@@ -180,7 +186,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn static_upstreams_return_the_peer_of_an_upstream_in_the_map() {
+    async fn static_upstreams_resolve_only_inserted_names() {
         let mut upstreams = StaticCalloutUpstreams::new();
         upstreams.insert("authz", peer(8181));
         let request = RequestHeader::build("GET", b"/", None).unwrap();

@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! What a guest tells the root callback thread, and where the guest is.
+//! Root callback events
+//!
+//! Events sent to the root callback thread about the effects of guest calls, and the types that
+//! identify the guest an event is about.
 
 use crate::callout::AcceptedCallout;
 use crate::root_callbacks::RootCallbackPluginState;
@@ -20,45 +23,45 @@ use proxy_wasm_host::abi::v0_2_1::{CalloutId, Changes, ContextId, GuestId, Queue
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
-/// One slot of one pool.
+/// A slot, identified by its pool and its index within that pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SlotIndex {
     pub(crate) pool_index: usize,
     pub(crate) slot_index: usize,
 }
 
-/// One guest, in the slot where it runs.
+/// A guest together with the slot it runs in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct GuestAddress {
     pub(crate) slot: SlotIndex,
     pub(crate) guest: GuestId,
 }
 
-/// An event that tells the root callback thread about a guest call on another thread.
+/// An event sent to the root callback thread.
 pub(crate) enum RootCallbackEvent {
-    /// A guest call changed the tick period or registered a queue.
+    /// A guest call changed the root context's tick period or registered a queue.
     TicksOrQueuesChanged {
         address: GuestAddress,
         root: ContextId,
         changes: Changes,
     },
-    /// A queue got an item.
+    /// An item was enqueued on a shared queue.
     QueueItem(QueueId),
-    /// Callouts whose results go to `context` with no request. These are the callouts of a root,
-    /// and the callouts of a context that the guest held after its request.
+    /// Callouts to start whose results are delivered to `context` outside of a request. They
+    /// were sent by a root context, or by a context the guest kept after its request ended.
     CalloutsToStart {
         address: GuestAddress,
         context: ContextId,
         callouts: Vec<AcceptedCallout>,
     },
-    /// Callouts that a held context sent during its request, whose results no task delivers.
-    /// The context receives a failure for each one.
+    /// Callouts a held context sent during its request, whose results will no longer be
+    /// delivered. The context gets a failure for each of them.
     OpenCalloutsToFail {
         address: GuestAddress,
         context: ContextId,
         callouts: Vec<CalloutId>,
     },
-    /// The guest called `proxy_done` for a context that it held.
+    /// The guest called `proxy_done` for a held context.
     HeldContextDone {
         address: GuestAddress,
         context: ContextId,
@@ -68,7 +71,7 @@ pub(crate) enum RootCallbackEvent {
 
 pub(crate) type RootCallbackSender = UnboundedSender<RootCallbackEvent>;
 
-/// The address and plugin of a guest, and the sender to the root callback thread.
+/// A guest's address and plugin state, with the sender for its root callback events.
 pub(crate) struct RootCallbackLink {
     pub(crate) address: GuestAddress,
     pub(crate) plugin: Arc<RootCallbackPluginState>,
@@ -89,7 +92,8 @@ impl RootCallbackLink {
     }
 
     pub(crate) fn send(&self, event: RootCallbackEvent) {
-        // The receiver is gone only when the runtime drops, and then nothing waits for events
+        // The receiver is only dropped when the runtime is dropped, and then the event is not
+        // needed
         let _ = self.sender.send(event);
     }
 }

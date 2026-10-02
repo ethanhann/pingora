@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The callouts of one request.
+//! Per-request callouts
 
 use super::{AcceptedCallout, CalloutResult};
 use proxy_wasm_host::abi::v0_2_1::CalloutId;
@@ -22,11 +22,12 @@ use std::pin::Pin;
 use std::task::Poll;
 use tokio::task::JoinHandle;
 
-/// The result of a callout that the plugin did not receive yet.
+/// The result of a started callout that has not been delivered to the plugin yet.
 #[derive(Debug)]
 pub(crate) enum PendingResult {
-    /// The task that sends the callout returns the result.
+    /// The result will be returned by the task sending the callout.
     FromTask(JoinHandle<CalloutResult>),
+    /// The result was decided without sending the callout.
     Known(CalloutResult),
 }
 
@@ -36,34 +37,33 @@ struct PendingCallout {
     result: PendingResult,
 }
 
-/// The callouts of the plugins of one request.
+/// Callouts made by the plugins of one request.
 ///
-/// A callout that a plugin sends during a guest call stays in `accepted` until the phase starts
-/// its task. When the plugin is paused, the started callout moves to `pending`, where the phase
-/// waits for its result. For a request with no callout, both lists stay empty and allocate
-/// nothing.
+/// Callouts made during a guest call are kept in `accepted` until the phase starts their tasks.
+/// If the plugin is paused at that point, the started callouts move to `pending`, where the
+/// phase waits for their results. Both lists stay empty, and allocate nothing, for a request
+/// that makes no callouts.
 #[derive(Default)]
 pub(crate) struct RequestCallouts {
     accepted: Vec<AcceptedCallout>,
     pending: Vec<PendingCallout>,
-    /// Whether a phase is waiting for a callout. It stays `true` when the future of the phase
-    /// is dropped during the wait.
+    /// Whether a phase is waiting for a callout result. This is left `true` if the phase's
+    /// future is dropped mid-wait, which makes the following phases fail the request.
     pub(crate) in_callout_wait: bool,
 }
 
 impl RequestCallouts {
-    /// Replace the callouts of the last guest call with those of a new one.
+    /// Replace the accepted callouts with those of the latest guest call.
     pub(crate) fn set_accepted(&mut self, accepted: Vec<AcceptedCallout>) {
         self.accepted = accepted;
     }
 
-    /// Remove and return the callouts of the last guest call.
+    /// Take the callouts accepted during the latest guest call.
     pub(crate) fn take_accepted(&mut self) -> Vec<AcceptedCallout> {
         mem::take(&mut self.accepted)
     }
 
-    /// Add a started callout of the plugin at `position`, so that the phase can wait for its
-    /// result.
+    /// Track a started callout of the plugin at `position` so the phase can wait for its result.
     pub(crate) fn add_pending(&mut self, position: usize, id: CalloutId, result: PendingResult) {
         self.pending.push(PendingCallout {
             position,
@@ -72,24 +72,29 @@ impl RequestCallouts {
         });
     }
 
+    /// Return `true` if the plugin at `position` has a pending callout.
     pub(crate) fn has_pending(&self, position: usize) -> bool {
         self.pending.iter().any(|p| p.position == position)
     }
 
-    /// Stop waiting for the callouts of the plugin at `position`. Their tasks continue.
+    /// Stop tracking the pending callouts of the plugin at `position`.
+    ///
+    /// Their tasks keep running.
     pub(crate) fn forget_pending(&mut self, position: usize) {
         self.pending.retain(|p| p.position != position);
     }
 
-    /// Forget every callout of the request. The tasks that are running continue.
+    /// Drop every callout of the request.
+    ///
+    /// Tasks that are already running are not cancelled.
     pub(crate) fn clear(&mut self) {
         self.accepted.clear();
         self.pending.clear();
     }
 
-    /// Wait for the next result of a pending callout of the plugin at `position`.
+    /// Wait for the next pending callout of the plugin at `position` to finish.
     ///
-    /// Return `None` when the plugin has no pending callout. A task that panicked or was
+    /// Returns `None` if the plugin has no pending callout. A task that panicked or was
     /// cancelled yields [CalloutResult::Failed].
     pub(crate) async fn next_result(
         &mut self,

@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A proxy whose plugin works outside of each request: it logs on a timer, calls another
-//! service from that timer, reads a shared queue, counts requests in a Prometheus metric, and
-//! reads properties that the proxy and the session provide.
+//! Plugin services example
+//!
+//! The plugin in this proxy does more than filter requests. It logs on every tick, makes a
+//! callout from the tick, reads a shared queue, counts requests in a Prometheus metric, and
+//! reads properties provided by the proxy and the session.
 
 use async_trait::async_trait;
 use pingora_core::protocols::Digest;
@@ -38,7 +40,7 @@ pub struct PluginProxy {
     chain: WasmChain,
 }
 
-/// Return the route of a request, which is the first segment of its path.
+/// Return the first path segment of a request, used here as its route name.
 fn route_of(path: &str) -> &str {
     let route = path.trim_start_matches('/').split(['/', '?']).next();
     route.filter(|route| !route.is_empty()).unwrap_or("root")
@@ -53,7 +55,7 @@ impl ProxyHttp for PluginProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-        // A real proxy sets the route it chose. The plugin reads it as `xds.route_name`
+        // Your proxy would set the route it picked here. The plugin reads it as `xds.route_name`.
         let route = route_of(session.req_header().uri.path()).to_string();
         ctx.set_property(&["xds", "route_name"], route);
         match ctx.request_filter(session).await? {
@@ -118,15 +120,15 @@ impl ProxyHttp for PluginProxy {
 
 // RUST_LOG=info cargo run -p pingora-wasm --example wasm_plugin_services
 //
-// The ticks start with the first request. The plugin then logs a tick each second, and it calls
-// httpbin on the first tick and on every tenth tick after it.
+// Ticks begin with the first request. From then on the plugin logs a tick every second, and
+// calls httpbin on the first tick and on every tenth tick after that.
 //
 // curl -i 127.0.0.1:6190/anything/hello
-// The response has the headers x-route: anything, x-client, and x-node: example-node, and the
-// log has the line "path seen: /anything/hello" from the shared queue.
+// You should see the response headers x-route: anything, x-client, and x-node: example-node,
+// and the log line "path seen: /anything/hello" coming from the shared queue.
 //
 // curl 127.0.0.1:6192/metrics
-// The output has plugin_requests_total with the label vm_id="plugin-services".
+// You should see plugin_requests_total with the label vm_id="plugin-services".
 fn main() {
     env_logger::init();
 
@@ -145,7 +147,8 @@ fn main() {
     services
         .fixed_properties
         .insert(&["node", "name"], "example-node");
-    // One slot gives one tick each second. With a slot for each thread, each slot ticks
+    // The default of one slot gives you one tick per second. Every slot ticks on its own, so
+    // one slot per thread would multiply the ticks.
     let plugin = WasmPluginConf::new("plugin-services", PLUGIN_PATH);
     let runtime = WasmRuntime::new_with_services(vec![plugin], services).unwrap();
     let chain = runtime.chain(&["plugin-services"]).unwrap();

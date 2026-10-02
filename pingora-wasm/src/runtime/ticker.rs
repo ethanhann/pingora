@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The epoch ticker.
+//! Epoch ticker
 //!
-//! Wasmtime measures the CPU time of a guest in epochs, and the ticker advances the epoch.
-//! Without it, a guest has no CPU time limit.
+//! Wasmtime measures a guest's CPU time in epochs, and the engine is configured to leave advancing
+//! the epoch to this ticker. While no ticker is running, the CPU time limit of a guest is not
+//! enforced.
 
 use super::RuntimeInner;
 use crate::ERR_PLUGIN_FAILED;
@@ -26,7 +27,7 @@ use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::Duration;
 
-// Linux keeps 15 bytes of a thread name
+// Thread names are limited to 15 bytes on Linux
 const THREAD_NAME: &str = "wasm-epoch";
 
 pub(crate) struct Ticker {
@@ -42,7 +43,11 @@ impl Ticker {
         }
     }
 
-    /// Start the ticker thread. It stops when the runtime is dropped.
+    /// Spawn the ticker thread, which exits once the runtime has been dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [ERR_PLUGIN_FAILED] if the thread cannot be spawned.
     pub(crate) fn start(&self, runtime: &Arc<RuntimeInner>) -> Result<()> {
         let weak = Arc::downgrade(runtime);
         let period = runtime.engine.epoch_period();
@@ -57,7 +62,10 @@ impl Ticker {
                 #[cfg(test)]
                 ticking.store(false, Ordering::Relaxed);
             })
-            .or_err(ERR_PLUGIN_FAILED, "failed to start the wasm epoch ticker")?;
+            .or_err(
+                ERR_PLUGIN_FAILED,
+                "failed to spawn wasm epoch ticker thread",
+            )?;
         Ok(())
     }
 }
@@ -72,8 +80,10 @@ fn tick(runtime: &Weak<RuntimeInner>, period: Duration) {
     }
 }
 
-/// Run `f` with a ticker that stops when `f` returns, so a guest that loops forever while it
-/// starts reaches its time limit.
+/// Run `f` with a temporary ticker that stops when `f` returns.
+///
+/// Guests are started while the runtime is being built, before its own ticker thread exists.
+/// This keeps the CPU time limit in force for a guest that loops forever during startup.
 pub(super) fn with_ticker<R>(engine: &Engine, f: impl FnOnce() -> R) -> R {
     struct Done<'a>(&'a AtomicBool);
 
@@ -105,7 +115,7 @@ mod tests {
     use proxy_wasm_host::EngineConfig;
 
     #[test]
-    fn the_ticker_starts_on_the_first_call() {
+    fn ticker_starts_on_first_start_threads_call() {
         let runtime =
             WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 1)]).unwrap();
         let ticking = runtime.inner.ticker.ticking.clone();
@@ -118,7 +128,7 @@ mod tests {
     }
 
     #[test]
-    fn the_ticker_stops_when_the_runtime_drops() {
+    fn ticker_stops_when_runtime_is_dropped() {
         let runtime =
             WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 1)]).unwrap();
         runtime.inner.start_threads().unwrap();
@@ -134,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn with_ticker_returns_when_the_closure_panics() {
+    fn with_ticker_returns_when_closure_panics() {
         let engine = EngineConfig::new()
             .with_external_ticks(true)
             .build()
@@ -143,7 +153,7 @@ mod tests {
 
         thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                with_ticker(&engine, || panic!("the guest start failed"))
+                with_ticker(&engine, || panic!("guest failed to start"))
             }));
             let _ = sender.send(result.is_err());
         });

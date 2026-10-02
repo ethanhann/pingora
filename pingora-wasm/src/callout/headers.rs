@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The request header of a callout.
+//! Callout request header
 
 use http::header::{HeaderName, CONNECTION, CONTENT_LENGTH, HOST, TE, TRANSFER_ENCODING, UPGRADE};
 use http::Method;
@@ -27,18 +27,21 @@ const PSEUDO_PATH: &[u8] = b":path";
 const KEEP_ALIVE: &str = "keep-alive";
 const PROXY_CONNECTION: &str = "proxy-connection";
 
-/// Return `true` for a hop-by-hop header and for a header that frames the body.
+/// Return `true` if `name` is a hop-by-hop header or one that frames the body.
 fn is_framing_or_hop_header(name: &HeaderName) -> bool {
     [CONTENT_LENGTH, TRANSFER_ENCODING, CONNECTION, UPGRADE, TE].contains(name)
         || name == KEEP_ALIVE
         || name == PROXY_CONNECTION
 }
 
-/// Build the request header of a callout from the headers that `plugin` passed.
+/// Build the request header for a callout from the header pairs `plugin` passed.
 ///
-/// The method, the path, and the `host` come from the pseudo headers. The crate sets
-/// `content-length` itself, so a plugin cannot frame the body in another way. Return `None` when
-/// a header is not valid.
+/// The method, path, and `host` are taken from the `:method`, `:path`, and `:authority`
+/// pseudo-headers, and any other pseudo-header is ignored. A `host` header among the pairs is
+/// dropped, as are framing and hop-by-hop headers. `content-length` is set from `body_len` when
+/// the callout has a body, so a plugin cannot frame the body any other way.
+///
+/// Returns `None` if one of the three pseudo-headers is missing or a header is invalid.
 pub(crate) fn callout_request_header(
     plugin: &str,
     pairs: &HeaderPairs<'_>,
@@ -62,7 +65,7 @@ pub(crate) fn callout_request_header(
         }
         let name = HeaderName::from_bytes(key).ok()?;
         if name == HOST || is_framing_or_hop_header(&name) {
-            debug!("wasm plugin {plugin} passed the callout header {name}, which is not sent");
+            debug!("wasm plugin {plugin}: callout header {name} dropped, host, framing, and hop-by-hop headers are not forwarded");
             continue;
         }
         request.append_header(name, value.as_ref()).ok()?;
@@ -98,7 +101,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_callout_request_drops_hop_by_hop_headers_and_sets_its_length() {
+    fn callout_request_drops_hop_headers_and_sets_content_length() {
         let mut headers = post_to_authz();
         headers.extend([
             (":scheme", "https"),
@@ -135,7 +138,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_callout_request_needs_valid_headers() {
+    fn callout_request_rejects_invalid_headers() {
         let mut bad_name = post_to_authz();
         bad_name.push(("bad name", "value"));
         let mut bad_method = post_to_authz();

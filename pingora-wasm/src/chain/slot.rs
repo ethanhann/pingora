@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The slot lock that each phase takes, and the error for a plugin failure.
+//! Slot locking for request phases
+//!
+//! A phase locks the slot holding a plugin's guest for the length of each guest call. Guest
+//! failures are turned into errors here, since that is also where a broken guest gets replaced.
 
 use super::ctx::PluginRecord;
 use crate::runtime::pool::{GuestPool, Loaded, SlotGuard};
@@ -20,7 +23,7 @@ use crate::{plugin_failure, plugin_unavailable};
 use pingora_error::{Error, Result};
 use proxy_wasm_host::abi::v0_2_1::GuestError;
 
-/// A locked slot of a plugin.
+/// A locked slot in a plugin's guest pool.
 pub(super) struct LockedSlot<'a> {
     pub(super) pool: &'a GuestPool,
     pub(super) slot: usize,
@@ -34,7 +37,12 @@ impl<'a> LockedSlot<'a> {
         Ok(LockedSlot { pool, slot, guard })
     }
 
-    /// Lock the slot that holds the context of a request.
+    /// Lock the slot whose guest holds a request's context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if the guest that held the context
+    /// is no longer in its slot, because it was replaced or lost.
     pub(super) fn of_request(pool: &'a GuestPool, record: &PluginRecord) -> Result<Self> {
         match pool.lock(record.slot, record.guest) {
             Some(guard) => Ok(LockedSlot {
@@ -44,21 +52,28 @@ impl<'a> LockedSlot<'a> {
             }),
             None => Err(plugin_unavailable(
                 &pool.name,
-                "lost the guest of this request",
+                "guest for this request is gone",
             )),
         }
     }
 
+    /// Return the guest in the locked slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if the slot is empty.
     pub(super) fn loaded(&mut self) -> Result<&mut Loaded> {
         match self.guard.as_mut() {
             Some(loaded) => Ok(loaded),
-            None => Err(plugin_unavailable(&self.pool.name, "has no guest")),
+            None => Err(plugin_unavailable(&self.pool.name, "no guest available")),
         }
     }
 
-    /// Return the error for a guest failure.
+    /// Turn a guest error into the [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) error a phase
+    /// returns.
     ///
-    /// A failure that leaves the guest unusable also replaces the guest.
+    /// The slot's guest is replaced first if the error left it unusable. `what` is the part of
+    /// the message after the plugin name.
     pub(super) fn guest_failure(self, what: &str, cause: GuestError) -> Box<Error> {
         self.pool.replace_if_unusable(self.slot, self.guard, &cause);
         plugin_failure(&self.pool.name, what, cause)

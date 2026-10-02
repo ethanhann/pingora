@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The client that sends a callout to its peer.
+//! Callout client
+//!
+//! Callouts are sent through a Pingora connector. Every outcome, including a failure, is turned
+//! into a `CalloutResult` for the plugin.
 
 use super::result::{connect_failure, session_failure, OwnedHeaderPairs, PSEUDO_STATUS};
 use super::{AcceptedCallout, CalloutResult, CalloutTarget, CalloutUpstreams};
@@ -30,25 +33,25 @@ use pingora_timeout::timeout;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// The interface that sends a callout and returns its result.
+/// The transport a callout is sent over.
 ///
-/// The runtime sends callouts through a [ConnectorSender]. Tests of the phases replace it, so
-/// that they need no socket.
+/// The runtime uses a [ConnectorSender]. Phase tests substitute their own sender so they can run
+/// without a socket.
 #[async_trait]
 pub(crate) trait CalloutSender: Send + Sync {
     async fn send(&self, callout: AcceptedCallout) -> CalloutResult;
 }
 
-/// A sender that sends each callout through a Pingora connector.
+/// A [CalloutSender] backed by a Pingora connector.
 ///
-/// It reports each failure to the metric sink.
+/// Every failed callout is reported to the metric sink.
 pub(crate) struct ConnectorSender {
     pub(crate) connector: Arc<Connector>,
     pub(crate) upstreams: Arc<dyn CalloutUpstreams>,
     pub(crate) metric_sink: Arc<dyn WasmMetricSink>,
 }
 
-/// A session whose response header arrived.
+/// A callout session whose response header has been read.
 struct ResponseInProgress {
     session: HttpSession,
     peer: Box<HttpPeer>,
@@ -106,10 +109,14 @@ impl CalloutSender for ConnectorSender {
 }
 
 impl ConnectorSender {
-    /// Send the request of `callout` to a peer of its upstream, and read the response header.
+    /// Send the callout's request to a peer of its upstream and read the response header.
     ///
-    /// Return the failure, and the response to give to the plugin, when no response header
-    /// arrives.
+    /// A request that fails on a reused connection is retried once.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure to report together with the result to give the plugin if no
+    /// response header could be read.
     async fn send_to_peer(
         &self,
         callout: &AcceptedCallout,
@@ -120,7 +127,7 @@ impl ConnectorSender {
         let peer = match self.upstreams.callout_peer(&target).await {
             Ok(peer) => peer,
             Err(e) => {
-                debug!("wasm plugin {plugin} has no peer for the callout upstream {upstream}: {e}");
+                debug!("wasm plugin {plugin}: no peer for callout upstream {upstream}: {e}");
                 let response = CalloutResult::no_healthy_upstream_response();
                 return Err((CalloutFailure::NoPeer, response));
             }
@@ -130,7 +137,7 @@ impl ConnectorSender {
             let (mut session, reused) = match self.connector.get_http_session(&*peer).await {
                 Ok(connected) => connected,
                 Err(e) => {
-                    debug!("wasm plugin {plugin} cannot connect to the callout upstream {upstream}: {e}");
+                    debug!("wasm plugin {plugin}: failed to connect to callout upstream {upstream}: {e}");
                     let response = CalloutResult::connect_failure_response(&e);
                     return Err((connect_failure(&e), response));
                 }
@@ -147,21 +154,23 @@ impl ConnectorSender {
                 }
                 Err(e) => e,
             };
-            // A peer can close a pooled connection at any time, so try once more, as Pingora
-            // does for a proxied request
+            // The peer may have closed a pooled connection while it sat idle. Retry once, as
+            // Pingora does for a proxied request.
             if reused && may_retry {
                 may_retry = false;
                 continue;
             }
-            debug!("the callout of wasm plugin {plugin} to the upstream {upstream} failed: {e}");
+            debug!("wasm plugin {plugin}: callout to upstream {upstream} failed: {e}");
             let response = CalloutResult::response_for_session_error(&e);
             return Err((session_failure(&e), response));
         }
     }
 }
 
-/// Write the request of `callout`, and read the response header as the pairs that the plugin
-/// reads.
+/// Write the callout's request and read the response header.
+///
+/// The header is returned as the pairs the plugin will read, with `:status` first. On an H1
+/// session, informational responses other than `101` are skipped.
 async fn write_request_and_read_response_header(
     session: &mut HttpSession,
     callout: &AcceptedCallout,
@@ -178,10 +187,13 @@ async fn write_request_and_read_response_header(
     loop {
         session.read_response_header().await?;
         let Some(header) = session.response_header() else {
-            return Error::e_explain(ErrorType::ReadError, "no callout response header");
+            return Error::e_explain(
+                ErrorType::ReadError,
+                "no response header read from callout upstream",
+            );
         };
-        // A second header read panics on an H2 session, so only an H1 session skips
-        // informational responses
+        // Reading the header a second time panics on an H2 session, so informational
+        // responses are only skipped on H1
         let informational = header.status.is_informational()
             && header.status != StatusCode::SWITCHING_PROTOCOLS
             && matches!(session, HttpSession::H1(_));
@@ -198,7 +210,9 @@ async fn write_request_and_read_response_header(
     }
 }
 
-/// Read the response body and the trailers. Return `None` for a body over `limit`.
+/// Read the response body and, on an H2 session, the trailers.
+///
+/// Returns `None` if the body is larger than `limit`.
 async fn read_body_and_trailers(
     session: &mut HttpSession,
     limit: usize,
@@ -240,14 +254,15 @@ mod tests {
     const RESET_BODY_PREFIX: &str =
         "upstream connect error or disconnect/reset before headers. reset reason: ";
 
-    /// What an origin does after it wrote its response.
+    /// What a test origin does once it has written its response.
     #[derive(Clone, Copy)]
     enum AfterResponse {
         Close,
         KeepOpen,
     }
 
-    /// Read one request with a body of `body_len` bytes, and return it.
+    /// Read one request with a `body_len`-byte body, or as much of it as arrives before the
+    /// connection closes.
     async fn read_request(stream: &mut TcpStream, body_len: usize) -> Vec<u8> {
         let mut request = Vec::new();
         let mut part = [0u8; 1024];
@@ -263,7 +278,7 @@ mod tests {
         }
     }
 
-    /// Start an origin that reads one request and writes `response`.
+    /// Start an origin that accepts one connection, reads one request, and writes `response`.
     async fn start_h1_origin(response: &'static [u8], then: AfterResponse) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -278,7 +293,7 @@ mod tests {
         addr
     }
 
-    /// Return the address of a port that refuses connections.
+    /// Return a local address that nothing is listening on.
     async fn closed_port() -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         listener.local_addr().unwrap()
@@ -298,7 +313,7 @@ mod tests {
         }
     }
 
-    /// Build a POST callout to the upstream `authz` with `body`.
+    /// Build a POST callout to the `authz` upstream with `body`.
     fn post_callout(body: &'static str, timeout: Duration) -> AcceptedCallout {
         let upstreams = Arc::new(StaticCalloutUpstreams::new());
         let conf = PluginCalloutConf::new("a", upstreams, timeout, RESPONSE_LIMIT);
@@ -319,8 +334,9 @@ mod tests {
         sender_to(authz_peer(addr)).send(callout).await
     }
 
-    /// Return the status and the body of a response, and check that `:status` is its first
-    /// header.
+    /// Return the status and body of a response, asserting that `:status` is its first header.
+    ///
+    /// A failed callout is returned as the status `failed` with an empty body.
     fn status_and_body(result: &CalloutResult) -> (String, String) {
         let CalloutResult::Response { headers, body, .. } = result else {
             return ("failed".to_string(), String::new());
@@ -334,7 +350,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_callout_returns_the_response_of_its_peer() {
+    async fn callout_returns_peer_response() {
         use AfterResponse::{Close, KeepOpen};
         let cases: [(&[u8], AfterResponse, &str, &str); 4] = [
             (OK_RESPONSE, KeepOpen, "200", "ok"),
@@ -369,7 +385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_callout_sends_its_body_with_its_length() {
+    async fn callout_sends_body_with_content_length() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let received = Arc::new(Mutex::new(String::new()));
@@ -397,7 +413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_callout_with_no_response_header_returns_a_synthetic_response() {
+    async fn callout_without_response_header_gets_synthetic_response() {
         let reset = |reason: &str| format!("{RESET_BODY_PREFIX}{reason}");
         let refused = closed_port().await;
         let closes = start_h1_origin(b"", AfterResponse::Close).await;
@@ -430,7 +446,7 @@ mod tests {
 
             assert_eq!(status_and_body(&result), (status.to_string(), body));
             let CalloutResult::Response { headers, body, .. } = result else {
-                panic!("no response");
+                panic!("expected a response");
             };
             let names: Vec<_> = headers.iter().map(|(name, _)| &name[..]).collect();
             assert_eq!(names, [&b":status"[..], b"content-length", b"content-type"]);
@@ -439,7 +455,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_read_timeout_of_the_peer_gives_a_timeout_response() {
+    async fn peer_read_timeout_gives_timeout_response() {
         let silent = start_h1_origin(b"", AfterResponse::KeepOpen).await;
         let mut peer = authz_peer(silent);
         peer.options.read_timeout = Some(SHORT_TIMEOUT);
@@ -452,7 +468,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_callout_that_fails_after_its_response_header_has_no_response() {
+    async fn callout_failing_after_response_header_has_no_response() {
         let header: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n";
         let over_the_limit = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: 2000\r\n\r\n{}",
@@ -475,8 +491,8 @@ mod tests {
         }
     }
 
-    /// Start an origin that closes its first connection after one response and a second
-    /// request, and responds on its second connection.
+    /// Start an origin that responds once on its first connection, closes it when a second
+    /// request arrives, and responds to the request on its second connection.
     async fn start_origin_that_closes_a_pooled_connection() -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -495,7 +511,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_callout_on_a_pooled_connection_that_closed_uses_a_new_connection() {
+    async fn callout_retries_on_closed_pooled_connection() {
         let addr = start_origin_that_closes_a_pooled_connection().await;
         let sender = sender_to(authz_peer(addr));
         let first = sender.send(post_callout("", NO_TIMEOUT_EXPECTED)).await;
@@ -521,7 +537,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_callout_with_no_peer_returns_a_synthetic_response() {
+    async fn callout_without_peer_gets_no_healthy_upstream_response() {
         let sender = ConnectorSender {
             connector: Arc::new(Connector::new(None)),
             upstreams: Arc::new(NoHealthyPeer),
@@ -554,7 +570,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_callout_to_an_h2_peer_returns_its_trailers() {
+    async fn callout_to_h2_peer_returns_trailers() {
         let mut peer = authz_peer(start_h2_origin().await);
         peer.options.set_http_version(2, 2);
         let callout = post_callout("", NO_TIMEOUT_EXPECTED);
@@ -567,7 +583,7 @@ mod tests {
             trailers,
         } = result
         else {
-            panic!("no response");
+            panic!("expected a response");
         };
         assert_eq!(headers[0], (b":status".to_vec(), b"200".to_vec()));
         assert_eq!(&body[..], b"ok");

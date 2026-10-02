@@ -12,13 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The services of the proxy that the plugins of a runtime use.
+//! Proxy services for plugins
+//!
+//! [WasmServices] is what a proxy provides to its plugins. The rest of the module spawns callout
+//! tasks and limits how many callouts are in flight.
 
 use crate::callout::{
     AcceptedCallout, CalloutResult, CalloutSender, CalloutUpstreams, PendingResult,
     StaticCalloutUpstreams,
 };
-use crate::observability::{CalloutFailure, NoMetricSink, WasmMetricSink, LogCrateSink};
+use crate::observability::{CalloutFailure, LogCrateSink, NoMetricSink, WasmMetricSink};
 use crate::properties::WasmProperties;
 use futures::FutureExt;
 use log::warn;
@@ -33,40 +36,47 @@ use tokio::sync::Semaphore;
 
 const MAX_CALLOUTS_IN_FLIGHT: usize = 1024;
 
-/// The services of your proxy that the plugins of a [WasmRuntime](crate::WasmRuntime) use.
+/// The services your proxy provides to the plugins of a [WasmRuntime](crate::WasmRuntime).
 ///
 /// Start from [WasmServices::default] and set the fields you need.
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct WasmServices {
-    /// The destination of guest log lines. The default sends them to the `log` crate with the
-    /// target `pingora_wasm::guest`.
+    /// The sink for guest log lines.
+    ///
+    /// The default sink writes them to the `log` crate under the target `pingora_wasm::guest`.
     pub log_sink: Arc<dyn LogSink>,
-    /// The upstreams that plugins can send callouts to. The default has no upstream, so
-    /// `proxy_http_call` returns `BAD_ARGUMENT` for every callout.
+    /// The upstreams plugins may send callouts to.
+    ///
+    /// The default has no upstreams, so `proxy_http_call` returns `BAD_ARGUMENT` for every
+    /// callout.
     pub callout_upstreams: Arc<dyn CalloutUpstreams>,
-    /// The connector that sends the callouts and pools their connections. Default `None`, in
-    /// which case the runtime creates a connector with the default options.
+    /// The connector used to send callouts, which also pools their connections. Default `None`.
     ///
-    /// When you replace a runtime to reload plugins, pass the connector of the old runtime to
-    /// the new one to keep the connections.
+    /// With `None` the runtime creates a connector with the default options. If you pass your own
+    /// connector, pass the same one to the runtime that replaces this one, so that its pooled
+    /// connections are kept.
     ///
-    /// Callouts that a plugin sends with no request, for example from a tick, use a connector of
-    /// their own with the default options, because they run on a thread that stops with the
-    /// runtime.
+    /// Callouts a plugin sends outside of a request, e.g. from `proxy_on_tick`, do not use this
+    /// connector. They run on a thread that stops with the runtime, and are sent through a
+    /// separate connector with the default options.
     pub callout_connector: Option<Arc<Connector>>,
-    /// The maximum number of callouts that the runtime sends at the same time. Default 1024.
+    /// The maximum number of callouts the runtime will have in flight at once. Default 1024.
     ///
-    /// A callout over this limit is not sent, and its plugin receives a 503 response. The
-    /// limit cannot be zero or more than `tokio::sync::Semaphore::MAX_PERMITS`.
+    /// A callout over this limit is not sent, and its plugin receives a 503 response instead.
+    /// The limit must be at least 1 and no greater than `tokio::sync::Semaphore::MAX_PERMITS`.
     pub max_callouts_in_flight: usize,
-    /// The sink that receives the metrics that plugins define, and a report for each failed
-    /// callout. The default publishes nothing.
+    /// The sink for metrics defined by plugins and for reports of failed callouts.
     ///
-    /// When you replace a runtime to reload plugins, pass the same sink to the new one.
+    /// The default sink publishes nothing. When you replace a runtime to reload plugins, pass
+    /// the same sink to the new one.
     pub metric_sink: Arc<dyn WasmMetricSink>,
-    /// Properties for values of your proxy that do not change, such as `node.metadata.NAME`.
-    /// Every plugin can read them, also in `proxy_on_configure`. Default empty.
+    /// Properties for values of your proxy that never change, such as `node.metadata.NAME`.
+    /// Default empty.
+    ///
+    /// Every plugin can read them, including from `proxy_on_configure`. A plugin can override a
+    /// fixed property for its own request with `proxy_set_property`, which a property set with
+    /// [WasmCtx::set_property](crate::WasmCtx::set_property) does not allow.
     pub fixed_properties: WasmProperties,
 }
 
@@ -91,17 +101,18 @@ impl fmt::Debug for WasmServices {
     }
 }
 
-/// The senders of the callouts of a runtime.
+/// The callout senders of a runtime.
 pub(crate) struct CalloutSenders {
-    /// The sender of the callouts that requests wait for.
+    /// The sender for callouts a request is waiting for.
     pub(crate) for_requests: Arc<dyn CalloutSender>,
-    /// The sender of the callouts that the root callback thread delivers. It has a connector
-    /// of its own, because a connection belongs to the tokio runtime that opened it, and the
-    /// runtime of that thread stops when the `WasmRuntime` drops.
+    /// The sender for callouts whose results are delivered by the root callback thread.
+    ///
+    /// It has a connector of its own because a connection is tied to the tokio runtime that
+    /// opened it, and that thread's tokio runtime is shut down when the `WasmRuntime` is dropped.
     pub(crate) root_callback: Arc<dyn CalloutSender>,
 }
 
-/// The launcher of callout tasks for a runtime, with the limit on how many are in flight.
+/// A runtime's callout task launcher, which enforces the limit on callouts in flight.
 pub(crate) struct CalloutLauncher {
     senders: CalloutSenders,
     metric_sink: Arc<dyn WasmMetricSink>,
@@ -118,7 +129,7 @@ impl CalloutLauncher {
         if limit == 0 || limit > Semaphore::MAX_PERMITS {
             return Error::e_explain(
                 ErrorType::InternalError,
-                format!("max_callouts_in_flight of the wasm services cannot be {limit}"),
+                format!("invalid max_callouts_in_flight {limit} in wasm services"),
             );
         }
         Ok(CalloutLauncher {
@@ -129,20 +140,23 @@ impl CalloutLauncher {
         })
     }
 
-    /// Return the number of callouts that are being sent.
+    /// Return the number of callouts in flight.
     pub(crate) fn in_flight_count(&self) -> usize {
         self.limit - self.in_flight_permits.available_permits()
     }
 
-    /// Start the task that sends `callout` for a request.
+    /// Spawn the task that sends `callout` on behalf of a request.
     ///
-    /// Return a response in place of the task for a callout over the limit, and `None` when no
-    /// tokio runtime is running, so the callout cannot be sent.
+    /// A callout over the in-flight limit is not spawned, and a ready 503 response is returned in
+    /// its place. Returns `None` if no tokio runtime is running, in which case the callout is
+    /// dropped.
     pub(crate) fn spawn(&self, callout: AcceptedCallout) -> Option<PendingResult> {
         self.spawn_with(&self.senders.for_requests, callout)
     }
 
-    /// Start the task that sends `callout` for the root callback thread.
+    /// Spawn the task that sends `callout` on behalf of the root callback thread.
+    ///
+    /// Behaves like [Self::spawn], except that the callout goes through the root callback sender.
     pub(crate) fn spawn_for_root_callback(
         &self,
         callout: AcceptedCallout,
@@ -163,9 +177,7 @@ impl CalloutLauncher {
             return Some(PendingResult::Known(CalloutResult::overflow_response()));
         };
         let Ok(tokio_runtime) = Handle::try_current() else {
-            warn!(
-                "wasm plugin {plugin_name} sent a callout with no tokio runtime running, and the callout is dropped"
-            );
+            warn!("wasm plugin {plugin_name}: callout dropped, no tokio runtime is running");
             self.metric_sink
                 .callout_failed(&plugin_name, CalloutFailure::TaskFailed);
             return None;

@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Callouts for tests: the callbacks of the guests that make them, and a sender that returns a
-//! fixed result.
+//! Callout test support
+//!
+//! Callback bodies for guests that make callouts, and a `CalloutSender` that returns a canned
+//! result without using the network.
 
 use crate::callout::{AcceptedCallout, CalloutResult, CalloutSender, StaticCalloutUpstreams};
 use crate::{WasmCtx, WasmPluginConf, WasmRuntime, WasmServices};
@@ -24,21 +26,21 @@ use pingora_core::upstreams::peer::HttpPeer;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
-/// A callback that makes a callout to the upstream `authz`, and pauses.
+/// Callback that sends a callout to the `authz` upstream and pauses.
 pub(crate) const CALL_AND_PAUSE: &str = "(call $call_authz_and_pause)";
 pub(crate) const CALL_TWICE_AND_PAUSE: &str =
     "(drop (call $call_authz_and_pause)) (call $call_authz_and_pause)";
 pub(crate) const CALL_WITHOUT_PAUSE: &str = "(call $call_without_pause)";
-/// A callback that makes a callout, writes the log line `accepted` or `refused` for its status,
-/// and returns 1.
+/// Callback that sends a callout, logs `accepted` or `refused` depending on whether the host
+/// took it, and returns 1.
 pub(crate) const CALL_AND_LOG_STATUS: &str = "(call $call_and_log_status) (i32.const 1)";
-/// A callback that sends 418 when the request has the header `x-asked`.
+/// Callback that responds with 418 if the request has an `x-asked` header.
 pub(crate) const TEAPOT_IF_ASKED: &str = "(call $teapot_if_asked)";
 pub(crate) const CALL_AND_TRAP: &str = "(drop (call $call_authz_and_pause)) unreachable";
 pub(crate) const CONTINUE_REQUEST_AND_PAUSE: &str = "(call $continue_and_pause (i32.const 0))";
 pub(crate) const CONTINUE_RESPONSE_AND_PAUSE: &str = "(call $continue_and_pause (i32.const 1))";
 
-/// Bodies of `proxy_on_http_call_response`.
+/// Bodies for `proxy_on_http_call_response`.
 pub(crate) const CONTINUE_REQUEST: &str = "(call $continue (i32.const 0))";
 pub(crate) const CONTINUE_RESPONSE: &str = "(call $continue (i32.const 1))";
 pub(crate) const CONTINUE_REQUEST_ON_SECOND_DELIVERY: &str =
@@ -51,17 +53,17 @@ pub(crate) const STAY_PAUSED: &str = "";
 pub(crate) const LOG_RESULT: &str = "(call $log_result (local.get 2))";
 pub(crate) const CALL_WITH_NO_RESULT: &str = "(drop (call $call_authz_and_pause))";
 
-/// A sender that returns one result for every callout.
+/// A callout sender that returns the same result for every callout.
 pub(crate) struct FixedSender {
     result: Option<CalloutResult>,
-    /// The upstream and the path of each callout that arrived.
+    /// Upstream name and path of each callout received.
     pub(crate) sent: Mutex<Vec<(String, String)>>,
-    /// When set, a callout waits here before it returns its result.
+    /// If set, each callout waits to be notified here before returning its result.
     gate: Option<Arc<Notify>>,
 }
 
 impl FixedSender {
-    /// Create a sender whose callouts receive 200 with `body`.
+    /// Create a sender that returns a 200 response with `body` for every callout.
     pub(crate) fn responds(body: &'static str) -> Arc<Self> {
         let result = CalloutResult::Response {
             headers: vec![(b":status".to_vec(), b"200".to_vec())],
@@ -71,12 +73,12 @@ impl FixedSender {
         Self::with_result_and_gate(Some(result), None)
     }
 
-    /// Create a sender whose tasks panic.
+    /// Create a sender that panics on every callout.
     pub(crate) fn panics() -> Arc<Self> {
         Self::with_result_and_gate(None, None)
     }
 
-    /// Create a sender whose callouts receive 200 with `body` after `gate` opens.
+    /// Create a sender like [Self::responds] that holds each callout until `gate` is notified.
     pub(crate) fn responds_after(body: &'static str, gate: Arc<Notify>) -> Arc<Self> {
         let sender = Self::responds(body);
         Self::with_result_and_gate(sender.result.clone(), Some(gate))
@@ -103,11 +105,11 @@ impl CalloutSender for FixedSender {
         if let Some(gate) = &self.gate {
             gate.notified().await;
         }
-        self.result.clone().expect("the sender has no result")
+        self.result.clone().expect("sender built without a result")
     }
 }
 
-/// Return services with the upstream `authz`.
+/// Return services whose only callout upstream is `authz`.
 pub(crate) fn authz_services() -> WasmServices {
     let mut upstreams = StaticCalloutUpstreams::new();
     upstreams.insert("authz", HttpPeer::new("127.0.0.1:1", false, String::new()));
@@ -117,8 +119,8 @@ pub(crate) fn authz_services() -> WasmServices {
     }
 }
 
-/// Build a runtime whose callouts go to `sender`, and a request context from a chain of
-/// `plugins` in that order.
+/// Build a runtime that hands its callouts to `sender`, and a context for a chain of `plugins`
+/// in the order given.
 pub(crate) fn callout_ctx(
     plugins: Vec<WasmPluginConf>,
     sender: Arc<FixedSender>,

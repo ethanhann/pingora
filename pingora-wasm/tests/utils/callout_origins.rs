@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The origins that the callouts of the test plugins go to.
+//! Callout origins
+//!
+//! Local origins for the test plugins to send their callouts to.
 
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
@@ -28,16 +30,16 @@ use tokio::runtime::Runtime;
 
 static ORIGIN_RUNTIME: Lazy<Runtime> = Lazy::new(|| Runtime::new().unwrap());
 
-/// An origin that records each request, and responds with a fixed body or not at all.
+/// An origin that records each request and either responds with a fixed body or never responds.
 pub struct CalloutOrigin {
     addr: SocketAddr,
-    /// The path and the `host` of each request.
+    /// Path and `host` header of each request received, in lowercase.
     requests: Mutex<Vec<(String, String)>>,
     body: Option<&'static str>,
 }
 
 impl CalloutOrigin {
-    /// Start an origin that responds with `body`, or that never responds.
+    /// Start an origin that responds with `body`, or never responds when `body` is `None`.
     fn start(body: Option<&'static str>) -> Arc<Self> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -83,30 +85,30 @@ impl CalloutOrigin {
         let _ = stream.write_all(response.as_bytes()).await;
     }
 
-    /// Return the path and the `host` of each request so far.
+    /// Return the path and `host` header of every request received so far.
     pub fn requests(&self) -> Vec<(String, String)> {
         self.requests.lock().unwrap().clone()
     }
 
-    /// Wait until the first request arrives.
+    /// Wait for the first request to arrive.
     ///
     /// # Panics
     ///
-    /// Panics when no request arrives in five seconds.
+    /// Panics if no request arrives within five seconds.
     pub async fn wait_for_a_request(&self) {
         let arrived = super::eventually(|| !self.requests().is_empty()).await;
-        assert!(arrived, "no callout arrived at the origin");
+        assert!(arrived, "no callout reached the origin");
     }
 }
 
-/// Callout upstreams that send the callouts of each plugin to its own origin, whatever the
-/// upstream name.
+/// Callout upstreams that route each plugin's callouts to that plugin's own origin, ignoring
+/// the upstream name.
 pub struct CalloutOriginPerPlugin {
     origins: HashMap<&'static str, Arc<CalloutOrigin>>,
 }
 
 impl CalloutOriginPerPlugin {
-    /// Start one origin for each plugin name. An origin with no body never responds.
+    /// Start one origin per plugin name. An origin given no body never responds.
     pub fn start(plugins: &[(&'static str, Option<&'static str>)]) -> Arc<Self> {
         let origins = plugins
             .iter()
@@ -129,7 +131,7 @@ impl CalloutUpstreams for CalloutOriginPerPlugin {
     async fn callout_peer(&self, target: &CalloutTarget<'_>) -> Result<Box<HttpPeer>> {
         match self.origins.get(target.plugin_name) {
             Some(origin) => Ok(Box::new(HttpPeer::new(origin.addr, false, String::new()))),
-            None => Error::e_explain(ErrorType::InternalError, "the plugin has no origin"),
+            None => Error::e_explain(ErrorType::InternalError, "no origin for this plugin"),
         }
     }
 }

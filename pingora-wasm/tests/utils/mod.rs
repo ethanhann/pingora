@@ -45,13 +45,15 @@ pub fn fixture(name: &str) -> PathBuf {
         .join(format!("{name}.wasm"))
 }
 
-/// A guest log message, with the name of its plugin.
+/// A guest log message paired with the name of its plugin.
 type GuestMessage = (String, Vec<u8>);
 
-/// Each guest log message so far.
+/// Every guest log message recorded so far.
 static GUEST_MESSAGES: Lazy<Mutex<Vec<GuestMessage>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
-/// The log sink of every runtime of the test server.
+/// The log sink shared by every runtime of the test server.
+///
+/// Messages are recorded under the plugin name, or under the VM id when there is none.
 pub struct GuestMessageSink;
 
 impl LogSink for GuestMessageSink {
@@ -65,7 +67,7 @@ impl LogSink for GuestMessageSink {
     }
 }
 
-/// Return every guest log line so far, as `plugin_name: message`.
+/// Return every guest log line so far, formatted as `plugin_name: message`.
 pub fn guest_lines() -> Vec<String> {
     let messages = GUEST_MESSAGES.lock().unwrap();
     messages
@@ -74,7 +76,7 @@ pub fn guest_lines() -> Vec<String> {
         .collect()
 }
 
-/// Return the log messages of `plugin` so far, as the bytes that the guest wrote.
+/// Return the raw bytes of every message `plugin` has logged so far.
 pub fn guest_messages(plugin: &str) -> Vec<Vec<u8>> {
     let messages = GUEST_MESSAGES.lock().unwrap();
     messages
@@ -86,9 +88,9 @@ pub fn guest_messages(plugin: &str) -> Vec<Vec<u8>> {
 
 static RUNTIMES: OnceCell<HashMap<u16, WasmRuntime>> = OnceCell::new();
 
-/// The runtime of the service on `port`.
+/// Return the runtime behind the service on `port`.
 pub fn runtime(port: u16) -> &'static WasmRuntime {
-    &RUNTIMES.get().expect("the test server is started")[&port]
+    &RUNTIMES.get().expect("test server should be running")[&port]
 }
 
 pub struct TestServer;
@@ -143,8 +145,8 @@ pub async fn init() {
     .unwrap();
 }
 
-/// Start a peer that reads one request with a chunked body, and closes the connection with no
-/// response.
+/// Start a peer that reads one request with a chunked body and closes the connection without
+/// responding.
 pub async fn closing_peer() -> (u16, tokio::task::JoinHandle<()>) {
     use tokio::io::AsyncReadExt;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -200,7 +202,7 @@ pub fn url(port: u16, path: &str) -> String {
     format!("http://127.0.0.1:{port}{path}")
 }
 
-/// Wait until `check` returns true, for up to five seconds.
+/// Poll `check` every 10 ms until it returns `true`, giving up after five seconds.
 pub async fn eventually(check: impl Fn() -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {

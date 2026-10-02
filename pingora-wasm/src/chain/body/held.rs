@@ -15,9 +15,10 @@
 use super::BodyDirection;
 use std::mem;
 
-/// The body bytes that the plugins hold, by position in the chain.
+/// Body bytes held back for paused plugins, indexed by chain position.
 ///
-/// A list stays empty until a plugin holds bytes.
+/// Each list only grows once a plugin has bytes to hold, so a request where nothing is held
+/// allocates nothing.
 #[derive(Debug, Default)]
 pub(crate) struct HeldBodies {
     request: Vec<Vec<u8>>,
@@ -50,12 +51,12 @@ impl HeldBodies {
         list[position] = bytes;
     }
 
-    /// Take the response bytes that the plugins hold, in chain order.
+    /// Take all held response bytes, one entry per plugin in chain order.
     pub(crate) fn take_response(&mut self) -> Vec<Vec<u8>> {
         mem::take(&mut self.response)
     }
 
-    /// Return the number of bytes that the plugin at `position` holds.
+    /// Return the number of bytes held for the plugin at `position`.
     pub(crate) fn len(&self, direction: BodyDirection, position: usize) -> usize {
         let list = match direction {
             BodyDirection::Request => &self.request,

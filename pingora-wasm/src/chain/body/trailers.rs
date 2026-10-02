@@ -25,32 +25,34 @@ use proxy_wasm_host::abi::v0_2_1::types::StreamType;
 use proxy_wasm_host::HeaderMap;
 use std::mem;
 
-const PAUSED_THE_TRAILERS: &str = "paused the trailers";
+const PAUSED_THE_TRAILERS: &str = "paused on response trailers with no callout pending";
 
 impl WasmCtx {
-    /// Run `proxy_on_response_trailers` of each plugin, in reverse chain order.
+    /// Run `proxy_on_response_trailers` for each plugin, in reverse chain order.
     ///
-    /// Call it from `response_trailer_filter` with the arguments of that filter, and return what it
-    /// returns. Only plugins with [response_trailers](crate::WasmPluginConf::response_trailers)
-    /// turned on run. Plugins can read and change the trailers, and can read the request headers.
+    /// Call this from your `response_trailer_filter`, pass its arguments through, and return its
+    /// result. Only plugins that have
+    /// [response_trailers](crate::WasmPluginConf::response_trailers) enabled and export the
+    /// callback are run. Plugins can read and change the trailers, and can read the request
+    /// headers. This filter does nothing for a subrequest and once a plugin has sent its own
+    /// response.
     ///
-    /// Call it when you run plugins on response bodies, too. A response with trailers ends with the
-    /// trailers and not with a last body chunk, so a plugin that paused the body still holds bytes
-    /// here. This phase returns those bytes, and Pingora writes them to the downstream in place of
-    /// the trailers.
+    /// Call this even if you only run plugins on response bodies. A response with trailers ends
+    /// with the trailers, not with a last body chunk, so a plugin that paused on the body is
+    /// still holding bytes at this point. Those bytes are returned, and Pingora writes them to
+    /// the downstream in place of the trailers.
     ///
-    /// A plugin can pause the trailers while it waits for a callout, and this phase waits with
-    /// it.
+    /// A plugin may pause while waiting for a callout, in which case this filter waits with it.
     ///
     /// # Errors
     ///
-    /// An error of type [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) when a plugin traps, fails,
-    /// or sends its own response, or when a plugin pauses and has no callout to wait for.
-    /// Pingora logs an error from `response_trailer_filter` and sends the trailers, so end the
-    /// response in your filter if the trailers must not go out.
+    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if a plugin traps or otherwise fails,
+    /// if a plugin sends its own response, or if a plugin pauses with no callout pending. Pingora
+    /// only logs an error from `response_trailer_filter` and still sends the trailers, so end the
+    /// response in your filter if they must not go out.
     ///
-    /// When a plugin holds body bytes, this phase logs the failure and returns the bytes, so that
-    /// the downstream receives the whole body.
+    /// If a plugin was holding body bytes, the failure is logged and the bytes are returned
+    /// instead of the error, so the downstream still gets the whole body.
     pub async fn response_trailer_filter<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -76,8 +78,13 @@ impl WasmCtx {
         }
     }
 
-    /// Run the trailer callback of each plugin, in reverse chain order, and wait for the
-    /// callouts of a plugin that pauses to wait for them.
+    /// Run the trailer callback of each plugin in reverse chain order, waiting for callouts along
+    /// the way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if a callback fails, if a plugin sends
+    /// its own response, or if a plugin is still paused with no callout left to wait for.
     async fn run_trailer_callbacks<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -99,10 +106,10 @@ impl WasmCtx {
         Ok(())
     }
 
-    /// Run the trailer callback of the first `remaining` plugins of the chain, in reverse
-    /// order.
+    /// Run the trailer callbacks of the plugins at positions below `remaining`, in reverse order.
     ///
-    /// Return the position of a plugin that paused and has a callout to wait for.
+    /// Returns the position of a plugin that paused with a callout pending, or `None` once every
+    /// plugin has run.
     fn run_trailer_callbacks_before<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -134,7 +141,7 @@ impl WasmCtx {
             let sent = self.stream().plugin_response.take();
             let action = match action {
                 Ok(action) => action,
-                Err(e) => return Err(locked.guest_failure("failed in on_response_trailers", e)),
+                Err(e) => return Err(locked.guest_failure("proxy_on_response_trailers failed", e)),
             };
             drop(locked);
             let paused =
@@ -154,10 +161,11 @@ impl WasmCtx {
         Ok(None)
     }
 
-    /// Take the response body bytes that the plugins hold, in the order of the stream.
+    /// Take the response body bytes still held by plugins and join them in stream order.
     ///
-    /// The plugins run in reverse chain order, so the first plugin of the chain holds the earliest
-    /// bytes.
+    /// Response bodies run in reverse chain order, so the first plugin in the chain holds the
+    /// earliest bytes. A warning is logged for each plugin that held any. Returns `None` if
+    /// nothing was held.
     fn release_held(&mut self) -> Option<Bytes> {
         let held = self.held.take_response();
         let size: usize = held.iter().map(Vec::len).sum();
@@ -170,7 +178,7 @@ impl WasmCtx {
                 continue;
             }
             warn!(
-                "wasm plugin {} held {} body bytes, sent in place of the response trailers",
+                "wasm plugin {}: still held {} body bytes at the response trailers, sent in place of the trailers",
                 self.pool_at(position).name,
                 bytes.len()
             );
@@ -195,7 +203,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_changes_a_trailer() {
+    async fn plugin_changes_trailer() {
         let plugins = vec![body_plugin("a", Wat::response_trailers(SET_TRAILER))];
         let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
         let mut trailers = trailers();
@@ -211,11 +219,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pause_a_plugin_response_or_a_trap_fails() {
+    async fn trailer_pause_response_or_trap_fails() {
         let cases = [
-            (PAUSE, "paused the trailers"),
-            (TEAPOT, "sent a response after the response header"),
-            (TRAP, "failed in on_response_trailers"),
+            (PAUSE, "paused on response trailers with no callout pending"),
+            (TEAPOT, "response rejected, sent after the response header"),
+            (TRAP, "proxy_on_response_trailers failed"),
         ];
 
         for (body, message) in cases {
@@ -235,7 +243,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn held_bytes_are_released_once_in_place_of_the_trailers() {
+    async fn held_bytes_are_released_once_in_place_of_trailers() {
         let plugins = vec![body_plugin("a", Wat::response_body(HOLD))];
         let (_runtime, mut ctx, mut session, _client) = start_request(plugins, POST).await;
         ctx.response_body_filter(&mut session, &mut body_chunk("held"), false)
@@ -256,7 +264,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn held_bytes_are_joined_in_the_order_of_the_stream() {
+    async fn held_bytes_are_joined_in_stream_order() {
         let plugins = vec![
             body_plugin("a", Wat::default()),
             body_plugin("b", Wat::default()),
@@ -274,7 +282,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failure_releases_the_held_bytes_in_place_of_the_trailers() {
+    async fn failure_still_releases_held_bytes() {
         let plugins = vec![
             body_plugin("hold", Wat::response_body(HOLD)),
             body_plugin("trap", Wat::response_trailers(TRAP)),

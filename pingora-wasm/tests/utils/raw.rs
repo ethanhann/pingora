@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A client that writes a request in parts, so that a test controls each body chunk.
+//! Raw H1 client
+//!
+//! Requests are written straight to a TCP stream, so a test controls how the body is split into
+//! chunks and when the connection closes.
 
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,7 +25,7 @@ const CHUNK_PAUSE: Duration = Duration::from_millis(50);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const END_OF_CHUNKS: &str = "0\r\n\r\n";
 
-/// A response as the client read it.
+/// A response as read off the wire.
 pub struct RawResponse {
     pub status: u16,
     pub head: String,
@@ -34,13 +37,13 @@ fn parse(response: &[u8]) -> RawResponse {
     let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
     let status = head.split(' ').nth(1).and_then(|code| code.parse().ok());
     RawResponse {
-        status: status.unwrap_or_else(|| panic!("no status in the response {text:?}")),
+        status: status.unwrap_or_else(|| panic!("no status code in response {text:?}")),
         head: head.to_ascii_lowercase(),
         body: body.to_string(),
     }
 }
 
-/// Read until `done` accepts what arrived, the peer closes, or the timeout passes.
+/// Read until `done` accepts the bytes read so far, the peer closes, or `timeout` elapses.
 async fn read_until(stream: &mut TcpStream, timeout: Duration, done: fn(&[u8]) -> bool) -> Vec<u8> {
     let mut response = Vec::new();
     let mut part = [0u8; 4096];
@@ -64,11 +67,10 @@ fn chunked_body_ended(response: &[u8]) -> bool {
     response.ends_with(END_OF_CHUNKS.as_bytes())
 }
 
-/// Send a request with a chunked body through the proxy on `port`, and return the response.
+/// Send a request with a chunked body to the proxy on `port` and return the response.
 ///
-/// The client waits after each chunk, so that the proxy runs the body filter once for each
-/// chunk.
-/// It stops sending when a response arrives.
+/// Chunks are written one at a time with a short wait after each, so the proxy runs its body
+/// filter once per chunk. Sending stops as soon as any response bytes arrive.
 pub async fn send_chunked_request(
     port: u16,
     origin: u16,
@@ -102,7 +104,7 @@ pub async fn send_chunked_request(
     parse(&response)
 }
 
-/// Send a GET through the proxy on `port`, and return the connection with no response read.
+/// Send a GET to the proxy on `port` and return the connection without reading the response.
 pub async fn send_get_without_reading(port: u16, origin: u16) -> TcpStream {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let request =
@@ -111,9 +113,10 @@ pub async fn send_get_without_reading(port: u16, origin: u16) -> TcpStream {
     stream
 }
 
-/// Send one POST for each body on one connection, and return the responses.
+/// Send one POST per body over a single connection and return the responses.
 ///
-/// The proxy must send each response with a chunked body.
+/// Each response is read up to the end of its chunked body, so the proxy must respond with
+/// chunked encoding.
 pub async fn post_on_one_connection(port: u16, origin: u16, bodies: &[&str]) -> Vec<RawResponse> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let mut responses = Vec::new();
@@ -130,7 +133,7 @@ pub async fn post_on_one_connection(port: u16, origin: u16, bodies: &[&str]) -> 
     responses
 }
 
-/// Return the bytes of a chunked body.
+/// Decode a chunked body, stopping at the last chunk or at the first incomplete one.
 pub fn decode_chunked_body(body: &str) -> String {
     let mut all = String::new();
     let mut rest = body;

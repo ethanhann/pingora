@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The response trailer map that a guest sees.
+//! Response trailer map
 
 use super::{header_name, value_of, visit_headers, WriteResult};
 use http::header::HeaderValue;
@@ -20,9 +20,9 @@ use proxy_wasm_host::{HeaderMap, PairVisitor};
 use std::borrow::Cow;
 use std::ops::ControlFlow;
 
-/// The response trailer map of a guest.
+/// The response trailer map exposed to a guest.
 ///
-/// Trailers have no pseudo headers.
+/// Trailers have no pseudo headers, so every key has to be a valid header name.
 #[derive(Default)]
 pub(crate) struct ResponseTrailers {
     pub(crate) trailers: http::HeaderMap,
@@ -92,7 +92,7 @@ mod tests {
     }
 
     #[test]
-    fn a_guest_reads_and_changes_trailers() {
+    fn trailers_can_be_read_and_changed() {
         let mut map = trailers();
 
         let results = [
@@ -108,7 +108,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_all_sets_the_pairs_it_receives() {
+    fn replace_all_sets_given_pairs() {
         let mut map = trailers();
 
         let result = map.replace_all(&[(b"a", b"1"), (b"a", b"2")]);
@@ -118,7 +118,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_name_or_value_changes_nothing() {
+    fn rejected_name_or_value_changes_nothing() {
         let mut map = trailers();
 
         let results = [

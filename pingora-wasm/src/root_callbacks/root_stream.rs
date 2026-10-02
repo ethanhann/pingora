@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The stream state of the callbacks that run with no request.
+//! Stream state for callbacks outside of a request
 
 use crate::properties::{join_path, WasmProperties};
 use log::warn;
@@ -22,10 +22,10 @@ use proxy_wasm_host::{Buffer, HeaderMap, VecHeaderMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// The plugin data that the callbacks with no request use.
+/// Per-plugin state shared by every [RootStream] of that plugin.
 ///
-/// It holds the plugin name, the fixed properties, and whether the warning about a call that
-/// tries to change a request was logged.
+/// Besides the plugin name and its fixed properties, this remembers whether the plugin has
+/// already been warned about calling a request-only host function outside of a request.
 pub(crate) struct RootCallbackPluginState {
     pub(crate) plugin_name: String,
     pub(crate) fixed_properties: Arc<WasmProperties>,
@@ -47,17 +47,19 @@ impl RootCallbackPluginState {
             .swap(true, Ordering::Relaxed)
         {
             warn!(
-                "wasm plugin {} called {function_name} outside a request phase, which has no effect",
+                "wasm plugin {}: {function_name} called outside of a request, no effect",
                 self.plugin_name
             );
         }
     }
 }
 
-/// The stream state of a callback that runs with no request.
+/// Stream state for a callback that runs outside of a request.
 ///
-/// Such a callback is a root callback, or the end of a context that the guest held after its
-/// request. A plugin reads empty header maps and the fixed properties.
+/// Used for root context callbacks and for ending a context the guest kept after its request.
+/// With no request, header maps read as empty, buffers are not found, and the only
+/// properties this state resolves are the runtime's fixed properties. `proxy_continue_stream` and
+/// `proxy_send_local_response` return `Ok` and do nothing.
 pub(crate) struct RootStream {
     plugin: Arc<RootCallbackPluginState>,
     empty_header_map: VecHeaderMap,
@@ -75,8 +77,8 @@ impl RootStream {
 }
 
 impl StreamState for RootStream {
-    // A guest built with the Rust SDK panics on a status other than `Ok` from a read of the
-    // pairs, so every map reads as empty, as in Envoy
+    // Reads return an empty map rather than an error, because the Rust SDK panics on any status
+    // other than `Ok` when it reads header pairs.
     fn header_map(
         &mut self,
         _call: Invocation,
@@ -159,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn a_header_map_reads_as_empty_and_refuses_a_write() {
+    fn header_map_reads_empty_and_rejects_writes() {
         let mut stream = root_stream("maps", WasmProperties::new());
 
         let read = stream
@@ -178,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fixed_property_is_found_and_another_path_is_not() {
+    fn property_resolves_fixed_paths_only() {
         let mut fixed = WasmProperties::new();
         fixed.insert(&["node", "name"], "edge-1");
         let mut stream = root_stream("fixed", fixed);
@@ -193,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_continue_stream_returns_ok_and_warns_once_for_each_plugin() {
+    fn continue_stream_returns_ok_and_warns_once_per_plugin() {
         record_crate_logs();
         let mut stream = root_stream("continue-from-tick", WasmProperties::new());
 
@@ -201,7 +203,7 @@ mod tests {
         let second = stream.continue_stream(tick_invocation(), StreamType::HttpRequest);
 
         assert_eq!((first, second), (Ok(()), Ok(())));
-        let warnings = crate_log_lines_with("continue-from-tick called proxy_continue_stream");
+        let warnings = crate_log_lines_with("continue-from-tick: proxy_continue_stream called");
         assert_eq!(warnings.len(), 1);
     }
 }

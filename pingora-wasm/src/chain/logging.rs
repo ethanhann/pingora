@@ -21,15 +21,16 @@ use pingora_proxy::Session;
 use proxy_wasm_host::abi::v0_2_1::{CallScope, ContextId, GuestError, StreamState};
 
 impl WasmCtx {
-    /// End the request in each plugin that saw it, in reverse chain order.
+    /// Run the end-of-request callbacks for each plugin that saw the request, in reverse chain order.
     ///
-    /// Call it from `logging`, for every request that created this `WasmCtx`. Each plugin runs
+    /// Call this from your `logging` for every request that created a `WasmCtx`. Each plugin runs
     /// `proxy_on_done`, `proxy_on_log`, and `proxy_on_delete`, and can read the request headers
-    /// and the response headers. A plugin failure here is logged and not returned, because the
-    /// response is already sent.
+    /// and the headers of the response that was written. A plugin failure here is logged rather
+    /// than returned, since the response has already been sent. A plugin whose guest was replaced
+    /// during the request is skipped.
     ///
-    /// A plugin whose `proxy_on_done` returns `false` holds its context, and it runs
-    /// `proxy_on_log` later, after it calls `proxy_done`, with empty header maps.
+    /// A plugin whose `proxy_on_done` returns `false` keeps its context. Its `proxy_on_log` runs
+    /// later, once it has called `proxy_done`, and sees empty header maps.
     pub async fn logging<DS: DownstreamSession>(&mut self, session: &mut Session<DS>) {
         let runtime = self.chain.runtime.clone();
         self.callouts.clear();
@@ -43,11 +44,11 @@ impl WasmCtx {
         });
         let held = self.held.request_len();
         if held > 0 {
-            debug!("the request ended while wasm plugins held {held} request body bytes");
+            debug!("request ended with {held} request body bytes still held by wasm plugins");
         }
         let held = self.held.response_len();
         if held > 0 {
-            warn!("the request ended while wasm plugins held {held} response body bytes");
+            warn!("request ended with {held} response body bytes still held by wasm plugins, never sent downstream");
         }
         for position in (0..self.records.len()).rev() {
             let Some(record) = self.records[position].take() else {
@@ -75,11 +76,13 @@ impl WasmCtx {
         }
     }
 
-    /// Record how the context of the plugin at `position` ended, and start the callouts that
-    /// the plugin sent while it ended.
+    /// Finish the bookkeeping for the context of the plugin at `position` once [finish] has run.
     ///
-    /// A context that the guest holds gets the results of its callouts on the root callback
-    /// thread, and it still owes `proxy_on_log` when `needs_on_log` is `true`.
+    /// If the context was deleted, the callouts it sent while ending are started and their
+    /// results are discarded. A context the guest kept is passed to the root callback thread
+    /// along with those callouts, and `needs_on_log` records whether it still needs
+    /// `proxy_on_log`. A guest failure is logged, and the guest is replaced if the failure left it
+    /// unusable.
     pub(super) fn end_or_hold_context(
         &mut self,
         position: usize,
@@ -95,7 +98,7 @@ impl WasmCtx {
             }
             Ok(false) => {
                 debug!(
-                    "wasm plugin {} holds a context after the request ended, until it calls proxy_done",
+                    "wasm plugin {}: context kept after the request ended, until the plugin calls proxy_done",
                     locked.pool.name
                 );
                 locked.pool.deleted(locked.slot);
@@ -103,14 +106,19 @@ impl WasmCtx {
                     loaded.hold_context(context, needs_on_log, self.callouts.take_accepted());
                 }
             }
-            Err(e) => error!("{}", locked.guest_failure("failed to end a context", e)),
+            Err(e) => error!(
+                "{}",
+                locked.guest_failure("failed to end the request context", e)
+            ),
         }
     }
 }
 
-/// End a context with `on_done`, then `on_log` when `log` is set, then `on_delete`.
+/// Run the end-of-request callbacks for `context`.
 ///
-/// Return `false` when the guest holds the context.
+/// `proxy_on_done` runs first, then `proxy_on_log` if `log` is set, then `proxy_on_delete`.
+/// Returns `false` without running the last two if `proxy_on_done` returned `false`, which means
+/// the guest is keeping the context.
 pub(super) fn finish<H: StreamState>(
     scope: &mut CallScope<'_, H>,
     context: ContextId,
@@ -131,7 +139,7 @@ mod tests {
     use crate::test_support::{add_request_header, one_plugin, session, wat_plugin, GET};
 
     #[tokio::test]
-    async fn logging_skips_a_replaced_guest() {
+    async fn logging_skips_replaced_guest() {
         let (runtime, mut ctx) = one_plugin(add_request_header());
         let (mut other_session, _other_client) = session(GET).await;
         let (mut session, _client) = session(GET).await;
@@ -151,7 +159,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logging_closes_a_context_after_a_guest_error() {
+    async fn logging_closes_context_after_guest_error() {
         let (runtime, mut ctx) = one_plugin(wat_plugin("bad-log", "i32.const 7"));
         let (mut session, _client) = session(GET).await;
         ctx.request_filter(&mut session).await.unwrap_err();

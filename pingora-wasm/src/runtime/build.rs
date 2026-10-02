@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The steps that build a runtime, which are the check of the plugin names, the shared store,
-//! and the pool of each plugin.
+//! Runtime construction
+//!
+//! Building a runtime validates the plugin configurations, creates the shared store, and then
+//! builds a guest pool for each plugin.
 
 use super::plugin::WasmPluginConf;
 use super::pool::events::RootCallbackEvent;
@@ -32,10 +34,18 @@ use proxy_wasm_host::{Engine, Module};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Check each plugin, and return a map from the name of each plugin to its index.
+/// Validate the plugin configurations and map each plugin name to its index.
+///
+/// # Errors
+///
+/// Returns an error if `plugins` is empty, if a configuration is invalid, or if two plugins have
+/// the same name.
 pub(super) fn checked_plugin_indexes(plugins: &[WasmPluginConf]) -> Result<HashMap<String, usize>> {
     if plugins.is_empty() {
-        return Error::e_explain(ErrorType::InternalError, "no wasm plugin to run");
+        return Error::e_explain(
+            ErrorType::InternalError,
+            "wasm runtime needs at least one plugin",
+        );
     }
     let mut names = HashMap::with_capacity(plugins.len());
     for (index, plugin) in plugins.iter().enumerate() {
@@ -43,16 +53,16 @@ pub(super) fn checked_plugin_indexes(plugins: &[WasmPluginConf]) -> Result<HashM
         if names.insert(plugin.name.clone(), index).is_some() {
             return Error::e_explain(
                 ErrorType::InternalError,
-                format!("wasm plugin {} is listed twice", plugin.name),
+                format!("wasm plugin {}: duplicate plugin name", plugin.name),
             );
         }
     }
     Ok(names)
 }
 
-/// Create the store of shared data, queues, and metrics.
+/// Create the store for shared data, queues, and metrics.
 ///
-/// The store sends an event to the root callback thread for each item that a plugin enqueues.
+/// Every item enqueued on a shared queue is reported to the root callback thread.
 pub(super) fn new_shared_store(
     root_callback_thread: &RootCallbackThread,
     metric_sink: Arc<dyn WasmMetricSink>,
@@ -65,7 +75,7 @@ pub(super) fn new_shared_store(
     Arc::new(SharedStore::new(limits, enqueue_observer, metric_sink))
 }
 
-/// The inputs that every pool of a runtime shares.
+/// Inputs shared by every pool of a runtime.
 pub(super) struct PoolInputs<'a> {
     pub(super) engine: &'a Engine,
     pub(super) host: &'a Host,
@@ -76,7 +86,12 @@ pub(super) struct PoolInputs<'a> {
     pub(super) root_callback_thread: &'a RootCallbackThread,
 }
 
-/// Compile `plugin` and start the guests of its pool.
+/// Compile `plugin` and build its pool, starting one guest per slot.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, does not compile, or is not a supported
+/// Proxy-Wasm module, or if a guest fails to start.
 pub(super) fn build_pool(
     pool_index: usize,
     plugin: &WasmPluginConf,
@@ -91,13 +106,18 @@ pub(super) fn build_pool(
     })?;
     let module = Module::new(inputs.engine, &bytes)
         .or_err_with(ErrorType::InternalError, || {
-            format!("wasm plugin {} does not compile", plugin.name)
+            format!("failed to compile wasm plugin {}", plugin.name)
         })?;
     let services = plugin.services(inputs.log_sink.clone(), inputs.shared_store.clone());
-    let spec = GuestSpec::new(inputs.host, &module, services, &plugin.limits)
-        .or_err_with(ErrorType::InternalError, || {
-            format!("wasm plugin {} is not a supported module", plugin.name)
-        })?;
+    let spec = GuestSpec::new(inputs.host, &module, services, &plugin.limits).or_err_with(
+        ErrorType::InternalError,
+        || {
+            format!(
+                "wasm plugin {}: not a supported Proxy-Wasm module",
+                plugin.name
+            )
+        },
+    )?;
     let root_callback_plugin =
         RootCallbackPluginState::new(&plugin.name, inputs.fixed_properties.clone());
     GuestPool::new(GuestPoolConf {

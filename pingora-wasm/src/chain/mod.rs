@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A chain of plugins and the phases that run them on each request.
+//! Plugin chain and its per-request phases
 
 mod body;
 mod ctx;
@@ -37,8 +37,8 @@ use std::sync::Arc;
 
 /// An ordered list of plugins from one [WasmRuntime](crate::WasmRuntime).
 ///
-/// Build it with [WasmRuntime::chain](crate::WasmRuntime::chain) and clone it where you need
-/// it. Create a [WasmCtx] from it for each request.
+/// Build a chain with [WasmRuntime::chain](crate::WasmRuntime::chain). Cloning is cheap, so you
+/// can keep a copy wherever requests are handled. Call [WasmChain::new_ctx] once per request.
 #[derive(Clone)]
 pub struct WasmChain {
     pub(crate) runtime: Arc<RuntimeInner>,
@@ -46,7 +46,7 @@ pub struct WasmChain {
     phases: ChainPhases,
 }
 
-/// The body and trailer phases that the plugins of a chain run.
+/// The body and trailer phases at least one plugin in the chain runs in.
 #[derive(Debug, Clone, Copy)]
 struct ChainPhases {
     request_body: bool,
@@ -54,15 +54,16 @@ struct ChainPhases {
     response_trailers: bool,
 }
 
-/// The result of [WasmCtx::request_filter].
+/// What to do with a request after [WasmCtx::request_filter].
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RequestOutcome {
-    /// Every plugin let the request continue to the upstream.
+    /// No plugin stopped the request, so it should be proxied to the upstream.
     Continue,
-    /// A plugin sent its own response. Write it to the downstream, for example with
-    /// [write_plugin_response], and return `Ok(true)` from
-    /// `request_filter`.
+    /// A plugin sent its own response, given here as a header and a body.
+    ///
+    /// Write it to the downstream, e.g. with [write_plugin_response], and return `Ok(true)` from
+    /// your `request_filter`.
     Respond(Box<ResponseHeader>, Bytes),
 }
 
@@ -85,7 +86,9 @@ impl WasmChain {
         }
     }
 
-    /// Create the state of one request. Keep it in the `CTX` of your proxy.
+    /// Create the per-request state for this chain.
+    ///
+    /// Call this from `new_ctx` and keep the result in your proxy's `CTX`.
     pub fn new_ctx(&self) -> WasmCtx {
         WasmCtx::new(self.clone())
     }

@@ -10,7 +10,7 @@ categories = ["asynchronous", "network-programming", "wasm"]
 keywords = ["proxy-wasm", "pingora", "wasm", "proxy"]
 exclude = ["tests/*"]
 description = """
-Proxy-Wasm plugins for Pingora proxies.
+Proxy-Wasm plugin support for Pingora proxies.
 """
 
 [lib]

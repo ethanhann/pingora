@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Small guests for behavior that no fixture has.
+//! WAT guests
+//!
+//! Small guests built from `guest.wat` for behavior the compiled fixtures do not cover.
 
 use pingora_wasm::WasmPluginConf;
 use std::path::PathBuf;
@@ -21,7 +23,7 @@ use std::time::Duration;
 const TEMPLATE: &str = include_str!("../fixtures/guest.wat");
 const REQUEST_BODY: &str = "proxy_on_request_body";
 const RESPONSE_HEADERS: &str = "proxy_on_response_headers";
-/// Hold the request body until its end, then write `a` in front of it.
+/// Body callback that pauses until the last chunk of the request body, then prepends `a`.
 const HOLD_THEN_MARK: &str = "(if (result i32) (local.get 2)
     (then (call $mark_a (i32.const 0))) (else (i32.const 1)))";
 const MARK: &str = "(call $mark_a (i32.const 0))";
@@ -31,8 +33,8 @@ const NO_DELIVERY: &str = "";
 const CALL_AND_PAUSE: &str = "(call $call_authz_and_pause)";
 const RELAY_CALLOUT_BODY: &str = "(call $relay_callout_body (local.get 2) (local.get 3))";
 
-/// Build a guest whose `callback` has the body `body` and whose
-/// `proxy_on_http_call_response` has the body `delivery`, and return its path.
+/// Write a guest whose `callback` runs `body` and whose `proxy_on_http_call_response` runs
+/// `delivery`, and return its path.
 fn wat_guest(label: &str, callback: &str, body: &str, delivery: &str) -> PathBuf {
     let callbacks = format!(
         r#"(func (export "proxy_abi_version_0_2_1"))
@@ -60,31 +62,33 @@ fn guest(name: &str, label: &str, callback: &str, body: &str) -> WasmPluginConf 
     conf
 }
 
-/// Build the configuration of a guest that holds the request body until its end.
+/// Build the conf for a plugin that buffers the whole request body, with `limit` as its
+/// `request_body_limit`.
 pub fn hold(label: &str, limit: usize) -> WasmPluginConf {
     let mut conf = guest("hold", label, REQUEST_BODY, HOLD_THEN_MARK);
     conf.request_body_limit = limit;
     conf
 }
 
-/// Build the configuration of a guest that writes `a` in front of each request body chunk.
+/// Build the conf for a plugin that prepends `a` to every request body chunk.
 pub fn mark() -> WasmPluginConf {
     guest("mark", "mark", REQUEST_BODY, MARK)
 }
 
-/// Build the configuration of a guest that responds to the request body with 418.
+/// Build the conf for a plugin that responds with 418 from `proxy_on_request_body`.
 pub fn teapot_for_a_request_body() -> WasmPluginConf {
     guest("teapot", "teapot-request", REQUEST_BODY, TEAPOT)
 }
 
-/// Build the configuration of a guest that responds to the response headers with 418.
+/// Build the conf for a plugin that responds with 418 from `proxy_on_response_headers`.
 pub fn teapot_for_a_response() -> WasmPluginConf {
     guest("teapot", "teapot-response", RESPONSE_HEADERS, TEAPOT)
 }
 
-/// Build the configuration of a guest that makes a callout from the request headers, and
-/// responds with the body of the callout response. `timeout_limit` sets the callout timeout
-/// limit of the plugin.
+/// Build the conf for a plugin that sends a callout from `proxy_on_request_headers` and
+/// responds with the body of the callout response.
+///
+/// `timeout_limit` overrides the plugin's `callout_timeout_limit` when set.
 pub fn relay_callout_body_plugin(name: &str, timeout_limit: Option<Duration>) -> WasmPluginConf {
     let path = wat_guest(name, REQUEST_HEADERS, CALL_AND_PAUSE, RELAY_CALLOUT_BODY);
     let mut conf = WasmPluginConf::new(name, path);
@@ -95,8 +99,10 @@ pub fn relay_callout_body_plugin(name: &str, timeout_limit: Option<Duration>) ->
     conf
 }
 
-/// Write a guest from the template with `callbacks`, which export every callback that the
-/// template does not export, and return its path.
+/// Write a guest made of the template and `callbacks`, and return its path.
+///
+/// `callbacks` must export every callback the template does not. The ABI version marker is
+/// added here.
 fn write_module(label: &str, callbacks: &str) -> PathBuf {
     let wat = TEMPLATE.replace(
         "\nCALLBACKS\n",
@@ -110,7 +116,7 @@ fn write_module(label: &str, callbacks: &str) -> PathBuf {
     path
 }
 
-/// The callbacks that a test guest exports, with defaults that continue and log nothing.
+/// Callback bodies of a test guest. The defaults continue and do nothing else.
 struct Exports {
     configure: String,
     request_headers: String,
@@ -159,7 +165,7 @@ impl Exports {
     }
 }
 
-/// Text at address 700 and up, with the address and the length of each text.
+/// Data segments for strings placed in guest memory from address 700 up.
 struct MemoryTexts {
     data_segments: String,
     next_address: usize,
@@ -173,7 +179,9 @@ impl MemoryTexts {
         }
     }
 
-    /// Add `text`, where `/` separates the segments of a property path.
+    /// Add `text` and return its address and length.
+    ///
+    /// Each `/` is stored as a NUL byte, the separator between the segments of a property path.
     fn add(&mut self, text: &str) -> (usize, usize) {
         let at = self.next_address;
         let escaped = text.replace('/', "\\00");
@@ -219,7 +227,8 @@ fn one_slot_plugin(name: &str, path: PathBuf) -> WasmPluginConf {
     conf
 }
 
-/// Build the configuration of a guest that logs `log_text` on each tick, every 100 ms.
+/// Build the conf for a plugin that sets a 100 ms tick period and logs `log_text` on every
+/// tick.
 pub fn tick_logger(name: &str, log_text: &str) -> WasmPluginConf {
     let mut texts = MemoryTexts::new();
     let exports = Exports {
@@ -233,8 +242,8 @@ pub fn tick_logger(name: &str, log_text: &str) -> WasmPluginConf {
     )
 }
 
-/// Build the configuration of a guest that defines the counter `counter_name` and adds one to it for
-/// each request.
+/// Build the conf for a plugin that defines the counter `counter_name` and increments it on
+/// every request.
 pub fn request_counter(name: &str, counter_name: &str) -> WasmPluginConf {
     let mut texts = MemoryTexts::new();
     let (at, len) = texts.add(counter_name);
@@ -249,20 +258,20 @@ pub fn request_counter(name: &str, counter_name: &str) -> WasmPluginConf {
     )
 }
 
-/// The properties that a property reader guest reads, and where it puts each one.
+/// The properties a [property_reader] plugin reads, and where each one goes.
 #[derive(Default)]
 pub struct PropertyReads<'a> {
-    /// A path and a header name for each property to add as a request header.
+    /// Property path and header name pairs, each added as a request header.
     pub to_request_headers: &'a [(&'a str, &'a str)],
-    /// A path and a header name for each property to add as a response header.
+    /// Property path and header name pairs, each added as a response header.
     pub to_response_headers: &'a [(&'a str, &'a str)],
-    /// The paths to log in `proxy_on_response_headers`.
+    /// Property paths to log in `proxy_on_response_headers`.
     pub logged_in_on_response_headers: &'a [&'a str],
-    /// The paths to log in `proxy_on_log`.
+    /// Property paths to log in `proxy_on_log`.
     pub logged_in_on_log: &'a [&'a str],
 }
 
-/// Build the configuration of a guest that reads the properties of `reads`.
+/// Build the conf for a plugin that reads the properties listed in `reads`.
 pub fn property_reader(name: &str, reads: PropertyReads<'_>) -> WasmPluginConf {
     let mut texts = MemoryTexts::new();
     let request = texts.property_to_header_calls(0, reads.to_request_headers);
@@ -280,8 +289,8 @@ pub fn property_reader(name: &str, reads: PropertyReads<'_>) -> WasmPluginConf {
     )
 }
 
-/// Build the configuration of a guest that sends a callout on its first tick, and logs
-/// `log_text` when the callout response arrives.
+/// Build the conf for a plugin that sends one callout from its first tick and logs `log_text`
+/// when the callout response arrives.
 pub fn tick_callout_sender(name: &str, log_text: &str) -> WasmPluginConf {
     let mut texts = MemoryTexts::new();
     let log = texts.log_call(log_text);
@@ -299,14 +308,15 @@ pub fn tick_callout_sender(name: &str, log_text: &str) -> WasmPluginConf {
     )
 }
 
-/// The body of `proxy_on_http_call_response` that calls `proxy_done` for the context that
+/// Body for `proxy_on_http_call_response` that calls `proxy_done` on the context whose id
 /// `proxy_on_done` stored at address 608.
 const DONE_FOR_THE_HELD_CONTEXT: &str =
     "(drop (call $set_effective_context (i32.load (i32.const 608)))) (drop (call $proxy_done))";
 
-/// Build the configuration of a guest that sends a callout from `proxy_on_done` and holds its
-/// context, calls `proxy_done` for it when the response arrives, and logs `log_text` from
-/// `proxy_on_log`.
+/// Build the conf for a plugin that keeps its context after the request has ended.
+///
+/// The plugin sends a callout from `proxy_on_done` and returns `false`, calls `proxy_done` once
+/// the callout result arrives, and logs `log_text` from `proxy_on_log`.
 pub fn context_holder(name: &str, log_text: &str) -> WasmPluginConf {
     let mut texts = MemoryTexts::new();
     let exports = Exports {
@@ -322,9 +332,12 @@ pub fn context_holder(name: &str, log_text: &str) -> WasmPluginConf {
     )
 }
 
-/// Build the configuration of a guest that sends a callout from the request headers and
-/// continues, holds its context in `proxy_on_done`, calls `proxy_done` for it when any callout
-/// result arrives, and logs `log_text` from `proxy_on_log`.
+/// Build the conf for a plugin that keeps its context while a callout of the request is still
+/// in flight.
+///
+/// The plugin sends a callout from `proxy_on_request_headers` without pausing, returns `false`
+/// from `proxy_on_done`, calls `proxy_done` when any callout result arrives, and logs
+/// `log_text` from `proxy_on_log`.
 pub fn context_holder_with_an_earlier_callout(name: &str, log_text: &str) -> WasmPluginConf {
     let mut texts = MemoryTexts::new();
     let exports = Exports {

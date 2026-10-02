@@ -1,5 +1,5 @@
-;; A small Proxy-Wasm guest for tests.
-;; A test replaces the line that holds only the word CALLBACKS with the callbacks it exports.
+;; Template for the small Proxy-Wasm guests that tests assemble.
+;; Tests replace the line holding only the word CALLBACKS with the callbacks they export.
 (module
   (import "env" "proxy_set_buffer_bytes"
     (func $set (param i32 i32 i32 i32 i32) (result i32)))
@@ -47,7 +47,7 @@
   (data (i32.const 81) "b")
   (data (i32.const 96) "content-length")
   (data (i32.const 112) "authz")
-  ;; The headers of a callout: GET /check with the authority authz.test
+  ;; Serialized callout headers for GET /check with the authority authz.test
   (data (i32.const 128) "\03\00\00\00\07\00\00\00\03\00\00\00\05\00\00\00\06\00\00\00\0a\00\00\00\0a\00\00\00\3a\6d\65\74\68\6f\64\00\47\45\54\00\3a\70\61\74\68\00\2f\63\68\65\63\6b\00\3a\61\75\74\68\6f\72\69\74\79\00\61\75\74\68\7a\2e\74\65\73\74\00")
   (data (i32.const 256) "x-asked")
   (data (i32.const 264) "yes")
@@ -57,9 +57,9 @@
   (data (i32.const 296) "refused")
   (data (i32.const 304) "missing")
   (data (i32.const 312) "tick")
-  ;; Addresses from 700 hold the text that a test adds in its callbacks.
+  ;; Addresses from 700 up are for strings that tests add for their own callbacks.
 
-  ;; Write one letter in front of the body. The buffer is 0 for a request and 1 for a response.
+  ;; Prepend one letter to the body. The buffer is 0 for the request and 1 for the response.
   (func $mark (param $buffer i32) (param $letter i32) (result i32)
     (drop (call $set
       (local.get $buffer) (i32.const 0) (i32.const 0) (local.get $letter) (i32.const 1)))
@@ -69,13 +69,13 @@
   (func $mark_b (param $buffer i32) (result i32)
     (call $mark (local.get $buffer) (i32.const 81)))
 
-  ;; Replace the first bytes of the body with "replaced".
+  ;; Replace the first $size bytes of the body with "replaced".
   (func $replace_body (param $buffer i32) (param $size i32) (result i32)
     (drop (call $set
       (local.get $buffer) (i32.const 0) (local.get $size) (i32.const 16) (i32.const 8)))
     i32.const 0)
 
-  ;; Send a response with the body "teapot", and pause.
+  ;; Send a response with the body "teapot" and pause.
   (func $respond (param $status i32) (result i32)
     (drop (call $send
       (local.get $status) (i32.const 0) (i32.const 0) (i32.const 32) (i32.const 6)
@@ -93,14 +93,14 @@
     (drop (call $remove (i32.const 2) (i32.const 96) (i32.const 14)))
     i32.const 0)
 
-  ;; Make a callout to the upstream "authz" with no timeout, and pause.
+  ;; Send a callout to the upstream "authz" without setting a timeout, and pause.
   (func $call_authz_and_pause (result i32)
     (drop (call $http_call
       (i32.const 112) (i32.const 5) (i32.const 128) (i32.const 75)
       (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 520)))
     i32.const 1)
 
-  ;; Make a callout, and write the log line "accepted" or "refused" for its status.
+  ;; Send a callout and log "accepted" if the host took it, or "refused" if not.
   (func $call_and_log_status
     (if (call $http_call
       (i32.const 112) (i32.const 5) (i32.const 128) (i32.const 75)
@@ -108,28 +108,28 @@
       (then (drop (call $log (i32.const 2) (i32.const 296) (i32.const 7))))
       (else (drop (call $log (i32.const 2) (i32.const 288) (i32.const 8))))))
 
-  ;; Send 418 when the request has the header "x-asked", and continue when it has not.
+  ;; Respond with 418 if the request has an "x-asked" header, and continue otherwise.
   (func $teapot_if_asked (result i32)
     (if (result i32) (call $get_header
       (i32.const 0) (i32.const 256) (i32.const 7) (i32.const 512) (i32.const 516))
       (then (i32.const 0))
       (else (call $respond (i32.const 418)))))
 
-  ;; Make a callout, and continue.
+  ;; Send a callout and continue without waiting for it.
   (func $call_without_pause (result i32)
     (drop (call $call_authz_and_pause))
     i32.const 0)
 
-  ;; Continue the stream. The stream is 0 for a request and 1 for a response.
+  ;; Continue the stream, which is 0 for the request and 1 for the response.
   (func $continue (param $stream i32)
     (drop (call $continue_stream (local.get $stream))))
 
-  ;; Continue the stream, and pause.
+  ;; Continue the stream and still return pause.
   (func $continue_and_pause (param $stream i32) (result i32)
     (call $continue (local.get $stream))
     i32.const 1)
 
-  ;; Continue the stream on the second call.
+  ;; Continue the stream on the second call only.
   (func $continue_on_second (param $stream i32)
     (i32.store (i32.const 600) (i32.add (i32.load (i32.const 600)) (i32.const 1)))
     (if (i32.eq (i32.load (i32.const 600)) (i32.const 2))
@@ -140,7 +140,7 @@
     (drop (call $add_header
       (i32.const 0) (i32.const 256) (i32.const 7) (i32.const 264) (i32.const 3))))
 
-  ;; Send 418 with the body of the callout response, or 500 for a callout with no header.
+  ;; Respond with 418 and the callout response body, or with 500 if the callout has no headers.
   (func $relay_callout_body (param $headers i32) (param $size i32)
     (if (i32.eqz (local.get $headers))
       (then (drop (call $respond (i32.const 500))))
@@ -152,21 +152,21 @@
           (i32.load (i32.const 512)) (i32.load (i32.const 516))
           (i32.const 0) (i32.const 0) (i32.const -1))))))
 
-  ;; Write the log line "failed" for a callout with no header, and "response" for the others.
+  ;; Log "failed" for a callout result without headers, and "response" otherwise.
   (func $log_result (param $headers i32)
     (if (i32.eqz (local.get $headers))
       (then (drop (call $log (i32.const 2) (i32.const 272) (i32.const 6))))
       (else (drop (call $log (i32.const 2) (i32.const 280) (i32.const 8))))))
 
-  ;; Write the value of the property at the path in memory as a log line, or "missing".
+  ;; Log the value of the property at the given path, or "missing" if it cannot be read.
   (func $log_property (param $path i32) (param $size i32)
     (if (call $get_property (local.get $path) (local.get $size) (i32.const 512) (i32.const 516))
       (then (drop (call $log (i32.const 2) (i32.const 304) (i32.const 7))))
       (else (drop (call $log
         (i32.const 2) (i32.load (i32.const 512)) (i32.load (i32.const 516)))))))
 
-  ;; Add the value of the property at the path as a request header, or a response header when
-  ;; the map is 2.
+  ;; Copy the property at the given path into a header of the given map, which is 0 for the
+  ;; request headers and 2 for the response headers. Nothing is added if the read fails.
   (func $property_to_header
     (param $map i32) (param $path i32) (param $size i32) (param $name i32) (param $name_size i32)
     (if (i32.eqz (call $get_property
@@ -175,7 +175,7 @@
         (local.get $map) (local.get $name) (local.get $name_size)
         (i32.load (i32.const 512)) (i32.load (i32.const 516)))))))
 
-  ;; Write the log line "tick".
+  ;; Log "tick".
   (func $log_tick
     (drop (call $log (i32.const 2) (i32.const 312) (i32.const 4))))
 

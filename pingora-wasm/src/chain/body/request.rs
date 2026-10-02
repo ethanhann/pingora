@@ -23,37 +23,44 @@ use pingora_proxy::Session;
 use std::mem;
 
 impl WasmCtx {
-    /// Run `proxy_on_request_body` of each plugin, in chain order.
+    /// Run `proxy_on_request_body` for each plugin, in chain order.
     ///
-    /// Call it from `request_body_filter` with the arguments of that filter. Only plugins with
-    /// [request_body](crate::WasmPluginConf::request_body) turned on run. Plugins can read and
-    /// replace the body, and can read the request headers.
+    /// Call this from your `request_body_filter` and pass its arguments through. Only plugins
+    /// that have [request_body](crate::WasmPluginConf::request_body) enabled and export the
+    /// callback are run. By default no plugin runs on request bodies and this filter does
+    /// nothing. It also does nothing for a request without a body, for a subrequest, after an
+    /// upgrade, and once a plugin has sent its own response.
     ///
-    /// A plugin can pause to wait for more of the body. This phase then holds the bytes for the
-    /// plugin and leaves an empty chunk for the upstream. On the next chunk, the plugin reads the
-    /// bytes it paused on and the new bytes together. A plugin can hold up to
-    /// [request_body_limit](crate::WasmPluginConf::request_body_limit) bytes.
+    /// Plugins can read and replace the body, and can read the request headers. Pingora has
+    /// already sent the request header upstream by the time it reads the body, so a plugin that
+    /// changes the body length must remove `content-length` in `proxy_on_request_headers`.
     ///
-    /// A plugin can also pause a chunk while it waits for a callout, and this phase waits with
-    /// it. When the plugin continues, the bytes that it holds go to the next plugin.
+    /// A plugin may pause to buffer more of the body. Its bytes are then held back, up to
+    /// [request_body_limit](crate::WasmPluginConf::request_body_limit), and the filter leaves an
+    /// empty chunk in `body`, so nothing is sent upstream for it. With the next chunk the plugin
+    /// sees the held bytes followed by the new ones. A plugin may also pause while waiting for a
+    /// callout, in which case this filter waits with it, and the bytes it was holding move on to
+    /// the next plugin once it continues.
     ///
-    /// Pingora sends the request header to the upstream before it reads the body. A plugin that
-    /// changes the length of the body must remove `content-length` in `proxy_on_request_headers`.
+    /// A plugin may send its own response instead, e.g. to deny a request after inspecting the
+    /// body. That plugin and the plugins ahead of it in the chain run `proxy_on_response_headers`
+    /// on the response before it is written to the downstream. This filter then returns an error
+    /// with the response status to stop the request, and [WasmCtx::plugin_responded] returns
+    /// `true`.
     ///
-    /// A plugin can send its own response, for example to deny a request after it read the body.
-    /// The plugins before it in the chain run `proxy_on_response_headers` on that response, and
-    /// this phase writes it to the downstream. The phase then returns an error with the status of
-    /// the response to stop the request, and [WasmCtx::plugin_responded] returns `true`.
-    ///
-    /// By default no plugin runs on request bodies, and this phase does nothing. It also does
-    /// nothing for a request with no body, for a subrequest, and after an upgrade.
+    /// When Pingora retries the request, the body bytes it replays are not run through the
+    /// plugins again. The upstream gets what the plugins produced the first time. This relies on
+    /// [WasmCtx::upstream_attempt] being called from `upstream_peer` for every attempt.
     ///
     /// # Errors
     ///
-    /// An error of type [ERR_PLUGIN_FAILED] when a plugin traps or fails, when a plugin pauses the
-    /// last chunk of a body and does not continue, or when [WasmCtx::upstream_attempt] did not
-    /// run. An error of type [ERR_REQUEST_BODY_TOO_LARGE](crate::ERR_REQUEST_BODY_TOO_LARGE) when
-    /// a plugin holds more bytes than its limit.
+    /// Returns [ERR_PLUGIN_FAILED] if a plugin traps or otherwise fails, if a plugin pauses on
+    /// the last chunk of the body and does not continue, if a plugin sends a response after the
+    /// response header has been processed, or if [WasmCtx::upstream_attempt] was never called.
+    /// The same error is returned if an earlier phase of this request was cancelled while a
+    /// plugin was waiting for a callout. Returns
+    /// [ERR_REQUEST_BODY_TOO_LARGE](crate::ERR_REQUEST_BODY_TOO_LARGE) if a plugin holds more
+    /// bytes than its limit.
     pub async fn request_body_filter<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -69,10 +76,11 @@ impl WasmCtx {
         if self.request_body.attempts == 0 {
             return Error::e_explain(
                 ERR_PLUGIN_FAILED,
-                "a wasm plugin reads the request body and upstream_peer did not call WasmCtx::upstream_attempt",
+                "WasmCtx::upstream_attempt was not called from upstream_peer, required when a wasm plugin runs on the request body",
             );
         }
-        // With request trailers, an H2 downstream ends its body with `None` and no end flag
+        // An H2 downstream that sends request trailers ends its body with `None` and never sets
+        // the end flag
         let end_of_stream = end_of_stream || body.is_none();
         let replay = mem::take(&mut self.request_body.replay_due)
             && self.request_body.progress != RequestBodyProgress::Waiting;
@@ -87,7 +95,7 @@ impl WasmCtx {
             }
             return Error::e_explain(
                 ERR_PLUGIN_FAILED,
-                "request body bytes arrived after the end of the body",
+                "request body chunk received after the end of the body",
             );
         }
         if empty && !end_of_stream {
@@ -135,7 +143,7 @@ mod tests {
         vec![body_plugin("a", Wat::request_body(TEAPOT))]
     }
 
-    /// Run the request body phase on each chunk, and return what it leaves for Pingora.
+    /// Run the request body filter on each chunk and collect what it leaves in `body`.
     async fn filter(
         ctx: &mut WasmCtx,
         session: &mut Session,
@@ -153,7 +161,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_body_call_with_no_upstream_attempt_fails() {
+    async fn body_without_upstream_attempt_fails() {
         let runtime = WasmRuntime::new(mark()).unwrap();
         let mut ctx = runtime.chain(&["a"]).unwrap().new_ctx();
         let (mut session, _client) = session(POST).await;
@@ -171,7 +179,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_replay_receives_the_output_of_the_first_attempt() {
+    async fn replay_sends_first_attempt_output() {
         let (_runtime, mut ctx, mut session, _client) = start_request(mark(), POST).await;
         filter(&mut ctx, &mut session, &[("x", false), ("y", true)]).await;
         ctx.upstream_attempt();
@@ -182,7 +190,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_chunks_follow_a_replay_in_the_middle_of_a_body() {
+    async fn live_chunks_follow_mid_body_replay() {
         let (_runtime, mut ctx, mut session, _client) = start_request(mark(), POST).await;
         filter(&mut ctx, &mut session, &[("x", false)]).await;
         ctx.upstream_attempt();
@@ -193,7 +201,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_attempt_with_no_bytes_before_it_runs_the_plugins() {
+    async fn retry_before_any_body_runs_plugins() {
         let (_runtime, mut ctx, mut session, _client) = start_request(mark(), POST).await;
         ctx.upstream_attempt();
 
@@ -203,7 +211,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bytes_after_the_end_of_the_body_fail() {
+    async fn chunk_after_end_of_body_fails() {
         let (_runtime, mut ctx, mut session, _client) = start_request(mark(), POST).await;
         filter(&mut ctx, &mut session, &[("x", true)]).await;
 
@@ -217,7 +225,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_sends_its_own_response() {
+    async fn plugin_sends_its_own_response() {
         let (_runtime, mut ctx, mut session, mut client) = start_request(teapot(), POST).await;
 
         let err = ctx
@@ -234,7 +242,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_plugins_before_the_sender_see_its_response_and_cannot_replace_it() {
+    async fn plugins_ahead_of_sender_see_response_and_cannot_replace_it() {
         let plugins = vec![
             body_plugin("first", Wat::response_headers(TRAP)),
             body_plugin("second", Wat::response_headers(FORBIDDEN)),
@@ -251,10 +259,11 @@ mod tests {
         assert_eq!(
             err.etype(),
             &ERR_PLUGIN_FAILED,
-            "the first plugin ran and trapped"
+            "first plugin should have run and trapped"
         );
         assert!(
-            err.to_string().contains("wasm plugin first failed"),
+            err.to_string()
+                .contains("wasm plugin first: proxy_on_response_headers failed"),
             "{err}"
         );
         assert_eq!(read_downstream(&mut client).await, "");
@@ -263,7 +272,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_plugin_response_is_dropped() {
+    async fn second_plugin_response_is_dropped() {
         let plugins = vec![
             body_plugin("second", Wat::response_headers(FORBIDDEN)),
             body_plugin("sender", Wat::request_body(TEAPOT)),
@@ -282,7 +291,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_response_after_the_upstream_response_fails() {
+    async fn plugin_response_after_upstream_response_fails() {
         let (_runtime, mut ctx, mut session, mut client) = start_request(teapot(), POST).await;
         let mut upstream = ResponseHeader::build(200, None).unwrap();
         ctx.response_filter(&mut session, &mut upstream)

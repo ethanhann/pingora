@@ -12,24 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Which root receives `proxy_on_queue_ready` for a queue item.
+//! Shared queue registrations
+//!
+//! Tracks which root contexts registered each queue, and so which one gets
+//! `proxy_on_queue_ready` when an item is enqueued.
 
 use crate::runtime::pool::events::GuestAddress;
 use proxy_wasm_host::abi::v0_2_1::{ContextId, QueueId};
 use std::collections::HashMap;
 
-/// The root of a guest that registered a queue.
+/// A root context that registered a queue, and the guest it belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Registrant {
     pub(super) address: GuestAddress,
     pub(super) root: ContextId,
 }
 
-/// The registrants of each queue, in the order they registered, and the number of items that
-/// arrived while no live guest had the queue registered.
+/// Per-queue registrants in registration order, plus a count of items still waiting for one.
 ///
-/// The last registrant receives each item, as in Envoy. Each slot has at most one entry for a
-/// queue, and a new registration of the slot moves it to the end.
+/// Each item is delivered to the most recent registrant. A slot appears at most once per queue,
+/// and registering again from the same slot moves it to the end. Items enqueued while a queue has
+/// no live registrant are counted as pending.
 #[derive(Default)]
 pub(super) struct QueueRegistrations {
     registrants: HashMap<QueueId, Vec<Registrant>>,
@@ -37,10 +40,10 @@ pub(super) struct QueueRegistrations {
 }
 
 impl QueueRegistrations {
-    /// Record that `root` of the guest at `address` registered `queue`.
+    /// Register `root` of the guest at `address` as the latest registrant of `queue`.
     ///
-    /// Return the number of items that arrived while no live guest had the queue registered,
-    /// which the new registrant now receives.
+    /// Any earlier registration from the same slot is replaced. Returns the number of pending
+    /// items, which this registrant now receives, and resets that count.
     pub(super) fn register(
         &mut self,
         queue: QueueId,
@@ -53,19 +56,19 @@ impl QueueRegistrations {
         self.pending_items.remove(&queue).unwrap_or(0)
     }
 
-    /// Return the registrant that receives the next item of `queue`.
+    /// Return the registrant the next item of `queue` should be delivered to.
     pub(super) fn last_registrant(&self, queue: QueueId) -> Option<Registrant> {
         self.registrants.get(&queue).and_then(|r| r.last()).copied()
     }
 
-    /// Remove a registrant whose guest left its slot.
+    /// Remove a registrant whose guest is no longer in its slot.
     pub(super) fn remove(&mut self, queue: QueueId, registrant: Registrant) {
         if let Some(registrants) = self.registrants.get_mut(&queue) {
             registrants.retain(|r| *r != registrant);
         }
     }
 
-    /// Keep an item of `queue` for the next registrant.
+    /// Count an item enqueued on `queue` as pending for the next guest that registers it.
     pub(super) fn add_pending_item(&mut self, queue: QueueId) {
         *self.pending_items.entry(queue).or_default() += 1;
     }
@@ -99,7 +102,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_registration_of_a_slot_moves_it_to_the_end() {
+    fn reregistering_slot_moves_it_to_end() {
         let mut registrations = QueueRegistrations::default();
         let slot_0 = registrant(0, 0);
         register(&mut registrations, slot_0);
@@ -111,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn a_slot_that_registers_twice_has_one_entry() {
+    fn slot_registering_twice_has_one_entry() {
         let mut registrations = QueueRegistrations::default();
         let slot_0 = registrant(0, 0);
         let slot_1 = registrant(0, 1);
@@ -125,7 +128,7 @@ mod tests {
     }
 
     #[test]
-    fn the_previous_registrant_receives_an_item_when_the_last_one_leaves() {
+    fn previous_registrant_takes_over_when_last_is_removed() {
         let mut registrations = QueueRegistrations::default();
         let first = registrant(0, 0);
         let replaced = registrant(0, 1);
@@ -138,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn an_item_with_no_live_registrant_goes_to_the_next_registrant() {
+    fn pending_items_go_to_next_registrant() {
         let mut registrations = QueueRegistrations::default();
         registrations.add_pending_item(queue_1());
         registrations.add_pending_item(queue_1());
@@ -149,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_item_goes_to_one_registrant_only() {
+    fn pending_items_are_handed_out_once() {
         let mut registrations = QueueRegistrations::default();
         registrations.add_pending_item(queue_1());
         register(&mut registrations, registrant(0, 0));

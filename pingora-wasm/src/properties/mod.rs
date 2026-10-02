@@ -12,17 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The properties that plugins read with `proxy_get_property`.
+//! Plugin properties
+//!
+//! Values a plugin reads with `proxy_get_property`, keyed by path.
 
 pub(crate) mod built_in;
 
 use std::collections::HashMap;
 
-/// A property value in the encoding that plugins expect.
+/// A property value, encoded the way plugins expect to read it.
 ///
-/// A string or bytes stay as they are, a bool is one byte, and an integer is 8 little-endian
-/// bytes, as Envoy encodes them. Create one with `From`, for example
-/// `WasmPropertyValue::from(8080_u16)`.
+/// Create one with `From`, e.g. `WasmPropertyValue::from(8080_u16)`, or pass anything that
+/// converts into it wherever you set a property. Strings and byte slices are stored unchanged, a
+/// `bool` becomes a single byte, and an integer becomes 8 little-endian bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmPropertyValue(Vec<u8>);
 
@@ -75,22 +77,23 @@ macro_rules! integer_property_value {
 
 integer_property_value!(i32 => i64, i64 => i64, u16 => u64, u32 => u64, u64 => u64);
 
-/// A set of property values, by path.
+/// A set of property values keyed by path.
 ///
-/// A path is a list of segments, such as `["node", "metadata", "NAME"]` for the property that a
-/// plugin reads as `node.metadata.NAME`.
+/// You give a path as its segments, so the property a plugin reads as `node.metadata.NAME` has
+/// the path `["node", "metadata", "NAME"]`. Use this to fill
+/// [WasmServices::fixed_properties](crate::WasmServices::fixed_properties).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WasmProperties {
     values: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 impl WasmProperties {
-    /// Create an empty set of properties.
+    /// Create an empty set.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Set the value of `path`, replacing any previous value.
+    /// Set the value at `path`, replacing any existing value.
     pub fn insert(&mut self, path: &[&str], value: impl Into<WasmPropertyValue>) {
         let mut joined_path = Vec::new();
         join_path(
@@ -100,7 +103,7 @@ impl WasmProperties {
         self.values.insert(joined_path, value.into().0);
     }
 
-    /// Return the value of `path`, in the encoding that plugins read.
+    /// Return the encoded value at `path`, or `None` if nothing is set there.
     pub fn get(&self, path: &[&str]) -> Option<&[u8]> {
         let mut joined_path = Vec::new();
         join_path(
@@ -110,18 +113,20 @@ impl WasmProperties {
         self.values.get(&joined_path).map(Vec::as_slice)
     }
 
-    /// Set the value of the path whose segments are joined in `joined_path`.
+    /// Set the value at a path whose segments are already joined with `\0`.
     pub(crate) fn insert_joined(&mut self, joined_path: &[u8], value: &[u8]) {
         self.values.insert(joined_path.to_vec(), value.to_vec());
     }
 
-    /// Return the value of the path whose segments are joined in `joined_path`.
+    /// Return the value at a path whose segments are already joined with `\0`.
     pub(crate) fn get_joined(&self, joined_path: &[u8]) -> Option<&[u8]> {
         self.values.get(joined_path).map(Vec::as_slice)
     }
 }
 
-/// Join the segments of a path with `\0` into `joined_path`, as the ABI sends a path.
+/// Join path segments with `\0`, the form the ABI uses for a path.
+///
+/// The result replaces the contents of `joined_path`, which lets a caller reuse one buffer.
 pub(crate) fn join_path<'a>(
     segments: impl IntoIterator<Item = &'a [u8]>,
     joined_path: &mut Vec<u8>,
@@ -140,7 +145,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn values_have_the_encoding_of_envoy() {
+    fn values_are_encoded_for_plugins() {
         let cases: [(WasmPropertyValue, &[u8]); 4] = [
             ("route".into(), b"route"),
             (true.into(), &[1]),
@@ -154,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn a_value_is_found_by_its_segments_and_by_its_joined_path_but_not_by_a_prefix() {
+    fn value_is_found_by_segments_and_joined_path_not_by_prefix() {
         let mut properties = WasmProperties::new();
 
         properties.insert(&["xds", "route_name"], "checkout");

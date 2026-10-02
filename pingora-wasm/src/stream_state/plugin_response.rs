@@ -18,8 +18,8 @@ use http::StatusCode;
 use pingora_http::ResponseHeader;
 use proxy_wasm_host::abi::v0_2_1::LocalResponse;
 
-/// A response that a plugin sent in place of the upstream response, with
-/// `proxy_send_local_response`.
+/// A response a plugin sent with `proxy_send_local_response`, to be used in place of the
+/// upstream response.
 #[derive(Debug)]
 pub(crate) struct PluginResponse {
     pub(crate) header: ResponseHeader,
@@ -27,7 +27,11 @@ pub(crate) struct PluginResponse {
 }
 
 impl PluginResponse {
-    /// Build the response. Return `None` when the status or a header is not valid.
+    /// Build the response from what the plugin passed to `proxy_send_local_response`.
+    ///
+    /// `content-length` is always set from the body, and any `content-length` or
+    /// `transfer-encoding` header from the plugin is dropped. Returns `None` if the status is not
+    /// in the range 200 to 599, or if a header is a pseudo header or has an invalid name or value.
     pub(crate) fn build(response: &LocalResponse<'_>) -> Option<Self> {
         let status = u16::try_from(response.status_code)
             .ok()
@@ -57,7 +61,7 @@ impl PluginResponse {
     }
 }
 
-/// Return `true` when `status` ends a response, which is true from 200 to 599.
+/// Return `true` if `status` is a final status, i.e. 200 to 599.
 fn is_final(status: &StatusCode) -> bool {
     status.is_success()
         || status.is_redirection()
@@ -81,7 +85,7 @@ mod tests {
     }
 
     #[test]
-    fn build_sets_the_status_the_headers_and_the_length() {
+    fn build_sets_status_headers_and_content_length() {
         let local = response(403, &[("x-denied", "yes"), ("X-Case", "Kept")]);
 
         let built = PluginResponse::build(&local).unwrap();
@@ -94,7 +98,7 @@ mod tests {
     }
 
     #[test]
-    fn build_drops_the_guest_framing_headers() {
+    fn build_drops_guest_framing_headers() {
         let local = response(
             200,
             &[("Content-Length", "999"), ("transfer-encoding", "chunked")],
@@ -111,7 +115,7 @@ mod tests {
     }
 
     #[test]
-    fn build_refuses_a_bad_status_or_header() {
+    fn build_rejects_invalid_status_or_header() {
         let bad = [
             response(0, &[]),
             response(100, &[]),

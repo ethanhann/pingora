@@ -42,9 +42,9 @@ pub(crate) fn plugin(name: &str, path: PathBuf, slots: usize) -> WasmPluginConf 
     conf
 }
 
-/// The body of each callback of a small guest, in WAT.
+/// Callback bodies, in WAT, for a guest built from `tests/fixtures/guest.wat`.
 ///
-/// The guest is the template `tests/fixtures/guest.wat` with these callbacks.
+/// [wat_guest] splices them into the template in place of its `CALLBACKS` line.
 #[derive(Clone, Copy)]
 pub(crate) struct Wat {
     pub(crate) abi: bool,
@@ -52,7 +52,8 @@ pub(crate) struct Wat {
     pub(crate) configure: &'static str,
     pub(crate) request_headers: &'static str,
     pub(crate) done: &'static str,
-    /// The callbacks below are exported only when they have a body.
+    /// Optional callbacks are left out of the guest when `None`, except `http_call_response`
+    /// and `log`, which are then exported with an empty body.
     pub(crate) request_body: Option<&'static str>,
     pub(crate) response_headers: Option<&'static str>,
     pub(crate) response_body: Option<&'static str>,
@@ -62,32 +63,32 @@ pub(crate) struct Wat {
     pub(crate) tick: Option<&'static str>,
     pub(crate) queue_ready: Option<&'static str>,
     pub(crate) delete: &'static str,
-    /// Text for the callbacks, such as `(data (i32.const 700) "text")`.
+    /// Data segments the callbacks refer to, e.g. `(data (i32.const 700) "text")`.
     pub(crate) data_segments: &'static str,
 }
 
 pub(crate) const CONTINUE: &str = "i32.const 0";
 pub(crate) const PAUSE: &str = "i32.const 1";
 pub(crate) const TRAP: &str = "unreachable";
-/// A body callback that returns `Pause` until the end of the stream.
+/// Body callback that pauses on every chunk except the last.
 pub(crate) const HOLD: &str = "(i32.eqz (local.get 2))";
-/// A body callback that holds the first chunks and traps on the last one.
+/// Body callback that pauses on every chunk except the last, where it traps.
 pub(crate) const HOLD_THEN_TRAP: &str =
     "(if (result i32) (local.get 2) (then unreachable) (else (i32.const 1)))";
-/// Callbacks that write `a` or `b` in front of the request body or the response body.
+/// Body callbacks that prepend `a` or `b` to the request or response body.
 pub(crate) const MARK_A_REQUEST: &str = "(call $mark_a (i32.const 0))";
 pub(crate) const MARK_B_REQUEST: &str = "(call $mark_b (i32.const 0))";
 pub(crate) const MARK_A_RESPONSE: &str = "(call $mark_a (i32.const 1))";
 pub(crate) const MARK_B_RESPONSE: &str = "(call $mark_b (i32.const 1))";
-/// A body callback that writes `a` in front of the request body on each call, and holds the
-/// body until its end.
+/// Body callback that prepends `a` to the request body on every call and pauses until the last
+/// chunk.
 pub(crate) const MARK_AND_HOLD: &str =
     "(drop (call $mark_a (i32.const 0))) (i32.eqz (local.get 2))";
-/// A body callback that holds the response body, and replaces all of it with `replaced` at
-/// the end.
+/// Body callback that pauses until the last chunk, then replaces the whole held response body
+/// with `replaced`.
 pub(crate) const HOLD_THEN_REPLACE: &str = "(if (result i32) (local.get 2)
     (then (call $replace_body (i32.const 1) (local.get 1))) (else (i32.const 1)))";
-/// Callbacks that send a response with the body `teapot`, and pause.
+/// Callbacks that respond with 418 or 403 and the body `teapot`, then pause.
 pub(crate) const TEAPOT: &str = "(call $respond (i32.const 418))";
 pub(crate) const FORBIDDEN: &str = "(call $respond (i32.const 403))";
 pub(crate) const SET_TRAILER: &str = "(call $set_trailer)";
@@ -147,7 +148,9 @@ impl Wat {
 
 const TEMPLATE: &str = include_str!("../../tests/fixtures/guest.wat");
 
-/// Return a callback that returns nothing, or the empty callback that the template needs.
+/// Return the WAT for an exported callback that has no result.
+///
+/// The callback is still exported, with an empty body, when `body` is `None`.
 fn export_with_no_result(name: &str, params: &str, body: Option<&str>) -> String {
     let body = body.unwrap_or_default();
     format!(r#"(func (export "{name}") (param {params}) {body})"#)
@@ -216,7 +219,7 @@ pub(crate) fn wat_guest(label: &str, guest: Wat) -> PathBuf {
     path
 }
 
-/// Build the configuration of a WAT plugin that runs every body phase.
+/// Build the conf for a WAT plugin with every body and trailer phase enabled.
 pub(crate) fn body_plugin(name: &str, wat: Wat) -> WasmPluginConf {
     let mut conf = plugin(name, wat_guest(name, wat), 1);
     conf.request_body = true;
@@ -229,8 +232,10 @@ pub(crate) fn body_chunk(bytes: &'static str) -> Option<Bytes> {
     Some(Bytes::from_static(bytes.as_bytes()))
 }
 
-/// Build a runtime with `plugins`, and a request context from a chain of them in that order.
-/// The context has run the request headers of `request` and started its first upstream attempt.
+/// Run `request` through the request filter of a new chain of `plugins`, in the order given.
+///
+/// Returns the runtime, the context, the session, and the client end of the session's
+/// connection. The context has already recorded its first upstream attempt.
 pub(crate) async fn start_request(
     plugins: Vec<WasmPluginConf>,
     request: &[u8],
@@ -245,7 +250,8 @@ pub(crate) async fn start_request(
     (runtime, ctx, session, client)
 }
 
-/// Build a runtime with one plugin named `a`, and a request context from a chain of it.
+/// Build a runtime from `conf`, which must be named `a`, and a context for a chain of that
+/// plugin.
 pub(crate) fn one_plugin(conf: WasmPluginConf) -> (WasmRuntime, WasmCtx) {
     let runtime = WasmRuntime::new(vec![conf]).unwrap();
     let ctx = runtime.chain(&["a"]).unwrap().new_ctx();
@@ -256,8 +262,8 @@ pub(crate) fn add_request_header() -> WasmPluginConf {
     plugin("a", fixture("add-request-header"), 1)
 }
 
-/// Build the configuration of a WAT plugin named `a` whose `proxy_on_request_headers` runs
-/// `request_headers`.
+/// Build the conf for a WAT plugin named `a` with `request_headers` as the body of its
+/// `proxy_on_request_headers`.
 pub(crate) fn wat_plugin(label: &str, request_headers: &'static str) -> WasmPluginConf {
     let wat = Wat {
         request_headers,
@@ -266,7 +272,7 @@ pub(crate) fn wat_plugin(label: &str, request_headers: &'static str) -> WasmPlug
     plugin("a", wat_guest(label, wat), 1)
 }
 
-/// Return every pair of a header map, as text.
+/// Collect all pairs of a header map as strings.
 pub(crate) fn pairs(map: &dyn HeaderMap) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let _ = map.for_each_pair(&mut |k, v| {
@@ -284,7 +290,7 @@ pub(crate) fn get(map: &dyn HeaderMap, key: &str) -> Option<String> {
         .map(|v| String::from_utf8_lossy(&v).into_owned())
 }
 
-/// The lines that guests logged.
+/// A log sink that records every guest log line.
 #[derive(Default)]
 pub(crate) struct RecordedGuestLogs(pub(crate) Mutex<Vec<String>>);
 
@@ -296,7 +302,7 @@ impl LogSink for RecordedGuestLogs {
     }
 }
 
-/// Wait until `check` returns true, for up to five seconds.
+/// Poll `check` every 10 ms until it returns `true`, giving up after about five seconds.
 pub(crate) async fn eventually(check: impl Fn() -> bool) -> bool {
     for _ in 0..500 {
         if check() {
@@ -325,14 +331,16 @@ impl log::Log for CrateLogs {
     fn flush(&self) {}
 }
 
-/// Start to record the log lines of the crate. Call it before the code that logs.
+/// Install a logger that records the crate's log lines.
+///
+/// Call this before the code under test logs.
 pub(crate) fn record_crate_logs() {
     if log::set_logger(&CrateLogs).is_ok() {
         log::set_max_level(log::LevelFilter::Debug);
     }
 }
 
-/// Return the recorded log lines of the crate that contain `text`.
+/// Return the recorded crate log lines containing `text`.
 pub(crate) fn crate_log_lines_with(text: &str) -> Vec<String> {
     let lines = CRATE_LOG_LINES.lock();
     lines

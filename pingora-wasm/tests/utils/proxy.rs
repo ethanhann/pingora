@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The proxy of the test services.
+//! Test proxy
+//!
+//! A `ProxyHttp` that forwards each filter to the matching `WasmCtx` method.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -34,9 +36,10 @@ pub struct TestCtx {
     attempts: usize,
 }
 
-/// The request header with the origin of the first upstream attempt.
+/// Request header with the origin port for the first upstream attempt.
 ///
-/// The proxy retries a request that has this header, and sends the retry to the origin in `ORIGIN`.
+/// A request with this header is retried if the first attempt fails, and the retry goes to the
+/// origin in `ORIGIN`.
 const FIRST_ORIGIN: &str = "x-test-first-origin";
 const ORIGIN: &str = "x-test-origin";
 

@@ -31,8 +31,7 @@ use proxy_wasm_host::HeaderMap;
 use std::fmt;
 use std::mem;
 
-/// The location of the context of one plugin for one request: the slot, the guest, and the
-/// context id.
+/// Where one plugin's context for a request is, given as its slot, guest, and context id.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PluginRecord {
     pub(crate) slot: usize,
@@ -40,10 +39,10 @@ pub(crate) struct PluginRecord {
     pub(crate) context: ContextId,
 }
 
-/// The progress of the response of one request, and where the response comes from.
+/// Whether plugins have run on a response header yet, and where that response came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ResponseProgress {
-    /// The plugins did not run on a response header.
+    /// No response header has been run through the plugins.
     NotStarted,
     /// The plugins ran on the upstream response header.
     FromUpstream,
@@ -51,10 +50,10 @@ pub(super) enum ResponseProgress {
     FromPlugin,
 }
 
-/// The state of one request in the plugins of one chain.
+/// Per-request state for the plugins of one chain.
 ///
-/// Create it with [WasmChain::new_ctx] and keep it in the `CTX` of your proxy. It holds a
-/// reference to its chain and runtime, so a request finishes on the runtime it started on.
+/// Create it with [WasmChain::new_ctx] and keep it in your proxy's `CTX`. It holds a reference to
+/// its chain and runtime, so a request finishes on the runtime it started on.
 ///
 /// Call [WasmCtx::logging] for every `WasmCtx` you create, so that each plugin sees the end of
 /// its request. If the request task ends before `logging`, dropping the `WasmCtx` ends each open
@@ -100,7 +99,7 @@ impl WasmCtx {
         }
     }
 
-    /// Run `body` on the guest while the guest holds the stream state.
+    /// Run `body` on the guest, lending it this request's stream state for the call.
     pub(crate) fn run<R>(
         &mut self,
         guest: &mut Guest,
@@ -111,10 +110,10 @@ impl WasmCtx {
         result
     }
 
-    /// Run `body` on the guest for `context`, the stream context of a plugin of this request.
+    /// Run `body` on the guest on behalf of `context`, one plugin's context for this request.
     ///
-    /// The guest can send callouts only from `context` during this call. The request holds
-    /// the callouts of the call until the phase starts them, or until the next call.
+    /// Only callouts sent from `context` are accepted during the call. They are kept on the
+    /// request until the phase starts them, and are discarded by the next call if it does not.
     pub(crate) fn run_for_context<R>(
         &mut self,
         loaded: &mut Loaded,
@@ -130,41 +129,46 @@ impl WasmCtx {
         result
     }
 
-    /// Set a property of this request, for example the name of the route that your proxy
-    /// chose.
+    /// Set a property on this request for plugins to read with `proxy_get_property`.
     ///
-    /// Plugins read it with `proxy_get_property`, and a plugin cannot change it. Set it before
-    /// the phase in which a plugin reads it.
+    /// Use this for anything only your proxy knows, e.g. the name of the route it picked. A
+    /// property has to be set before the phase a plugin reads it in. Setting the same path again
+    /// replaces the value, and plugins cannot overwrite it.
     pub fn set_property(&mut self, path: &[&str], value: impl Into<WasmPropertyValue>) {
         self.stream.proxy_properties.insert(path, value);
     }
 
-    /// Return a property of this request that a plugin wrote with `proxy_set_property`.
+    /// Return a property that a plugin set on this request with `proxy_set_property`.
+    ///
+    /// Returns `None` if no plugin has set a value at `path`.
     pub fn guest_property(&self, path: &[&str]) -> Option<&[u8]> {
         self.stream.guest_properties.get(path)
     }
 
-    /// Record the upstream peer that the request connected to, for the properties
-    /// `upstream.address` and `upstream.port`.
+    /// Record the upstream peer for the `upstream.address` and `upstream.port` properties.
     ///
-    /// Call it from `connected_to_upstream`. It runs no plugin, and a later call, for example
-    /// after a retry, replaces the recorded peer.
+    /// Call this from your `connected_to_upstream`. No plugin is run. Calling it again, e.g. after
+    /// a retry, replaces the recorded peer. A peer without an IP address, such as a Unix socket,
+    /// clears both properties.
     pub fn upstream_connected(&mut self, peer: &HttpPeer) {
         self.stream.request_facts.upstream_address = peer.address().as_inet().copied();
     }
 
-    /// Return the pool of the plugin at `position` of the chain.
+    /// Return the guest pool of the plugin at `position` in the chain.
     pub(crate) fn pool_at(&self, position: usize) -> &GuestPool {
         &self.chain.runtime.pools[self.chain.plugins[position]]
     }
 
-    /// Return the error for the plugin at `position`, which cannot go on after `what` it did.
+    /// Build an [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) error for the plugin at `position`.
+    ///
+    /// `what` is the part of the message after the plugin name.
     pub(crate) fn plugin_error(&self, position: usize, what: &str) -> Box<Error> {
         plugin_unavailable(&self.pool_at(position).name, what)
     }
 
-    /// Move the request header from the session into the stream state for a callback, and put
-    /// a placeholder in the session.
+    /// Move the session's request header into the stream state for the duration of a callback.
+    ///
+    /// The session is left with a placeholder header until [Self::request_out] is called.
     pub(crate) fn request_in(&mut self, header: &mut RequestHeader) {
         let spare = self
             .spare_request
@@ -174,7 +178,7 @@ impl WasmCtx {
         self.stream.request = Some(RequestHeaders::new(request, self.scheme.clone()));
     }
 
-    /// Move the request header back into the session.
+    /// Move the request header back into the session, keeping the placeholder for reuse.
     pub(crate) fn request_out(&mut self, header: &mut RequestHeader) {
         if let Some(request) = self.stream.request.take() {
             self.spare_request = Some(mem::replace(header, request.header));
@@ -235,11 +239,11 @@ impl Drop for WasmCtx {
 }
 
 fn placeholder_request() -> RequestHeader {
-    RequestHeader::build(Method::GET, b"/", Some(0)).expect("a static request line is valid")
+    RequestHeader::build(Method::GET, b"/", Some(0)).expect("static request line should be valid")
 }
 
 fn placeholder_response() -> ResponseHeader {
-    ResponseHeader::build(StatusCode::OK, Some(0)).expect("a static status is valid")
+    ResponseHeader::build(StatusCode::OK, Some(0)).expect("static status should be valid")
 }
 
 #[cfg(test)]
@@ -272,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_ctx_ends_its_open_context() {
+    fn drop_ends_open_context() {
         let held = Wat {
             done: "i32.const 0",
             ..Wat::default()
@@ -295,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn a_swap_returns_the_session_header() {
+    fn request_out_restores_session_header() {
         let runtime =
             WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 1)]).unwrap();
         let mut ctx = runtime.chain(&["a"]).unwrap().new_ctx();
@@ -312,7 +316,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_ctx_finishes_on_its_runtime_after_a_swap() {
+    async fn ctx_finishes_on_original_runtime_after_reload() {
         let (old, mut ctx) = one_plugin(add_request_header());
         let (mut session, _client) = session(GET).await;
         ctx.request_filter(&mut session).await.unwrap();
@@ -322,13 +326,15 @@ mod tests {
 
         ctx.logging(&mut session).await;
 
-        let old = weak.upgrade().expect("the request keeps its runtime");
+        let old = weak
+            .upgrade()
+            .expect("request should keep its runtime alive");
         assert_eq!(old.pools[0].open_contexts(), 0);
         assert_eq!(new.open_contexts(), 0);
     }
 
     #[tokio::test]
-    async fn the_last_ctx_releases_an_old_runtime() {
+    async fn last_ctx_releases_old_runtime() {
         let (old, mut ctx) = one_plugin(add_request_header());
         let (mut session, _client) = session(GET).await;
         ctx.request_filter(&mut session).await.unwrap();
@@ -342,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn a_later_upstream_replaces_the_upstream_properties() {
+    fn later_upstream_replaces_upstream_properties() {
         let (_runtime, mut ctx) = one_plugin(add_request_header());
         let first = HttpPeer::new("10.0.0.1:8080", false, String::new());
         let retry = HttpPeer::new("10.0.0.2:9090", false, String::new());

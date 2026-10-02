@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! How a phase waits for the callouts of a paused plugin.
+//! Waiting for callouts
+//!
+//! A plugin that pauses with a callout in flight keeps its phase waiting. Results are delivered
+//! to the plugin as they arrive, until it continues, sends a response, or has no callout left.
 
 mod delivery;
 
@@ -31,44 +34,54 @@ use std::future::{poll_fn, Future};
 use std::pin::pin;
 use std::task::Poll;
 
-/// The result of [WasmCtx::wait_for_callouts].
+/// Outcome of [WasmCtx::wait_for_callouts].
 pub(super) enum CalloutWaitOutcome {
-    /// The plugin asked to continue.
+    /// The plugin continued.
     Continued,
-    /// The plugin has no pending callout and did not ask to continue.
+    /// The plugin is still paused and has no callout left to wait for.
     StillPaused,
     /// The plugin sent its own response.
     Respond(Box<PluginResponse>),
 }
 
 impl WasmCtx {
-    /// Return an error when the future of an earlier phase of this request was dropped while
-    /// a plugin waited for a callout.
+    /// Fail the phase if an earlier phase of this request was cancelled during a callout wait.
+    ///
+    /// A phase is cancelled when its future is dropped. If that happened while a plugin was
+    /// waiting for a callout, the plugin is still paused in that phase, so the header, body, and
+    /// trailer filters that follow fail the request. [WasmCtx::logging] still runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [ERR_PLUGIN_FAILED] if a callout wait was cancelled.
     pub(super) fn refuse_after_cancelled_wait(&self) -> Result<()> {
         if self.callouts.in_callout_wait {
             return Error::e_explain(
                 ERR_PLUGIN_FAILED,
-                "the request cannot continue, because a phase was cancelled while a wasm plugin waited for a callout",
+                "request aborted, an earlier phase was cancelled while a wasm plugin waited for a callout",
             );
         }
         Ok(())
     }
 
-    /// Return `true` when the plugin that returned `action` from the last guest call stays
-    /// paused in `direction`.
+    /// Return `true` if the plugin that returned `action` from the last guest call is paused in
+    /// `direction`.
+    ///
+    /// A plugin that returns `Pause` but asked to continue `direction` during the same call is
+    /// not paused.
     pub(super) fn plugin_stays_paused(&mut self, action: Action, direction: StreamType) -> bool {
         action == Action::Pause && !self.stream().continue_requested(direction)
     }
 
-    /// Return `true` when the plugin at `position` has a callout to wait for.
+    /// Return `true` if the plugin at `position` has a callout pending.
     pub(super) fn waits_for_callout(&self, position: usize) -> bool {
         self.callouts.has_pending(position)
     }
 
-    /// Start the callouts that the plugin at `position` sent during the last guest call.
+    /// Start the callouts the plugin at `position` made during the last guest call.
     ///
-    /// When `paused` is `true`, keep the tasks so that the phase can wait for their results.
-    /// Otherwise the tasks run on, and their results are dropped.
+    /// If the plugin is `paused`, the callouts become pending so the phase can wait for their
+    /// results. Otherwise the callouts are still sent, but their results are discarded.
     pub(super) fn start_callouts(&mut self, position: usize, paused: bool) {
         let runtime = self.chain.runtime.clone();
         for callout in self.callouts.take_accepted() {
@@ -80,8 +93,12 @@ impl WasmCtx {
         }
     }
 
-    /// Deliver the results of the pending callouts of the plugin at `position` as they
-    /// arrive, until the plugin asks to continue, sends a response, or has no pending callout.
+    /// Deliver pending callout results to the plugin at `position` as they arrive.
+    ///
+    /// Returns once the plugin continues, sends a response, or has no pending callout left.
+    /// Callouts still pending at that point are no longer waited for. If this future is dropped
+    /// mid-wait, `in_callout_wait` stays set, which is what [Self::refuse_after_cancelled_wait]
+    /// checks.
     pub(super) async fn wait_for_callouts<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -120,9 +137,14 @@ impl WasmCtx {
         }
     }
 
-    /// Wait for the next callout result of the plugin at `position`.
+    /// Wait for the next callout result for the plugin at `position`.
     ///
-    /// On an HTTP/2 downstream, return an error when the client closes the stream first.
+    /// Returns `None` if the plugin has no pending callout.
+    ///
+    /// # Errors
+    ///
+    /// On an HTTP/2 downstream, returns an error if the client closes the stream before a result
+    /// arrives.
     async fn next_result_or_downstream_close<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -181,7 +203,7 @@ mod tests {
     const CALL_AND_RESPOND: &str =
         "(drop (call $call_authz_and_pause)) (call $respond (i32.const 403))";
 
-    /// A phase after the request headers, which a test runs on one chunk or one header.
+    /// The phases after the request headers that `run_phase` can run.
     #[derive(Debug, Clone, Copy)]
     enum Phase {
         RequestBody,
@@ -190,7 +212,7 @@ mod tests {
         ResponseTrailers,
     }
 
-    /// The response header, the body chunk, and the trailers that a phase runs on.
+    /// The response header, body chunk, and trailers passed to the phases.
     struct PhaseInputs {
         response: ResponseHeader,
         body: Option<Bytes>,
@@ -209,13 +231,13 @@ mod tests {
         }
     }
 
-    /// Run the request headers and the first upstream attempt of a new request.
+    /// Run the request header phase and record the first upstream attempt.
     async fn run_request_headers(ctx: &mut WasmCtx, session: &mut Session) {
         ctx.request_filter(session).await.unwrap();
         ctx.upstream_attempt();
     }
 
-    /// Run `phase` on the last chunk of a body, or on the headers or the trailers.
+    /// Run `phase` once on `inputs`, with a body chunk passed as the last one.
     async fn run_phase(
         ctx: &mut WasmCtx,
         session: &mut Session,
@@ -238,7 +260,7 @@ mod tests {
         }
     }
 
-    /// Return a plugin whose `phase` has the callback `callback`, with `delivery` as its
+    /// Return a plugin that runs `callback` in `phase`, with `delivery` as its
     /// `proxy_on_http_call_response`.
     fn plugin_with_callback_in(
         name: &str,
@@ -259,8 +281,8 @@ mod tests {
         body_plugin(name, wat)
     }
 
-    /// Return a plugin that makes a callout from its request headers, with `delivery` as its
-    /// `proxy_on_http_call_response`.
+    /// Return a plugin that makes a callout and pauses in `proxy_on_request_headers`, with
+    /// `delivery` as its `proxy_on_http_call_response`.
     fn asks_on_request_headers(name: &str, delivery: &'static str) -> WasmPluginConf {
         let wat = Wat {
             request_headers: CALL_AND_PAUSE,
@@ -271,7 +293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_changes_the_request_in_a_delivery_before_the_next_plugin_runs() {
+    async fn next_plugin_sees_request_changed_during_delivery() {
         let sender = FixedSender::responds("allowed");
         let reads_the_header = Wat {
             request_headers: TEAPOT_IF_ASKED,
@@ -296,7 +318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_receives_the_request_body_after_it_waited_on_the_headers() {
+    async fn request_body_runs_after_callout_wait_on_headers() {
         let wat = Wat {
             request_headers: CALL_AND_PAUSE,
             http_call_response: Some(CONTINUE_REQUEST),
@@ -316,7 +338,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_responds_with_the_body_of_its_callout() {
+    async fn plugin_responds_with_callout_body() {
         let sender = FixedSender::responds("denied by authz");
         let plugins = vec![
             body_plugin("first", Wat::response_headers(REMOVE_LENGTH)),
@@ -338,7 +360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_that_stays_paused_after_its_callout_fails_the_request() {
+    async fn staying_paused_after_callout_fails_request() {
         let sender = FixedSender::responds("allowed");
         let cases = [STAY_PAUSED, CONTINUE_RESPONSE];
 
@@ -350,13 +372,16 @@ mod tests {
             let err = ctx.request_filter(&mut session).await.unwrap_err();
 
             assert_eq!(err.etype(), &ERR_PLUGIN_FAILED, "{delivery}");
-            assert!(err.to_string().contains("paused a request"), "{err}");
+            assert!(
+                err.to_string().contains("paused on request headers"),
+                "{err}"
+            );
         }
         assert_eq!(sender.sent_count(), 2);
     }
 
     #[tokio::test]
-    async fn a_plugin_that_continues_both_directions_continues_the_request() {
+    async fn continuing_both_streams_resumes_request() {
         let sender = FixedSender::responds("allowed");
         let plugins = vec![asks_on_request_headers("a", BOTH_DIRECTIONS)];
         let (_runtime, mut ctx) = callout_ctx(plugins, sender);
@@ -371,7 +396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_continue_in_the_callback_that_pauses_continues_the_request_headers() {
+    async fn continue_inside_pausing_callback_resumes_request_headers() {
         let wat = Wat {
             request_headers: CONTINUE_REQUEST_AND_PAUSE,
             ..Wat::default()
@@ -386,7 +411,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_continue_in_the_callback_that_pauses_continues_the_phase() {
+    async fn continue_inside_pausing_callback_resumes_phase() {
         let cases = [
             (Phase::RequestBody, CONTINUE_REQUEST_AND_PAUSE),
             (Phase::ResponseHeaders, CONTINUE_RESPONSE_AND_PAUSE),
@@ -409,7 +434,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_continues_after_the_last_of_two_callouts() {
+    async fn plugin_continues_after_second_of_two_callouts() {
         let wat = Wat {
             request_headers: CALL_TWICE_AND_PAUSE,
             http_call_response: Some(CONTINUE_REQUEST_ON_SECOND_DELIVERY),
@@ -426,7 +451,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_plugin_of_a_chain_receives_the_result_of_its_own_callout() {
+    async fn each_plugin_receives_its_own_callout_result() {
         let sender = FixedSender::responds("allowed");
         let plugins = vec![
             asks_on_request_headers("a", CONTINUE_REQUEST),
@@ -443,7 +468,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_slot_is_free_while_a_plugin_waits() {
+    async fn slot_is_unlocked_during_callout_wait() {
         let sender = FixedSender::responds_after("allowed", Arc::new(Notify::new()));
         let plugins = vec![asks_on_request_headers("a", CONTINUE_REQUEST)];
         let (runtime, mut ctx) = callout_ctx(plugins, sender);
@@ -457,7 +482,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_callout_is_sent_when_a_later_plugin_stops_the_response() {
+    async fn callout_is_sent_when_plugin_ahead_in_chain_stops_response() {
         let cases = [TEAPOT, PAUSE, TRAP];
 
         for stops in cases {
@@ -480,7 +505,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_callout_is_sent_when_its_plugin_responds_in_the_same_callback() {
+    async fn callout_is_sent_when_plugin_responds_in_same_callback() {
         let wat = Wat {
             request_headers: CALL_AND_RESPOND,
             ..Wat::default()
@@ -496,7 +521,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_callout_of_a_guest_call_that_trapped_is_not_sent() {
+    async fn callout_from_trapped_guest_call_is_not_sent() {
         let wat = Wat {
             request_headers: CALL_AND_TRAP,
             ..Wat::default()
@@ -514,7 +539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_releases_its_body_to_the_next_plugin_after_its_callout() {
+    async fn held_body_moves_to_next_plugin_after_callout() {
         let phase = Phase::RequestBody;
         let plugins = vec![
             plugin_with_callback_in("a", phase, CALL_AND_PAUSE, CONTINUE_REQUEST),
@@ -532,7 +557,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_that_stays_paused_after_its_callout_holds_its_body() {
+    async fn staying_paused_after_callout_holds_body() {
         let phase = Phase::RequestBody;
         let plugins = vec![plugin_with_callback_in(
             "a",
@@ -554,7 +579,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_that_stays_paused_at_the_end_of_a_body_fails_the_request() {
+    async fn staying_paused_on_last_chunk_fails_request() {
         let phase = Phase::RequestBody;
         let plugins = vec![plugin_with_callback_in(
             "a",
@@ -572,11 +597,11 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
-        assert!(err.to_string().contains("paused a body at its end"));
+        assert!(err.to_string().contains("paused on the last body chunk"));
     }
 
     #[tokio::test]
-    async fn a_plugin_that_holds_a_body_does_not_wait_for_an_earlier_callout() {
+    async fn body_hold_does_not_wait_for_earlier_callout() {
         let wat = Wat {
             request_headers: CALL_WITHOUT_PAUSE,
             request_body: Some(HOLD),
@@ -597,7 +622,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_responds_to_a_request_body_from_a_delivery() {
+    async fn plugin_responds_to_request_body_from_delivery() {
         let phase = Phase::RequestBody;
         let plugins = vec![plugin_with_callback_in(
             "a",
@@ -622,7 +647,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_plugins_after_a_plugin_that_waited_run_on_the_response() {
+    async fn remaining_plugins_run_after_callout_wait() {
         let cases = [
             (Phase::ResponseHeaders, Wat::response_headers(REMOVE_LENGTH)),
             (Phase::ResponseBody, Wat::response_body(MARK_B_RESPONSE)),
@@ -654,7 +679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_that_stays_paused_after_its_callout_fails_the_trailers() {
+    async fn staying_paused_after_callout_fails_trailers() {
         let phase = Phase::ResponseTrailers;
         let plugins = vec![plugin_with_callback_in(
             "a",
@@ -671,11 +696,14 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(err.to_string().contains("paused the trailers"), "{err}");
+        assert!(
+            err.to_string().contains("paused on response trailers"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
-    async fn a_plugin_responds_in_place_of_the_upstream_response_from_a_delivery() {
+    async fn plugin_replaces_upstream_response_from_delivery() {
         let phase = Phase::ResponseHeaders;
         let plugins = vec![plugin_with_callback_in(
             "a",
@@ -698,7 +726,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_response_from_a_delivery_after_the_response_header_is_an_error() {
+    async fn response_from_delivery_after_response_header_fails() {
         let phase = Phase::ResponseBody;
         let plugins = vec![plugin_with_callback_in(
             "a",
@@ -720,7 +748,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plugin_that_continues_with_a_callout_receives_a_failure_at_the_end() {
+    async fn callout_in_flight_at_request_end_is_failed() {
         let wat = Wat {
             request_headers: CALL_WITHOUT_PAUSE,
             http_call_response: Some(LOG_RESULT),
@@ -747,7 +775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_callout_from_the_log_callback_is_sent() {
+    async fn callout_from_log_callback_is_sent() {
         let wat = Wat {
             log: Some(CALL_WITH_NO_RESULT),
             ..Wat::default()
@@ -763,7 +791,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_trap_in_a_delivery_fails_the_request_and_replaces_the_guest() {
+    async fn trap_in_delivery_fails_request_and_replaces_guest() {
         let sender = FixedSender::responds("allowed");
         let plugins = vec![asks_on_request_headers("a", TRAP)];
         let (runtime, mut ctx) = callout_ctx(plugins, sender);
@@ -772,14 +800,18 @@ mod tests {
         let err = ctx.request_filter(&mut session).await.unwrap_err();
 
         assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
-        assert!(err.to_string().contains("on_http_call_response"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("proxy_on_http_call_response failed"),
+            "{err}"
+        );
         assert_eq!(session.req_header().raw_path(), b"/original");
         let slot = runtime.inner.pools[0].lock_slot(0);
         assert!(slot.as_ref().unwrap().guest.is_serving());
     }
 
     #[tokio::test]
-    async fn a_callout_task_that_panics_gives_the_plugin_a_failure() {
+    async fn panicking_callout_task_delivers_failure() {
         let plugins = vec![asks_on_request_headers("a", RELAY_CALLOUT_BODY)];
         let (_runtime, mut ctx) = callout_ctx(plugins, FixedSender::panics());
         let (mut session, _client) = session(GET).await;
@@ -793,7 +825,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_callout_over_the_limit_receives_a_response_and_is_not_sent() {
+    async fn callout_over_limit_is_failed_without_being_sent() {
         let gate = Arc::new(Notify::new());
         let sender = FixedSender::responds_after("allowed", gate.clone());
         let wat = Wat {
@@ -823,7 +855,8 @@ mod tests {
         assert_eq!(sender.sent_count(), 1);
     }
 
-    /// Start a request whose plugin waits in `phase`, and drop the future of that phase.
+    /// Start a request, leave its plugin waiting for a callout in `phase`, and drop that phase's
+    /// future.
     async fn cancel_a_wait_in(phase: Phase, ctx: &mut WasmCtx, session: &mut Session) {
         run_request_headers(ctx, session).await;
         let mut inputs = PhaseInputs::new();
@@ -832,7 +865,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_phase_after_a_cancelled_wait_fails() {
+    async fn phase_after_cancelled_wait_fails() {
         let waits_on_the_request_body = Wat {
             request_body: Some(CALL_AND_PAUSE),
             response_headers: Some(CONTINUE),
@@ -866,7 +899,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logging_ends_the_context_after_a_cancelled_wait() {
+    async fn logging_ends_context_after_cancelled_wait() {
         let phase = Phase::RequestBody;
         let sender = FixedSender::responds_after("late", Arc::new(Notify::new()));
         let plugins = vec![plugin_with_callback_in(
@@ -885,7 +918,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_a_ctx_after_a_cancelled_wait_ends_its_context() {
+    async fn dropping_ctx_after_cancelled_wait_ends_context() {
         let phase = Phase::RequestBody;
         let sender = FixedSender::responds_after("late", Arc::new(Notify::new()));
         let plugins = vec![plugin_with_callback_in(
@@ -904,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_ctx_outside_of_a_tokio_runtime_sends_no_callout() {
+    fn dropping_ctx_outside_tokio_runtime_sends_no_callout() {
         let wat = Wat {
             done: CALL_AND_LOG_STATUS,
             ..Wat::default()

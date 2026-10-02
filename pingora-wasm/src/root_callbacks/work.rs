@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The work of the root callback thread, and the guest call that each piece of work makes.
+//! Root callback work
+//!
+//! The kinds of work the root callback loop runs, and the guest call each one makes.
 
 use super::callback_loop::RootCallbackLoop;
 use super::root_callouts::FinishedCallout;
@@ -24,7 +26,7 @@ use log::{debug, warn};
 use proxy_wasm_host::abi::v0_2_1::{CallScope, ContextId, GuestError, QueueId};
 use std::time::Instant;
 
-/// A piece of work for the root callback thread.
+/// One item of work for the root callback thread.
 pub(super) enum Work {
     Tick(GuestAddress),
     QueueItem(QueueId),
@@ -36,20 +38,20 @@ pub(super) enum Work {
     },
 }
 
-/// The outcome of one piece of work.
+/// The outcome of running one [Work] item.
 pub(super) enum WorkOutcome {
     Done,
-    /// A request holds the slot, so the work waits.
+    /// The slot is locked by a request, so the work has to be retried later.
     SlotBusy,
 }
 
-/// The outcome of a guest call on the root callback thread.
+/// The outcome of a guest call made from the root callback thread.
 enum GuestCallOutcome<R> {
     Ran(R),
-    /// The guest returned an error, and was replaced when the error left it unusable.
+    /// The call failed. The guest has been replaced if the error left it unusable.
     Failed,
     SlotBusy,
-    /// The slot has another guest, or none.
+    /// The slot now holds a different guest, or none.
     GuestGone,
 }
 
@@ -62,7 +64,7 @@ impl<R> GuestCallOutcome<R> {
     }
 }
 
-/// The context that a guest call on the root callback thread is for.
+/// Which context a guest call from the root callback thread targets.
 #[derive(Clone, Copy)]
 enum GuestCallContext {
     RootOfGuest,
@@ -98,7 +100,7 @@ impl RootCallbackLoop {
     fn run_queue_item(&mut self, runtime: &RuntimeInner, queue: QueueId) -> WorkOutcome {
         loop {
             let Some(registrant) = self.queues.last_registrant(queue) else {
-                debug!("wasm queue {queue} got an item, and no live plugin registered it");
+                debug!("wasm queue {queue}: item kept pending, no live registrant");
                 self.queues.add_pending_item(queue);
                 return WorkOutcome::Done;
             };
@@ -114,10 +116,10 @@ impl RootCallbackLoop {
         }
     }
 
-    /// Deliver the result of a callout with `proxy_on_http_call_response`.
+    /// Deliver a callout result to the guest through `proxy_on_http_call_response`.
     ///
-    /// The result is dropped when the callout is no longer open, which happens when
-    /// `proxy_on_delete` ended its context first.
+    /// The result is silently dropped if the callout is no longer open, which is the case once
+    /// `proxy_on_delete` has ended its context.
     fn deliver_callout_result(
         &mut self,
         runtime: &RuntimeInner,
@@ -137,13 +139,14 @@ impl RootCallbackLoop {
         delivery.work_outcome()
     }
 
-    /// Run `proxy_on_log`, when the context still owes it, and then `proxy_on_delete`.
+    /// End a context the guest kept after its request, once the guest is done with it.
     ///
-    /// `proxy_on_delete` also runs after a failure of `proxy_on_log` that left the guest in its
-    /// slot. The results of the callouts that the context still had open are dropped when they
-    /// arrive, because the callouts are no longer open.
+    /// Runs `proxy_on_log` first if `needs_on_log` is set, then `proxy_on_delete`. A failing
+    /// `proxy_on_log` does not skip `proxy_on_delete`, although the latter does nothing if the
+    /// failure cost the guest its slot. Callouts the context still had open are closed with it,
+    /// so their results are dropped when they arrive.
     ///
-    /// When the slot is busy for `proxy_on_delete`, only `proxy_on_delete` runs again later, so
+    /// If the slot is busy by the time `proxy_on_delete` is due, only that call is retried, so
     /// `proxy_on_log` never runs twice.
     fn end_held_context(
         &mut self,
@@ -176,10 +179,14 @@ impl RootCallbackLoop {
         WorkOutcome::Done
     }
 
-    /// Run `body` on the guest at `address` with no request, and start the callouts it sent.
+    /// Run `body` against the guest at `address` outside of a request.
     ///
-    /// `body` receives the context of the call. A failure logs a warning with `callback_name`,
-    /// unless the failure removed the guest from its slot, because the pool logs that itself.
+    /// `body` is passed the resolved context id. The slot is locked without blocking, and nothing
+    /// runs if it is busy or no longer holds this guest. Callouts the guest made during a
+    /// successful call are started afterwards.
+    ///
+    /// A failed call is logged as a warning with `callback_name`, unless the failure removed the
+    /// guest from its slot, which the pool logs on its own.
     fn call_guest<R>(
         &mut self,
         runtime: &RuntimeInner,
@@ -211,7 +218,7 @@ impl RootCallbackLoop {
             }
             Err(e) => {
                 if !pool.replace_if_unusable(address.slot.slot_index, guard, &e) {
-                    warn!("wasm plugin {} failed in {callback_name}: {e}", pool.name);
+                    warn!("wasm plugin {}: {callback_name} failed: {e}", pool.name);
                 }
                 GuestCallOutcome::Failed
             }
