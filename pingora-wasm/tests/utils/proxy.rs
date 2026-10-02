@@ -21,7 +21,7 @@ use bytes::Bytes;
 use pingora_core::protocols::Digest;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{Error, ErrorType, Result};
-use pingora_http::ResponseHeader;
+use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use pingora_wasm::{write_plugin_response, RequestOutcome, WasmChain, WasmCtx};
 use std::time::Duration;
@@ -42,6 +42,8 @@ pub struct TestCtx {
 /// origin in `ORIGIN`.
 const FIRST_ORIGIN: &str = "x-test-first-origin";
 const ORIGIN: &str = "x-test-origin";
+/// Upstream request header listing the plugins that were skipped on the request.
+const SKIPPED_PLUGINS: &str = "x-test-skipped";
 
 #[async_trait]
 impl ProxyHttp for TestProxy {
@@ -95,6 +97,22 @@ impl ProxyHttp for TestProxy {
     ) -> Result<()> {
         if let Some(wasm) = ctx.wasm.as_mut() {
             wasm.upstream_connected(peer);
+        }
+        Ok(())
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        let skipped: Vec<&str> = match ctx.wasm.as_ref() {
+            Some(wasm) => wasm.skipped_plugins().collect(),
+            None => Vec::new(),
+        };
+        if !skipped.is_empty() {
+            upstream_request.insert_header(SKIPPED_PLUGINS, skipped.join(","))?;
         }
         Ok(())
     }

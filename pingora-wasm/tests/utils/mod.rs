@@ -37,7 +37,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const FIRST_PORT: u16 = 6380;
-pub const LAST_PORT: u16 = 6412;
+pub const LAST_PORT: u16 = 6420;
 
 pub fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

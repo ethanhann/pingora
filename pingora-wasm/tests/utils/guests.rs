@@ -26,6 +26,17 @@ const RESPONSE_HEADERS: &str = "proxy_on_response_headers";
 /// Body callback that pauses until the last chunk of the request body, then prepends `a`.
 const HOLD_THEN_MARK: &str = "(if (result i32) (local.get 2)
     (then (call $mark_a (i32.const 0))) (else (i32.const 1)))";
+/// Body callback that pauses until the last chunk of the request body, then traps.
+const HOLD_THEN_TRAP: &str =
+    "(if (result i32) (local.get 2) (then unreachable) (else (i32.const 1)))";
+/// Body for `proxy_on_request_headers` that stores its context id at address 608, sends a
+/// callout, and pauses.
+const STORE_CONTEXT_AND_CALL: &str =
+    "(i32.store (i32.const 608) (local.get 0)) (call $call_authz_and_pause)";
+/// Body for `proxy_on_http_call_response` that sends another callout from the context whose id
+/// is stored at address 608.
+const CALL_AGAIN: &str = "(drop (call $set_effective_context (i32.load (i32.const 608))))
+    (drop (call $call_authz_and_pause))";
 const MARK: &str = "(call $mark_a (i32.const 0))";
 const TEAPOT: &str = "(call $respond (i32.const 418))";
 const REQUEST_HEADERS: &str = "proxy_on_request_headers";
@@ -225,6 +236,58 @@ fn one_slot_plugin(name: &str, path: PathBuf) -> WasmPluginConf {
     let mut conf = WasmPluginConf::new(name, path);
     conf.slots = 1;
     conf
+}
+
+/// Write a guest that adds the request header `header` with `value`, and return its path.
+pub fn request_header_adder_module(label: &str, header: &str, value: &str) -> PathBuf {
+    let mut texts = MemoryTexts::new();
+    let (name_at, name_len) = texts.add(header);
+    let (value_at, value_len) = texts.add(value);
+    let exports = Exports {
+        request_headers: format!(
+            "(drop (call $add_header (i32.const 0) (i32.const {name_at}) (i32.const {name_len}) (i32.const {value_at}) (i32.const {value_len}))) i32.const 0"
+        ),
+        ..Exports::default()
+    };
+    write_module(label, &exports.into_wat(&texts.data_segments))
+}
+
+/// Build the conf for a plugin that adds the request header `header` with `value`.
+pub fn request_header_adder(name: &str, header: &str, value: &str) -> WasmPluginConf {
+    one_slot_plugin(name, request_header_adder_module(name, header, value))
+}
+
+/// Build the conf for a plugin that traps in `proxy_on_request_headers`.
+pub fn trap_on_request_headers(name: &str) -> WasmPluginConf {
+    let exports = Exports {
+        request_headers: "unreachable".to_string(),
+        ..Exports::default()
+    };
+    one_slot_plugin(name, write_module(name, &exports.into_wat("")))
+}
+
+/// Build the conf for a plugin that holds the request body and traps on its last chunk.
+pub fn hold_request_body_then_trap(name: &str) -> WasmPluginConf {
+    let mut conf = guest(name, name, REQUEST_BODY, HOLD_THEN_TRAP);
+    conf.slots = 1;
+    conf
+}
+
+/// Build the conf for a plugin that sends a callout from `proxy_on_request_headers`, pauses,
+/// and never continues.
+pub fn stay_paused_after_callout(name: &str) -> WasmPluginConf {
+    let path = wat_guest(name, REQUEST_HEADERS, CALL_AND_PAUSE, NO_DELIVERY);
+    one_slot_plugin(name, path)
+}
+
+/// Build the conf for a plugin that sends a callout from `proxy_on_request_headers`, pauses,
+/// and sends another callout each time a callout result arrives.
+///
+/// A callout result is delivered to the root context, so the plugin makes its stream context
+/// the effective one before it sends the next callout, as an SDK does.
+pub fn callout_on_each_delivery(name: &str) -> WasmPluginConf {
+    let path = wat_guest(name, REQUEST_HEADERS, STORE_CONTEXT_AND_CALL, CALL_AGAIN);
+    one_slot_plugin(name, path)
 }
 
 /// Build the conf for a plugin that sets a 100 ms tick period and logs `log_text` on every

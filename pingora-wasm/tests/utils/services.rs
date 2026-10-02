@@ -20,10 +20,11 @@ use super::callout_origins::{CalloutOrigin, CalloutOriginPerPlugin};
 use super::{fixture, guests};
 use once_cell::sync::Lazy;
 use pingora_wasm::{
-    PrometheusMetricSink, WasmPluginConf, WasmProperties, WasmRuntime, WasmServices,
+    FailPolicy, PrometheusMetricSink, WasmConf, WasmPluginConf, WasmRuntime, WasmServices,
 };
 use prometheus::{Encoder, Registry, TextEncoder};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -49,6 +50,8 @@ static CALLOUT_ORIGINS: Lazy<Arc<CalloutOriginPerPlugin>> = Lazy::new(|| {
         ("held-context", Some("0")),
         ("relay-metric", None),
         ("held-earlier", None),
+        ("stay-paused", Some("0")),
+        ("callout-chain", Some("0")),
     ])
 });
 
@@ -71,9 +74,9 @@ pub fn metrics_text() -> String {
 /// Attach the shared metric sink and set the fixed property `node.name` to `test-node`.
 fn add_metric_sink_and_node_name(services: &mut WasmServices) {
     services.metric_sink = METRIC_REGISTRY_AND_SINK.1.clone();
-    let mut fixed = WasmProperties::new();
-    fixed.insert(&["node", "name"], "test-node");
-    services.fixed_properties = fixed;
+    services
+        .fixed_properties
+        .insert(&["node", "name"], "test-node");
 }
 
 /// Return the origin receiving the callouts of `plugin`.
@@ -81,22 +84,17 @@ pub fn callout_origin(plugin: &str) -> Arc<CalloutOrigin> {
     CALLOUT_ORIGINS.origin(plugin)
 }
 
-/// The plugins and callout routing of one runtime.
+/// The plugins of one runtime and the services it is built with.
 struct RuntimePlan {
     plugins: Vec<WasmPluginConf>,
-    /// Whether callouts are routed to the per-plugin origins.
-    has_callout_origins: bool,
+    services: WasmServices,
 }
 
 impl RuntimePlan {
-    fn build(self) -> WasmRuntime {
-        let mut services = WasmServices::default();
-        if self.has_callout_origins {
-            services.callout_upstreams = CALLOUT_ORIGINS.clone();
-        }
-        add_metric_sink_and_node_name(&mut services);
-        services.log_sink = Arc::new(super::GuestMessageSink);
-        WasmRuntime::new_with_services(self.plugins, services).unwrap()
+    fn build(mut self) -> WasmRuntime {
+        add_metric_sink_and_node_name(&mut self.services);
+        self.services.log_sink = Arc::new(super::GuestMessageSink);
+        WasmRuntime::new_with_services(self.plugins, self.services).unwrap()
     }
 }
 
@@ -110,12 +108,28 @@ struct ServicePlans {
 
 impl ServicePlans {
     /// Add a runtime with `plugins` and return its index.
+    ///
+    /// With `has_callout_origins` set, callouts are routed to the per-plugin origins.
     fn runtime(&mut self, plugins: Vec<WasmPluginConf>, has_callout_origins: bool) -> usize {
-        self.runtimes.push(RuntimePlan {
-            plugins,
-            has_callout_origins,
-        });
+        let mut services = WasmServices::default();
+        if has_callout_origins {
+            services.callout_upstreams = CALLOUT_ORIGINS.clone();
+        }
+        self.runtimes.push(RuntimePlan { plugins, services });
         self.runtimes.len() - 1
+    }
+
+    /// Add a service on `port` whose runtime and `default` chain are read from a YAML file.
+    fn service_from_conf_file(&mut self, port: u16, path: &Path) {
+        let conf: WasmConf = serde_yaml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        let chain = conf.chain_plugins("default").unwrap();
+        let chain = chain.iter().map(|name| &*name.to_string().leak()).collect();
+        self.runtimes.push(RuntimePlan {
+            plugins: conf.plugins.clone(),
+            services: conf.services(),
+        });
+        let runtime = self.runtimes.len() - 1;
+        self.services.push((port, runtime, chain, None));
     }
 
     /// Add a service on `port` with its own runtime and a chain of all `plugins`, in order.
@@ -131,6 +145,24 @@ impl ServicePlans {
         let runtime = self.runtime(vec![plugin], true);
         self.services.push((port, runtime, chain, None));
     }
+}
+
+/// Write a configuration file with two plugins that each add an `x-order` request header, and a
+/// `default` chain of both.
+///
+/// The file is written at run time because the guests are built in a temporary directory.
+fn conf_file_with_two_plugins() -> PathBuf {
+    let first = guests::request_header_adder_module("yaml-first", "x-order", "first");
+    let second = guests::request_header_adder_module("yaml-second", "x-order", "second");
+    let yaml = format!(
+        "version: 1\nplugins:\n  - name: first\n    path: '{}'\n  - name: second\n    path: '{}'\n\
+         chains:\n  default: [first, second]\n",
+        first.display(),
+        second.display()
+    );
+    let path = first.with_extension("yaml");
+    fs::write(&path, yaml).unwrap();
+    path
 }
 
 fn chain_of(plugins: &[WasmPluginConf]) -> Vec<&'static str> {
@@ -243,6 +275,38 @@ pub fn services() -> Vec<(u16, WasmRuntime, Vec<&'static str>, Option<usize>)> {
         "held context of 6412 logged",
     );
     plans.service_with_callout_origin(6412, held_earlier);
+
+    plans.service_from_conf_file(6413, &conf_file_with_two_plugins());
+    plans.service(
+        6414,
+        vec![plugin("trap-closed", fixture("http-example"), 1, "")],
+        None,
+    );
+    let open = |mut conf: WasmPluginConf| {
+        conf.fail_policy = FailPolicy::Open;
+        conf
+    };
+    let adds_header = guests::request_header_adder("next", "x-order", "next");
+    let trap_open = open(guests::trap_on_request_headers("trap-open"));
+    plans.service(6415, vec![trap_open, adds_header], None);
+    let hold_then_trap = open(guests::hold_request_body_then_trap("hold-trap-open"));
+    plans.service(6416, vec![hold_then_trap], None);
+    let stay_paused = open(guests::stay_paused_after_callout("stay-paused"));
+    plans.service_with_callout_origin(6417, stay_paused);
+    let mut callout_chain = guests::callout_on_each_delivery("callout-chain");
+    callout_chain.callout_timeout_limit = CALLOUT_TIMEOUT_LIMIT;
+    callout_chain.callout_wait_limit = CALLOUT_TIMEOUT_LIMIT;
+    plans.service_with_callout_origin(6418, callout_chain);
+    let code_logger = guests::property_reader(
+        "code-logger",
+        guests::PropertyReads {
+            logged_in_on_log: &["response/code"],
+            ..guests::PropertyReads::default()
+        },
+    );
+    let trap_after_logger = guests::trap_on_request_headers("trap-after-logger");
+    plans.service(6419, vec![code_logger, trap_after_logger], None);
+    plans.service(6420, vec![open(guests::hold("hold-limit-open", 16))], None);
 
     let runtimes: Vec<WasmRuntime> = thread::scope(|scope| {
         let builds: Vec<_> = plans

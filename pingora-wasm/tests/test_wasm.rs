@@ -14,6 +14,10 @@
 
 mod utils;
 
+#[path = "test_wasm/configuration.rs"]
+mod configuration;
+#[path = "test_wasm/fail_policy.rs"]
+mod fail_policy;
 #[path = "test_wasm/plugin_services.rs"]
 mod plugin_services;
 #[path = "test_wasm/properties.rs"]
