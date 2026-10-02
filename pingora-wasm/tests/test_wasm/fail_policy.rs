@@ -103,7 +103,7 @@ async fn callout_chain_ends_at_wait_limit() {
     let res = get(6418, "/", origin.addr().port(), &[]).await;
 
     assert_eq!(res.status(), 503);
-    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert!(started.elapsed() >= Duration::from_millis(400));
     assert_eq!(count.load(Ordering::SeqCst), 0);
     assert!(callout_origin("callout-chain").requests().len() > 1);
     let metrics = metrics_text();

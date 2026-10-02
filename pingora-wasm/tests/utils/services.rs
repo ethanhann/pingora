@@ -295,7 +295,7 @@ pub fn services() -> Vec<(u16, WasmRuntime, Vec<&'static str>, Option<usize>)> {
     plans.service_with_callout_origin(6417, stay_paused);
     let mut callout_chain = guests::callout_on_each_delivery("callout-chain");
     callout_chain.callout_timeout_limit = CALLOUT_TIMEOUT_LIMIT;
-    callout_chain.callout_wait_limit = CALLOUT_TIMEOUT_LIMIT;
+    callout_chain.callout_wait_limit = CALLOUT_TIMEOUT_LIMIT + Duration::from_millis(100);
     plans.service_with_callout_origin(6418, callout_chain);
     let code_logger = guests::property_reader(
         "code-logger",
