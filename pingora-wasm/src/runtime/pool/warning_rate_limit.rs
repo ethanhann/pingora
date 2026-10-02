@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Warning rate limit
+//! Rate limiting for repeated warnings
 //!
-//! A plugin that fails on every request gets a new guest each time, and with
-//! `FailPolicy::Open` it is also skipped each time. To limit the log volume, the warning for a
-//! replaced guest and the warning for a skipped plugin are each written at most once per
-//! interval for a plugin.
+//! A plugin failing on every request would log a warning for each one. Its pool warns at most
+//! once every 10 seconds and reports how many events the warning covers.
 
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
