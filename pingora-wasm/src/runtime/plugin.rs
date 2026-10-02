@@ -110,8 +110,8 @@ pub struct WasmPluginConf {
     /// to [callout_wait_limit](Self::callout_wait_limit) for the wait as a whole.
     ///
     /// If the plugin sends callouts from a body filter or from the response header filter, keep
-    /// this limit below the `read_timeout` of your upstream peers. Must be greater than zero, and
-    /// a value above [callout_wait_limit](Self::callout_wait_limit) is rejected.
+    /// this limit below the `read_timeout` of your upstream peers. Must be greater than zero and
+    /// less than [callout_wait_limit](Self::callout_wait_limit).
     pub callout_timeout_limit: Duration,
     /// The longest a filter may wait for the plugin's callouts. Default 30 seconds.
     ///
@@ -130,10 +130,8 @@ pub struct WasmPluginConf {
     /// The limit applies to each wait separately. A body filter runs once per chunk, so a plugin
     /// that waits on every chunk gets the full limit each time. If the plugin sends callouts
     /// from a body filter or from the response header filter, keep this limit below the
-    /// `read_timeout` of your upstream peers. Must not be less than
-    /// [callout_timeout_limit](Self::callout_timeout_limit). If the two limits are equal, a
-    /// single callout that times out ends at the same moment as the wait, and either the timeout
-    /// or the wait limit may take effect first.
+    /// `read_timeout` of your upstream peers. Must be greater than
+    /// [callout_timeout_limit](Self::callout_timeout_limit).
     ///
     /// A timeout of your own around a filter cannot replace this limit. Once the future of a
     /// filter has been dropped during a callout wait, every later header or trailer filter of the
@@ -157,8 +155,8 @@ pub struct WasmPluginConf {
     ///
     /// With [FailPolicy::Open], the failure is logged, the plugin is skipped, and the request
     /// continues with the next plugin. No later header, body, or trailer filter of that request
-    /// runs the skipped plugin again. Every skip is logged at debug level, and as a warning at
-    /// most once every 10 seconds per plugin. A plugin is skipped when it:
+    /// runs the skipped plugin again. Per plugin, one skip every 10 seconds is logged as a
+    /// warning, and the rest at debug level. A plugin is skipped when it:
     ///
     /// - traps or returns an error in a callback, including `proxy_on_http_call_response`
     /// - has no guest in any of its slots when the request starts

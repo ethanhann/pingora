@@ -283,8 +283,8 @@
 //! where `response.code` reads 503.
 //!
 //! With [FailPolicy::Open], the failure is logged, the plugin is skipped for the rest of the
-//! request, and the request continues with the other plugins. Every skip is logged at debug
-//! level, and as a warning at most once every 10 seconds per plugin. On a plugin that
+//! request, and the request continues with the other plugins. Per plugin, one skip every 10
+//! seconds is logged as a warning, and the rest at debug level. On a plugin that
 //! authorizes requests, `Open` lets a request through each time the plugin crashes, hangs, or is
 //! too slow. Use it for plugins a request can do without, such as one that collects statistics.
 //! [WasmCtx::skipped_plugins] returns the plugins that were skipped on a request, so your proxy

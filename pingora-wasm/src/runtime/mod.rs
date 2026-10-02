@@ -90,8 +90,8 @@ impl WasmRuntime {
     /// `proxy_on_configure` returns `false`, or if its configuration is invalid. A configuration
     /// is invalid when [slots](WasmPluginConf::slots) is zero, when
     /// [limits](WasmPluginConf::limits) sets a fuel limit, when one of the body or callout limits
-    /// is zero, or when [callout_wait_limit](WasmPluginConf::callout_wait_limit) is less than
-    /// [callout_timeout_limit](WasmPluginConf::callout_timeout_limit). A plugin's
+    /// is zero, or when [callout_wait_limit](WasmPluginConf::callout_wait_limit) is not greater
+    /// than [callout_timeout_limit](WasmPluginConf::callout_timeout_limit). A plugin's
     /// [fail_policy](WasmPluginConf::fail_policy) has no effect on these errors.
     ///
     /// Returns `InternalError` if the wasm engine cannot be built.

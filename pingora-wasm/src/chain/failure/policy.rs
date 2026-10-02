@@ -143,9 +143,8 @@ impl WasmCtx {
 
     /// Log that the plugin at `position` was skipped after `failure`.
     ///
-    /// Every skip is logged at debug level. The warning is rate limited per plugin, and gives the
-    /// number of requests that skipped the plugin since the last warning if there was more than
-    /// one.
+    /// The warning is rate limited per plugin, and other skips are logged at debug level. It gives
+    /// the number of requests that skipped the plugin since the last warning if more than one did.
     fn log_skipped_plugin(&self, position: usize, failure: &FilterFailure) {
         let pool = self.pool_at(position);
         let plugin = &pool.name;
