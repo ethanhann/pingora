@@ -25,7 +25,7 @@ use pingora_wasm::{
     write_plugin_response, PrometheusMetricSink, RequestOutcome, StaticCalloutUpstreams, WasmChain,
     WasmConf, WasmCtx, WasmPluginConf, WasmRuntime, WasmServices,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -187,15 +187,24 @@ fn runtime_and_chain_from_args(args: &[String], slots: usize) -> (WasmRuntime, W
 
 /// Build the runtime and the `default` chain from a YAML file.
 fn runtime_and_chain_from_conf(path: &str) -> (WasmRuntime, WasmChain) {
-    let yaml = std::fs::read_to_string(path).expect("conf file should be readable");
-    let conf: WasmConf = serde_yaml::from_str(&yaml).expect("conf file should be valid");
+    let yaml = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| exit_with(format!("cannot read {path}: {e}")));
+    let conf: WasmConf =
+        serde_yaml::from_str(&yaml).unwrap_or_else(|e| exit_with(format!("invalid {path}: {e}")));
     let mut services = conf.services();
     services.metric_sink = prometheus_sink();
-    let runtime = WasmRuntime::new_with_services(conf.plugins.clone(), services).unwrap();
-    let chain = runtime
-        .chain(&conf.chain_plugins(DEFAULT_CHAIN).unwrap())
-        .unwrap();
+    let runtime = WasmRuntime::new_with_services(conf.plugins.clone(), services)
+        .unwrap_or_else(|e| exit_with(format!("invalid {path}: {e}")));
+    let chain = conf
+        .chain_plugins(DEFAULT_CHAIN)
+        .and_then(|names| runtime.chain(&names))
+        .unwrap_or_else(|e| exit_with(format!("invalid {path}: {e}")));
     (runtime, chain)
+}
+
+fn exit_with(message: String) -> ! {
+    eprintln!("{message}");
+    std::process::exit(1)
 }
 
 fn prometheus_sink() -> Arc<PrometheusMetricSink> {
@@ -230,11 +239,15 @@ fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let conf_path = match &args[..] {
         [flag, path] if flag == CONF_FLAG => Some(path.clone()),
+        [flag] if flag == CONF_FLAG => exit_with("--conf needs a file".to_string()),
         _ if args.iter().any(|arg| arg == CONF_FLAG) => {
-            panic!("--conf takes one file and cannot be combined with other arguments")
+            exit_with("--conf cannot be combined with other arguments".to_string())
         }
         _ => None,
     };
+    if let Some(path) = conf_path.as_ref().filter(|path| !Path::new(path).is_file()) {
+        exit_with(format!("cannot read {path}: no such file"));
+    }
     let opt = Opt {
         conf: conf_path.clone(),
         ..Opt::default()
