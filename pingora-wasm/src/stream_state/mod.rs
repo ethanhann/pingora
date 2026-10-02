@@ -13,10 +13,6 @@
 // limitations under the License.
 
 //! Per-request stream state
-//!
-//! This is what a plugin reads and writes from inside a callback. It covers the request and
-//! response headers, the body, the response trailers, the properties, and a response the plugin
-//! sends itself in place of the upstream's.
 
 mod body;
 mod headers;
@@ -40,7 +36,6 @@ use std::sync::Arc;
 /// them back out afterwards.
 #[derive(Default)]
 pub(crate) struct PingoraStream {
-    /// The plugin whose callback is running, for log messages.
     pub(crate) plugin_name: Arc<str>,
     pub(crate) request: Option<RequestHeaders>,
     pub(crate) response: Option<ResponseHeaders>,
@@ -55,7 +50,6 @@ pub(crate) struct PingoraStream {
     pub(crate) request_facts: RequestFacts,
     /// Per-request properties set by the proxy. Plugins cannot change them.
     pub(crate) proxy_properties: WasmProperties,
-    /// Per-request properties written by plugins.
     pub(crate) guest_properties: WasmProperties,
     fixed_properties: Arc<WasmProperties>,
     joined_path: Vec<u8>,
@@ -76,14 +70,11 @@ impl PingoraStream {
         }
     }
 
-    /// Clear the continue flags left by the previous guest call.
     pub(crate) fn clear_continue_requests(&mut self) {
         self.asked_to_continue_request = false;
         self.asked_to_continue_response = false;
     }
 
-    /// Return `true` if the plugin called `proxy_continue_stream` for `direction` during the last
-    /// guest call.
     pub(crate) fn continue_requested(&self, direction: StreamType) -> bool {
         match direction {
             StreamType::HttpRequest => self.asked_to_continue_request,
@@ -93,11 +84,10 @@ impl PingoraStream {
     }
 
     /// Return the callback whose access rules apply to a host call.
-    ///
-    /// This is the callback being run, except in `proxy_on_http_call_response`, where the plugin
-    /// gets the access of the callback it is paused in.
     fn access_callback(&self, call: Invocation) -> Option<Callback> {
         match call.callback {
+            // In `proxy_on_http_call_response` the plugin gets the access of the callback it is
+            // paused in
             Some(Callback::HttpCallResponse) => self.delivery_callback,
             callback => callback,
         }

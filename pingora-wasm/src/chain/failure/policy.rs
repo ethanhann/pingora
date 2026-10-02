@@ -13,9 +13,6 @@
 // limitations under the License.
 
 //! Fail policy enforcement
-//!
-//! The per-request record the fail policy works from, and the `WasmCtx` functions that apply the
-//! policy to a failure, skip a plugin, and report to the metric sink.
 
 use super::FilterFailure;
 use crate::chain::body::BodyDirection;
@@ -31,15 +28,9 @@ use proxy_wasm_host::abi::v0_2_1::{Callback, GuestError};
 use std::time::Instant;
 
 /// Per-request record of plugin failures and body changes, kept as chain positions.
-///
-/// An empty `Vec` does not allocate, so these lists cost nothing for a request without a failure
-/// or a body change.
 #[derive(Debug, Default)]
 pub(crate) struct FailPolicyRecord {
-    /// Plugins that failed open, in the order they failed. They are skipped for the rest of the
-    /// request.
     skipped: Vec<usize>,
-    /// Plugins with a failure already reported to the metric sink.
     reported: Vec<usize>,
     /// Plugins that wrote to the request body or changed one of its length headers.
     changed_request_body: Vec<usize>,
@@ -48,7 +39,6 @@ pub(crate) struct FailPolicyRecord {
     /// Whether the response has ended. That is the case for a response without a body, once
     /// its last body chunk has run through the plugins, and once its trailers have arrived.
     pub(in crate::chain) response_body_ended: bool,
-    /// Whether a plugin has sent its own response, after which no body is proxied.
     pub(in crate::chain) plugin_response_started: bool,
 }
 
@@ -64,11 +54,9 @@ impl FailPolicyRecord {
 impl WasmCtx {
     /// Return the names of the plugins that failed open on this request.
     ///
-    /// A plugin with [FailPolicy::Open] that fails is skipped for the rest of the request, and
-    /// the request continues without it. Use this to apply a rule of your own when that happens,
+    /// Use this to apply a rule of your own when a plugin with [FailPolicy::Open] is skipped,
     /// e.g. deny the request if a plugin that authorizes requests is in the list, add a header,
-    /// or tag your access log. The names are in the order the plugins failed, and the iterator is
-    /// empty if none did.
+    /// or tag your access log. The names are in the order the plugins failed.
     ///
     /// A plugin can still be skipped in a later filter, after your `request_filter` has looked at
     /// this list. A rule that denies the request therefore has to check the list again in the
@@ -78,12 +66,10 @@ impl WasmCtx {
         skipped.map(|position| &*self.pool_at(*position).name)
     }
 
-    /// Return `true` if the plugin at `position` has been skipped on this request.
     pub(in crate::chain) fn is_skipped(&self, position: usize) -> bool {
         self.failures.skipped.contains(&position)
     }
 
-    /// Record that the plugin at `position` changed the body of `direction` or its length headers.
     pub(crate) fn record_body_change(&mut self, direction: BodyDirection, position: usize) {
         let changed = match direction {
             BodyDirection::Request => &mut self.failures.changed_request_body,
@@ -94,19 +80,6 @@ impl WasmCtx {
         }
     }
 
-    /// Apply the fail policy of the plugin at `position` to `failure`.
-    ///
-    /// Returns `Ok` once the plugin has been skipped, and the caller then continues the pass with
-    /// the next plugin. Skipping drops the response the plugin recorded and the callouts it sent
-    /// in the failing call, stops the wait for its pending callouts, and clears its continue
-    /// requests. Its context is kept, so `logging` still runs its end-of-request callbacks if its
-    /// guest is usable.
-    ///
-    /// # Errors
-    ///
-    /// Returns the failure's error if the plugin's fail policy is `Closed`. A plugin with `Open`
-    /// also fails the request while a body it changed can still have bytes to come. The failure
-    /// is then reported as [PluginFailure::BodyChanged], and the error message says so.
     pub(in crate::chain) fn skip_plugin_or_fail_request(
         &mut self,
         position: usize,
@@ -133,6 +106,9 @@ impl WasmCtx {
         );
         self.log_skipped_plugin(position, &failure);
         self.failures.skipped.push(position);
+        // The response the plugin recorded and the callouts it sent in the failing call are
+        // dropped. Its context is kept, so `logging` still runs its end-of-request callbacks if
+        // its guest is usable
         self.callouts.take_accepted();
         self.callouts.forget_pending(position);
         let stream = self.stream();
@@ -141,10 +117,6 @@ impl WasmCtx {
         Ok(())
     }
 
-    /// Log that the plugin at `position` was skipped after `failure`.
-    ///
-    /// The warning is rate limited per plugin, and other skips are logged at debug level. It gives
-    /// the number of requests that skipped the plugin since the last warning if more than one did.
     fn log_skipped_plugin(&self, position: usize, failure: &FilterFailure) {
         let pool = self.pool_at(position);
         let plugin = &pool.name;
@@ -161,14 +133,6 @@ impl WasmCtx {
         }
     }
 
-    /// Replace the guest in `locked` if `error` left it unusable, then apply the fail policy of
-    /// the plugin at `position` to the failed `callback`.
-    ///
-    /// Returns `Ok` if the plugin was skipped.
-    ///
-    /// # Errors
-    ///
-    /// Returns the failure's error if the plugin was not skipped.
     pub(in crate::chain) fn guest_call_failed(
         &mut self,
         position: usize,
@@ -181,14 +145,6 @@ impl WasmCtx {
         self.skip_plugin_or_fail_request(position, failure)
     }
 
-    /// Lock the slot whose guest holds the context of the plugin at `position`.
-    ///
-    /// `callback` is the callback the filter is about to run, and is only used in the failure
-    /// message. Returns `None` if the guest is gone and the plugin was skipped.
-    ///
-    /// # Errors
-    ///
-    /// Returns the failure's error if the guest is gone and the plugin was not skipped.
     pub(in crate::chain) fn lock_slot_or_skip_plugin<'a>(
         &mut self,
         pool: &'a GuestPool,
@@ -204,18 +160,8 @@ impl WasmCtx {
         Ok(None)
     }
 
-    /// Return the direction of a body the plugin at `position` changed that can still have bytes
-    /// run through the plugin.
-    ///
-    /// Such a plugin cannot be skipped, because the rest of that body would go out without its
-    /// changes. Returns `None` if the plugin can be skipped.
-    ///
-    /// A plugin changed a body if it wrote to the body bytes, or changed the value of
-    /// `content-length` or `transfer-encoding` of that message. A body only counts if the plugin
-    /// runs on it. The request body counts until its last chunk has run through the plugins, and
-    /// the response body until the response has ended. Neither counts once a plugin has sent its
-    /// own response, since no body is proxied after that.
     fn changed_body_with_bytes_to_come(&self, position: usize) -> Option<BodyDirection> {
+        // No body is proxied once a plugin has sent its own response
         if self.failures.plugin_response_started {
             return None;
         }
@@ -232,9 +178,6 @@ impl WasmCtx {
         None
     }
 
-    /// Report `failure` as having failed the request and return its error.
-    ///
-    /// Called directly for the failures that fail the request under both policies.
     pub(in crate::chain) fn failed_request_error(
         &mut self,
         position: usize,
@@ -249,9 +192,6 @@ impl WasmCtx {
         failure.into_error(&self.pool_at(position).name)
     }
 
-    /// Send a failure report for the plugin at `position` to the metric sink.
-    ///
-    /// Later failures of the same plugin on this request are not reported.
     pub(in crate::chain) fn report_failure(
         &mut self,
         position: usize,
@@ -259,6 +199,7 @@ impl WasmCtx {
         outcome: PluginFailureOutcome,
         callback: Option<Callback>,
     ) {
+        // The metric sink gets at most one report per plugin and request
         if self.failures.reported.contains(&position) {
             return;
         }

@@ -13,15 +13,11 @@
 // limitations under the License.
 
 //! Shared queue registrations
-//!
-//! Tracks which root contexts registered each queue, and so which one gets
-//! `proxy_on_queue_ready` when an item is enqueued.
 
 use crate::runtime::pool::events::GuestAddress;
 use proxy_wasm_host::abi::v0_2_1::{ContextId, QueueId};
 use std::collections::HashMap;
 
-/// A root context that registered a queue, and the guest it belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Registrant {
     pub(super) address: GuestAddress,
@@ -30,9 +26,7 @@ pub(super) struct Registrant {
 
 /// Per-queue registrants in registration order, plus a count of items still waiting for one.
 ///
-/// Each item is delivered to the most recent registrant. A slot appears at most once per queue,
-/// and registering again from the same slot moves it to the end. Items enqueued while a queue has
-/// no live registrant are counted as pending.
+/// Each item is delivered to the most recent registrant.
 #[derive(Default)]
 pub(super) struct QueueRegistrations {
     registrants: HashMap<QueueId, Vec<Registrant>>,
@@ -42,11 +36,6 @@ pub(super) struct QueueRegistrations {
 }
 
 impl QueueRegistrations {
-    /// Register `root` of the guest at `address` as the latest registrant of `queue`.
-    ///
-    /// Any earlier registration from the same slot is replaced. Returns the number of pending
-    /// items, which this registrant now receives, and resets that count. `name` is kept for log
-    /// messages the first time the queue is registered.
     pub(super) fn register(
         &mut self,
         queue: QueueId,
@@ -58,29 +47,27 @@ impl QueueRegistrations {
             .entry(queue)
             .or_insert_with(|| String::from_utf8_lossy(name).into_owned());
         let registrants = self.registrants.entry(queue).or_default();
+        // A slot appears at most once per queue, so registering again moves it to the end
         registrants.retain(|r| r.address.slot != address.slot);
         registrants.push(Registrant { address, root });
+        // This registrant now receives the items that were pending
         self.pending_items.remove(&queue).unwrap_or(0)
     }
 
-    /// Return the name `queue` was registered with, or `unknown` if no guest registered it.
     pub(super) fn name(&self, queue: QueueId) -> &str {
         self.names.get(&queue).map_or("unknown", String::as_str)
     }
 
-    /// Return the registrant the next item of `queue` should be delivered to.
     pub(super) fn last_registrant(&self, queue: QueueId) -> Option<Registrant> {
         self.registrants.get(&queue).and_then(|r| r.last()).copied()
     }
 
-    /// Remove a registrant whose guest is no longer in its slot.
     pub(super) fn remove(&mut self, queue: QueueId, registrant: Registrant) {
         if let Some(registrants) = self.registrants.get_mut(&queue) {
             registrants.retain(|r| *r != registrant);
         }
     }
 
-    /// Count an item enqueued on `queue` as pending for the next guest that registers it.
     pub(super) fn add_pending_item(&mut self, queue: QueueId) {
         *self.pending_items.entry(queue).or_default() += 1;
     }

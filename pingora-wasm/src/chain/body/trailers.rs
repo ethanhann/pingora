@@ -37,36 +37,19 @@ impl WasmCtx {
     /// Call this from your `response_trailer_filter`, pass its arguments through, and return its
     /// result. Only plugins that have
     /// [response_trailers](crate::WasmPluginConf::response_trailers) enabled and export the
-    /// callback are run. Plugins can read and change the trailers, and can read the request
-    /// headers. This filter does nothing for a subrequest and once a plugin has sent its own
-    /// response.
+    /// callback are run. A plugin may pause to wait for a callout, in which case this filter
+    /// waits with it, up to its [callout_wait_limit](crate::WasmPluginConf::callout_wait_limit).
     ///
     /// Call this even if you only run plugins on response bodies. A response with trailers ends
     /// with the trailers, not with a last body chunk, so a plugin that paused on the body is
     /// still holding bytes at this point. Those bytes are returned, and Pingora writes them to
     /// the downstream in place of the trailers.
     ///
-    /// A plugin may pause while waiting for a callout, in which case this filter waits with it.
-    ///
-    /// # Errors
-    ///
-    /// For a plugin with [FailPolicy::Closed](crate::FailPolicy::Closed), returns
-    /// [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if the plugin traps or otherwise fails,
-    /// pauses with no callout pending, waits for callouts longer than its
-    /// [callout_wait_limit](crate::WasmPluginConf::callout_wait_limit), or lost the guest holding
-    /// this request. A plugin with [FailPolicy::Open](crate::FailPolicy::Open) is skipped
-    /// instead. A change it made to the response body no longer prevents that, because the
-    /// trailers end the response. A change to a request body that is still being sent upstream
-    /// does. See [fail_policy](crate::WasmPluginConf::fail_policy) for the full rule.
-    ///
-    /// Under both policies, the same error is returned if a plugin sends its own response, or if
-    /// an earlier filter of this request was cancelled while a plugin was waiting for a callout.
-    ///
     /// Pingora only logs an error from `response_trailer_filter` and still sends the trailers, so
     /// end the response in your filter if they must not go out.
     ///
-    /// If a plugin was holding body bytes, the failure is logged and the bytes are returned
-    /// instead of the error, so the downstream still gets the whole body.
+    /// If a plugin was holding body bytes, the error is logged and the bytes are returned in its
+    /// place, so the downstream still gets the whole body.
     pub async fn response_trailer_filter<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -77,6 +60,8 @@ impl WasmCtx {
         {
             return Ok(None);
         }
+        // The trailers end the response, so a change a plugin made to the response body no
+        // longer prevents skipping it
         self.failures.response_body_ended = true;
         let mut passed = self.refuse_after_cancelled_wait();
         if passed.is_ok() && self.chain.phases.response_trailers {
@@ -93,14 +78,6 @@ impl WasmCtx {
         }
     }
 
-    /// Run the trailer callback of each plugin in reverse chain order, waiting for callouts along
-    /// the way.
-    ///
-    /// # Errors
-    ///
-    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if a plugin sends its own response.
-    /// The same error is returned if a callback fails, or if a plugin is still paused with no
-    /// callout left to wait for, unless the plugin's fail policy lets it be skipped.
     async fn run_trailer_callbacks<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -126,9 +103,6 @@ impl WasmCtx {
     }
 
     /// Run the trailer callbacks of the plugins at positions below `remaining`, in reverse order.
-    ///
-    /// Returns the position of a plugin that paused with a callout pending, or `None` once the
-    /// pass is over.
     fn run_trailer_callbacks_before<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -188,11 +162,6 @@ impl WasmCtx {
         Ok(None)
     }
 
-    /// Take the response body bytes still held by plugins and join them in stream order.
-    ///
-    /// Response bodies run in reverse chain order, so the first plugin in the chain holds the
-    /// earliest bytes. A warning is logged for each plugin that held any. Returns `None` if
-    /// nothing was held.
     fn release_held(&mut self) -> Option<Bytes> {
         let held = self.held.take_response();
         let size: usize = held.iter().map(Vec::len).sum();
@@ -200,6 +169,8 @@ impl WasmCtx {
             return None;
         }
         let mut all = BytesMut::with_capacity(size);
+        // Response bodies run in reverse chain order, so the first plugin in the chain holds the
+        // earliest bytes
         for (position, bytes) in held.iter().enumerate() {
             if bytes.is_empty() {
                 continue;

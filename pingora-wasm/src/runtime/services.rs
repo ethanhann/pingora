@@ -13,9 +13,6 @@
 // limitations under the License.
 
 //! Proxy services for plugins
-//!
-//! [WasmServices] is what a proxy provides to its plugins. The rest of the module spawns callout
-//! tasks and limits how many callouts are in flight.
 
 use crate::callout::{
     AcceptedCallout, CalloutResult, CalloutSender, CalloutUpstreams, PendingResult,
@@ -50,7 +47,8 @@ pub struct WasmServices {
     /// The upstreams plugins may send callouts to.
     ///
     /// The default has no upstreams, so `proxy_http_call` returns `BAD_ARGUMENT` for every
-    /// callout.
+    /// callout. Pass a [StaticCalloutUpstreams] for a fixed list of peers, or your own
+    /// implementation of [CalloutUpstreams].
     pub callout_upstreams: Arc<dyn CalloutUpstreams>,
     /// The connector used to send callouts, which also pools their connections. Default `None`.
     ///
@@ -59,8 +57,7 @@ pub struct WasmServices {
     /// connections are kept.
     ///
     /// Callouts a plugin sends outside of a request, e.g. from `proxy_on_tick`, do not use this
-    /// connector. They run on a thread that stops with the runtime, and are sent through a
-    /// separate connector with the default options.
+    /// connector. They are sent through a separate connector with the default options.
     pub callout_connector: Option<Arc<Connector>>,
     /// The maximum number of callouts the runtime will have in flight at once. Default 1024.
     ///
@@ -78,10 +75,8 @@ pub struct WasmServices {
     ///
     /// Every plugin can read them, including from `proxy_on_configure`. A plugin cannot override
     /// a fixed property. During a request, its `proxy_set_property` call on a fixed path still
-    /// succeeds, since the Rust SDK panics on any other status, but the plugin reads the fixed
-    /// value back. [WasmCtx::guest_property](crate::WasmCtx::guest_property) returns what the
-    /// plugin wrote. Outside of a request, e.g. in `proxy_on_configure` or `proxy_on_tick`,
-    /// `proxy_set_property` fails for every path.
+    /// succeeds, but the plugin reads the fixed value back.
+    /// [WasmCtx::guest_property](crate::WasmCtx::guest_property) returns what the plugin wrote.
     pub fixed_properties: WasmProperties,
 }
 
@@ -106,18 +101,11 @@ impl fmt::Debug for WasmServices {
     }
 }
 
-/// The callout senders of a runtime.
 pub(crate) struct CalloutSenders {
-    /// The sender for callouts a request is waiting for.
     pub(crate) for_requests: Arc<dyn CalloutSender>,
-    /// The sender for callouts whose results are delivered by the root callback thread.
-    ///
-    /// It has a connector of its own because a connection is tied to the tokio runtime that
-    /// opened it, and that thread's tokio runtime is shut down when the `WasmRuntime` is dropped.
     pub(crate) root_callback: Arc<dyn CalloutSender>,
 }
 
-/// A runtime's callout task launcher, which enforces the limit on callouts in flight.
 pub(crate) struct CalloutLauncher {
     senders: CalloutSenders,
     metric_sink: Arc<dyn WasmMetricSink>,
@@ -145,23 +133,14 @@ impl CalloutLauncher {
         })
     }
 
-    /// Return the number of callouts in flight.
     pub(crate) fn in_flight_count(&self) -> usize {
         self.limit - self.in_flight_permits.available_permits()
     }
 
-    /// Spawn the task that sends `callout` on behalf of a request.
-    ///
-    /// A callout over the in-flight limit is not spawned, and a ready 503 response is returned in
-    /// its place. Returns `None` if no tokio runtime is running, in which case the callout is
-    /// dropped.
     pub(crate) fn spawn(&self, callout: AcceptedCallout) -> Option<PendingResult> {
         self.spawn_with(&self.senders.for_requests, callout)
     }
 
-    /// Spawn the task that sends `callout` on behalf of the root callback thread.
-    ///
-    /// Behaves like [Self::spawn], except that the callout goes through the root callback sender.
     pub(crate) fn spawn_for_root_callback(
         &self,
         callout: AcceptedCallout,

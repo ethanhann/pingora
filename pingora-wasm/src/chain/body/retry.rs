@@ -13,20 +13,15 @@
 // limitations under the License.
 
 //! Request body replay on retry
-//!
-//! When Pingora retries a request it replays the request body it buffered. The plugins have
-//! already run on those bytes, so their output is kept here and sent again without running them
-//! a second time.
 
 use crate::chain::WasmCtx;
 use bytes::{Bytes, BytesMut};
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_proxy::Session;
 
-/// Progress of the request body through the plugins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RequestBodyProgress {
-    /// The request has no body, or the request header phase has not run.
+    /// The request has no body, or `request_filter` has not run.
     Absent,
     /// A body is expected, but no chunk has been run through the plugins yet.
     Waiting,
@@ -34,16 +29,12 @@ pub(super) enum RequestBodyProgress {
     Ended,
 }
 
-/// Request body filter state, including the plugin output kept for a retry.
 #[derive(Debug)]
 pub(crate) struct RequestBodyState {
     pub(super) progress: RequestBodyProgress,
     pub(super) attempts: usize,
-    /// Set when a retry starts, as its first body chunk may be a replay of bytes the plugins
-    /// have already run on.
     pub(super) replay_due: bool,
-    /// Plugin output so far, sent again on a retry. `None` once Pingora has truncated its own
-    /// retry buffer.
+    /// Plugin output so far, sent again on a retry.
     pub(super) kept: Option<BytesMut>,
 }
 
@@ -57,8 +48,6 @@ impl RequestBodyState {
         }
     }
 
-    /// Return `true` if the request has a body whose last chunk has not been run through the
-    /// plugins yet.
     pub(crate) fn is_unfinished(&self) -> bool {
         matches!(
             self.progress,
@@ -66,7 +55,6 @@ impl RequestBodyState {
         )
     }
 
-    /// Mark the request as having a body.
     pub(crate) fn expect_body(&mut self) {
         self.progress = RequestBodyProgress::Waiting;
     }
@@ -84,18 +72,16 @@ impl WasmCtx {
     /// request body if the call was never made.
     pub fn upstream_attempt(&mut self) {
         self.request_body.attempts += 1;
+        // The first body chunk of a retry may be a replay of bytes the plugins have already run on
         self.request_body.replay_due = self.request_body.attempts > 1;
     }
 
-    /// Append `output` to the bytes kept for a retry.
-    ///
-    /// Everything kept is dropped once Pingora has truncated its own retry buffer, since the body
-    /// can no longer be replayed.
     pub(super) fn keep_for_retry<DS: DownstreamSession>(
         &mut self,
         session: &Session<DS>,
         output: &Bytes,
     ) {
+        // The body can no longer be replayed once Pingora has truncated its own retry buffer
         if session.as_downstream().retry_buffer_truncated() {
             self.request_body.kept = None;
         } else if let Some(kept) = self.request_body.kept.as_mut() {

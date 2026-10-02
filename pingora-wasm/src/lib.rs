@@ -107,8 +107,8 @@ pub const ERR_RESPONSE_BODY_TOO_LARGE: ErrorType =
 /// The error type returned for a mistake in the configuration.
 ///
 /// Returned by [WasmRuntime::new], [WasmRuntime::new_with_services], [WasmRuntime::chain], and
-/// [WasmConf::chain_plugins]. A plugin whose file cannot be compiled, or whose guest does not start,
-/// is reported with this type as well. A file that cannot be read is a `ReadError`.
+/// [WasmConf::chain_plugins]. A plugin whose file cannot be compiled, or whose guest does not
+/// start, is reported with this type as well. A file that cannot be read is a `ReadError`.
 pub const ERR_INVALID_CONF: ErrorType = ErrorType::new("WasmInvalidConf");
 
 pub(crate) fn invalid_conf(detail: impl Into<String>) -> Box<Error> {

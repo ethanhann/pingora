@@ -28,10 +28,6 @@ use proxy_wasm_host::abi::v0_2_1::Callback;
 
 const CHUNKED: &str = "chunked";
 
-/// Build the failure for a plugin that paused on response headers with nothing to wait for.
-///
-/// On an upstream response the plugin has no callout pending. On a plugin's response its callouts
-/// are never started, so the pause could not end.
 fn response_pause_failure(origin: ResponseSource) -> FilterFailure {
     let what = match origin {
         ResponseSource::Upstream => "paused on response headers with no callout pending",
@@ -40,48 +36,28 @@ fn response_pause_failure(origin: ResponseSource) -> FilterFailure {
     FilterFailure::paused(Callback::ResponseHeaders, what)
 }
 
-/// Where the response header given to [WasmCtx::response_pass] came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ResponseSource {
     Upstream,
-    /// A plugin sent it. A response another plugin sends during the pass is dropped.
     Plugin,
 }
 
 impl WasmCtx {
-    /// Run `proxy_on_response_headers` for each plugin that saw the request, in reverse chain order.
+    /// Run `proxy_on_response_headers` for each plugin, in reverse chain order.
     ///
     /// Call this from your `response_filter`. Plugins can read the request headers, and can read
     /// and change the response headers before they are sent downstream. This filter does nothing
-    /// for a subrequest, for an informational (1xx) response other than 101, and once a plugin has
-    /// sent its own response.
+    /// for an informational (1xx) response other than 101.
     ///
     /// A plugin that changes the body length must remove `content-length` here. The response is
-    /// then sent with `transfer-encoding: chunked`, as Pingora does for any response without a
-    /// length, so that the downstream connection can be reused.
+    /// then sent with `transfer-encoding: chunked`.
     ///
     /// A plugin may pause the response while waiting for a callout, in which case this filter
-    /// waits until the plugin continues or sends its own response.
+    /// waits with it, up to its [callout_wait_limit](crate::WasmPluginConf::callout_wait_limit).
     ///
     /// A plugin may send its own response in place of the upstream's. The remaining plugins are
     /// skipped and the response is written to the downstream, which is closed afterwards. This
-    /// filter then returns an error with the response status to stop the request, and
-    /// [WasmCtx::plugin_responded] returns `true`.
-    ///
-    /// # Errors
-    ///
-    /// For a plugin with [FailPolicy::Closed](crate::FailPolicy::Closed), returns
-    /// [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if the plugin traps or otherwise fails,
-    /// pauses the response with no callout pending, waits for callouts longer than its
-    /// [callout_wait_limit](crate::WasmPluginConf::callout_wait_limit), or lost the guest holding
-    /// this request. A plugin with [FailPolicy::Open](crate::FailPolicy::Open) is skipped
-    /// instead, unless it has already changed a body that can still have bytes to come, or that
-    /// body's length, e.g. a request body that is still being sent upstream. See
-    /// [fail_policy](crate::WasmPluginConf::fail_policy) for the full rule.
-    ///
-    /// Under both policies, the same error is returned if an earlier filter of this request was
-    /// cancelled while a plugin was waiting for a callout, or if the runtime's threads cannot be
-    /// started.
+    /// filter then returns an error with the response status to stop the request.
     pub async fn response_filter<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -132,19 +108,6 @@ impl WasmCtx {
     }
 
     /// Run `proxy_on_response_headers` on `resp` for the plugins at `positions`, in that order.
-    ///
-    /// Positions without a context for this request are passed over, and so are plugins already
-    /// skipped. The pass stops early at a plugin that pauses with a callout pending, or that
-    /// sends its own response while `origin` is the upstream. Callouts are only started for an
-    /// upstream response, because the filters that pass a plugin's response along cannot wait on
-    /// one.
-    ///
-    /// A plugin that fails, whose guest is gone, or that pauses with no callout pending is
-    /// skipped if its fail policy allows it, and the pass continues with the next plugin.
-    ///
-    /// # Errors
-    ///
-    /// Returns the failure's error if the plugin failed and was not skipped.
     pub(super) fn response_pass<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -188,6 +151,8 @@ impl WasmCtx {
             drop(locked);
             let paused =
                 sent.is_none() && self.plugin_stays_paused(action, StreamType::HttpResponse);
+            // The filters that pass a plugin's response along cannot wait on a callout, so the
+            // callouts sent during that pass are not started
             if origin == ResponseSource::Upstream {
                 self.start_callouts(position, paused);
             }
@@ -212,17 +177,12 @@ impl WasmCtx {
     }
 }
 
-/// How a [WasmCtx::response_pass] ended.
 pub(super) enum ResponsePassOutcome {
-    /// Every plugin in the pass ran and none of them stopped it.
     Finished,
-    /// The plugin at this position sent a response in place of the upstream response.
     Respond(usize, Box<PluginResponse>),
-    /// The plugin at this position paused with a callout pending.
     WaitsForCallout(usize),
 }
 
-/// Frame the response as chunked if a plugin removed its `content-length` and a body follows.
 pub(super) fn frame_if_length_removed(
     resp: &mut ResponseHeader,
     had_length: bool,
@@ -234,26 +194,22 @@ pub(super) fn frame_if_length_removed(
     Ok(())
 }
 
-/// Add `transfer-encoding: chunked` to a response that has no framing header.
-///
-/// Pingora does the same for an upstream response without a length before `response_filter`
-/// runs, which keeps the downstream connection reusable.
 fn frame_as_chunked(resp: &mut ResponseHeader) -> Result<()> {
     let framed =
         resp.headers.contains_key(CONTENT_LENGTH) || resp.headers.contains_key(TRANSFER_ENCODING);
     if framed || resp.status.is_informational() {
         return Ok(());
     }
+    // Pingora does the same for an upstream response without a length before `response_filter`
+    // runs, which keeps the downstream connection reusable
     resp.set_version(Version::HTTP_11);
     resp.insert_header(TRANSFER_ENCODING, CHUNKED)
 }
 
-/// Return `true` for an informational (1xx) status other than 101, which plugins never see.
 fn skips_response(status: StatusCode) -> bool {
     status.is_informational() && status != StatusCode::SWITCHING_PROTOCOLS
 }
 
-/// Return `true` if no body will follow the response header.
 fn response_ends(method: &Method, resp: &ResponseHeader) -> bool {
     *method == Method::HEAD
         || resp.status == StatusCode::NO_CONTENT

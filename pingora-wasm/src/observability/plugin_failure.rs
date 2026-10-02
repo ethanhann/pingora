@@ -33,11 +33,7 @@ pub enum PluginFailure {
     /// run the plugin.
     ///
     /// A guest leaves its slot once a failure has made it unusable, e.g. a trap in another
-    /// request. A request that lost its context that way reports this the next time a filter is
-    /// about to run the plugin, so a request that only reaches `logging` after the loss reports
-    /// nothing.
-    /// [WasmMetricSink::guest_replaced](crate::WasmMetricSink::guest_replaced) is called
-    /// separately, once for each new guest.
+    /// request.
     GuestLost,
     /// The plugin paused on headers, on trailers, or on the last chunk of a body with no callout
     /// pending.
@@ -49,9 +45,9 @@ pub enum PluginFailure {
     ///
     /// Only reported for a plugin with [FailPolicy::Open](crate::FailPolicy::Open), where it is
     /// the reason the request failed and the plugin was not skipped, so the outcome is always
-    /// [PluginFailureOutcome::Failed]. [fail_policy](crate::WasmPluginConf::fail_policy) describes
-    /// when a changed body has this effect. For a plugin with `Closed`, the report has the
-    /// failure itself, e.g. [GuestError](Self::GuestError).
+    /// [PluginFailureOutcome::Failed]. [FailPolicy](crate::FailPolicy) describes when a changed
+    /// body has this effect. For a plugin with `Closed`, the report has the failure itself, e.g.
+    /// [GuestError](Self::GuestError).
     BodyChanged,
     /// The plugin held more body bytes than its limit.
     BodyLimit,
@@ -141,11 +137,9 @@ pub struct PluginFailureReport<'a> {
 }
 
 impl<'a> PluginFailureReport<'a> {
-    /// Create a report with no callback.
+    /// Create a report with no callback, e.g. to test your [WasmMetricSink](crate::WasmMetricSink).
     ///
-    /// The struct is non-exhaustive, so use this to build a report in your own code, e.g. to test
-    /// your [WasmMetricSink](crate::WasmMetricSink). Set [callback](Self::callback) on the result
-    /// if you need one.
+    /// Set [callback](Self::callback) on the result if you need one.
     pub fn new(
         plugin_name: &'a str,
         failure: PluginFailure,

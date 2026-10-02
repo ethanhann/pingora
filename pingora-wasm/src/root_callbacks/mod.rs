@@ -18,10 +18,8 @@
 //! `proxy_on_tick`, `proxy_on_queue_ready`, callout responses no request is waiting for, and the
 //! teardown of contexts a guest kept after its request ended.
 //!
-//! The thread owns a single-threaded tokio runtime, so a tick runs off the Pingora service
-//! threads. A request that needs the same slot still waits for the tick to finish. Threads that
-//! make guest calls report the resulting tick, queue, and callout changes as events on one
-//! channel. Only the root callback thread reads that channel, which lets it keep its state
+//! Threads that make guest calls report the resulting tick, queue, and callout changes as events
+//! on one channel. Only the root callback thread reads that channel, which lets it keep its state
 //! without locks.
 
 mod callback_loop;
@@ -70,16 +68,6 @@ impl RootCallbackThread {
         self.sender.clone()
     }
 
-    /// Spawn the thread and wait for it to build its tokio runtime.
-    ///
-    /// Events sent before this call stay queued in the channel and are handled once the thread is
-    /// running. The thread exits when the `WasmRuntime` is dropped, since it holds every sender
-    /// of the channel.
-    ///
-    /// # Errors
-    ///
-    /// Returns [ERR_PLUGIN_FAILED] if the thread cannot be spawned or its tokio runtime cannot be
-    /// built. The queued events are kept in both cases, so a later call can try again.
     pub(crate) fn start(&self, runtime: Weak<RuntimeInner>) -> Result<()> {
         let receiver = self.receiver.clone();
         let (build_result_sender, build_result_receiver) = mpsc::channel();
@@ -96,6 +84,8 @@ impl RootCallbackThread {
                 {
                     Ok(tokio_runtime) => tokio_runtime,
                     Err(e) => {
+                        // The receiver is not taken yet, so the queued events are kept and a
+                        // later call can try again
                         let _ = build_result_sender.send(Err(e));
                         return;
                     }
@@ -126,12 +116,6 @@ impl RootCallbackThread {
     }
 }
 
-/// Run the root callback loop until the `WasmRuntime` is dropped.
-///
-/// Waiting happens inside `block_on` and the work itself runs outside of it. If this thread ends
-/// up holding the last reference to the `WasmRuntime`, the runtime is therefore dropped outside
-/// of `block_on` as well, where anything in it that owns a tokio runtime of its own, such as a
-/// log sink, can be dropped without panicking.
 fn run_root_callback_loop(
     tokio_runtime: &Runtime,
     runtime: &Weak<RuntimeInner>,
@@ -139,6 +123,9 @@ fn run_root_callback_loop(
 ) {
     let mut callback_loop = RootCallbackLoop::default();
     while tokio_runtime.block_on(callback_loop.wait_for_work(&mut events)) {
+        // The work runs outside of `block_on`. If this is the last reference to the runtime, it
+        // is dropped here, where anything in it that owns a tokio runtime of its own, such as a
+        // log sink, can be dropped without panicking
         let Some(runtime) = runtime.upgrade() else {
             return;
         };

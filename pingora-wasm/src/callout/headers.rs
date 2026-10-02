@@ -28,19 +28,16 @@ const PSEUDO_PATH: &str = ":path";
 const KEEP_ALIVE: &str = "keep-alive";
 const PROXY_CONNECTION: &str = "proxy-connection";
 
-/// Return `true` if `name` is a hop-by-hop header or one that frames the body.
 fn is_framing_or_hop_header(name: &HeaderName) -> bool {
     [CONTENT_LENGTH, TRANSFER_ENCODING, CONNECTION, UPGRADE, TE].contains(name)
         || name == KEEP_ALIVE
         || name == PROXY_CONNECTION
 }
 
-/// The header at fault when a callout's header pairs cannot be turned into a request header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RejectedCalloutHeader {
     MissingPseudo(&'static str),
     InvalidPseudo(&'static str),
-    /// A regular header with an invalid name or value. Only its name is kept.
     InvalidRegular(String),
 }
 
@@ -58,17 +55,6 @@ impl fmt::Display for RejectedCalloutHeader {
     }
 }
 
-/// Build the request header for a callout from the header pairs `plugin` passed.
-///
-/// The method, path, and `host` are taken from the `:method`, `:path`, and `:authority`
-/// pseudo-headers, and any other pseudo-header is ignored. A `host` header among the pairs is
-/// dropped, as are framing and hop-by-hop headers. `content-length` is set from `body_len` when
-/// the callout has a body, so a plugin cannot frame the body any other way.
-///
-/// # Errors
-///
-/// Returns the header at fault if one of the three pseudo-headers is missing or a header is
-/// invalid. A header value is never part of the error, since it can be a credential.
 pub(crate) fn callout_request_header(
     plugin: &str,
     pairs: &HeaderPairs<'_>,
@@ -94,6 +80,7 @@ pub(crate) fn callout_request_header(
         if key.starts_with(PSEUDO_PREFIX.as_bytes()) {
             continue;
         }
+        // A header value is never part of the error, since it can be a credential
         let invalid = || InvalidRegular(String::from_utf8_lossy(key).into_owned());
         let name = HeaderName::from_bytes(key).map_err(|_| invalid())?;
         if name == HOST || is_framing_or_hop_header(&name) {
@@ -104,6 +91,8 @@ pub(crate) fn callout_request_header(
             .append_header(name, value.as_ref())
             .map_err(|_| invalid())?;
     }
+    // `content-length` is set here and dropped from the pairs above, so a plugin cannot frame
+    // the body any other way
     if body_len > 0 {
         request
             .insert_header(CONTENT_LENGTH, body_len)

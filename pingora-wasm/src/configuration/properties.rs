@@ -13,17 +13,12 @@
 // limitations under the License.
 
 //! Properties from a file
-//!
-//! In a file, `WasmProperties` is a nested mapping with one level per path segment, because a
-//! segment may itself contain a dot. Every leaf is a string.
 
 use crate::properties::WasmProperties;
 use serde::de::{Error, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use std::fmt;
 
-/// One node of a properties mapping, either a string value or a mapping from the next path
-/// segment to its node.
 enum PropertyNode {
     Value(String),
     Segments(Vec<(String, PropertyNode)>),
@@ -57,8 +52,6 @@ impl<'de> Deserialize<'de> for PropertyNode {
     }
 }
 
-/// Insert every value under `node` into `properties`, where `path` holds the segments leading
-/// to `node`.
 fn insert_values<'a>(
     properties: &mut WasmProperties,
     path: &mut Vec<&'a str>,

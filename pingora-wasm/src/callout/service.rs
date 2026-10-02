@@ -25,22 +25,16 @@ use proxy_wasm_host::abi::v0_2_1::{
 use std::mem;
 use std::sync::Arc;
 
-/// State of the guest call in progress.
 #[derive(Default)]
 struct GuestCallState {
     /// The context the call was made for, or `None` outside of a guest call.
     calling_context: Option<ContextId>,
-    /// Callouts accepted so far during the call.
     accepted: Vec<AcceptedCallout>,
 }
 
 /// The callout service of one guest.
 ///
-/// Callout ids are only unique within a guest, so each guest has its own service. A callout is
-/// accepted only during a guest call, and only from the context the call was made for, which is
-/// the root context for `proxy_on_tick` and `proxy_on_queue_ready`. A stream callback that
-/// switches to its root context therefore cannot make a callout. The result would be delivered
-/// to the root context on the root callback thread while the request continued without it.
+/// Callout ids are only unique within a guest, so each guest has its own service.
 pub(crate) struct GuestCalloutService {
     conf: Arc<PluginCalloutConf>,
     call_in_progress: Mutex<GuestCallState>,
@@ -54,15 +48,12 @@ impl GuestCalloutService {
         }
     }
 
-    /// Run `guest_call` on behalf of `context` and collect the callouts made from that context.
-    ///
-    /// Returns the result of `guest_call` together with the callouts accepted while it ran.
-    /// Callouts left behind by an earlier call that unwound are discarded.
     pub(crate) fn record_callouts<R>(
         &self,
         context: ContextId,
         guest_call: impl FnOnce() -> R,
     ) -> (R, Vec<AcceptedCallout>) {
+        // Also discards the callouts left behind by an earlier call that unwound
         *self.call_in_progress.lock() = GuestCallState {
             calling_context: Some(context),
             accepted: Vec::new(),
@@ -84,6 +75,9 @@ impl Callouts for GuestCalloutService {
         let mut call_in_progress = self.call_in_progress.lock();
         match call_in_progress.calling_context {
             Some(context) if context == call.context => {}
+            // A stream callback that switches to its root context cannot make a callout. The
+            // result would be delivered to the root context on the root callback thread while
+            // the request continued without it.
             Some(_) => {
                 warn!("wasm plugin {plugin}: callout rejected, not sent from the context of the current callback");
                 return Err(HttpCallRefusal::Failed);

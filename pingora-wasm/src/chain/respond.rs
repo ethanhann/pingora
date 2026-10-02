@@ -13,10 +13,6 @@
 // limitations under the License.
 
 //! Plugin responses
-//!
-//! A plugin may send its own response instead of letting a request or an upstream response
-//! through. The helpers here run that response past the plugin that sent it and the plugins ahead
-//! of it in the chain, and write it to the downstream.
 
 use super::failure::FilterFailure;
 use super::response::{frame_if_length_removed, ResponseSource};
@@ -40,7 +36,7 @@ impl WasmCtx {
     /// return it from `suppress_error_log` to keep Pingora from logging the error.
     ///
     /// It is `true` as well once [WasmCtx::request_filter] has returned
-    /// [RequestOutcome::Respond](crate::RequestOutcome::Respond). In the other phases it only
+    /// [RequestOutcome::Respond](crate::RequestOutcome::Respond). In the other filters it only
     /// becomes `true` after the response has been written, so it stays `false` if that write
     /// fails.
     pub fn plugin_responded(&self) -> bool {
@@ -48,9 +44,6 @@ impl WasmCtx {
     }
 
     /// Run `proxy_on_response_headers` on a response sent by the plugin at `position`.
-    ///
-    /// The callback runs for that plugin and every plugin ahead of it, in reverse chain order.
-    /// With `no_body` set, the callback runs with end of stream set.
     pub(super) fn pass_plugin_response<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -72,17 +65,13 @@ impl WasmCtx {
         frame_if_length_removed(header, had_length, end_of_stream)
     }
 
-    /// Write a response a plugin sent from the request body phase and return the error that stops
-    /// the request.
-    ///
-    /// If the plugins have already run on a response header, nothing is written and a plugin
-    /// failure is returned instead.
     pub(super) async fn respond_to_request_body<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
         position: usize,
         response: PluginResponse,
     ) -> Box<Error> {
+        // The plugins have already run on a response header, which this response cannot replace
         if self.response_progress != ResponseProgress::NotStarted {
             return self.late_response_error(position, Callback::RequestBody);
         }
@@ -98,8 +87,6 @@ impl WasmCtx {
         self.write_response(session, position, response).await
     }
 
-    /// Write a response a plugin sent in place of the upstream response and return the error that
-    /// stops the request.
     pub(super) async fn respond_in_place_of_upstream<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -130,10 +117,6 @@ impl WasmCtx {
         )
     }
 
-    /// Report a response the plugin at `position` sent too late and return its error.
-    ///
-    /// The response was sent from `callback` after the response header had been processed, so it
-    /// cannot replace that header. This fails the request under both fail policies.
     pub(super) fn late_response_error(
         &mut self,
         position: usize,
@@ -147,11 +130,8 @@ impl WasmCtx {
 ///
 /// Pass it the header and body from [RequestOutcome::Respond](crate::RequestOutcome). The body
 /// is left out for a `HEAD` request. If your proxy has its own way of writing responses, e.g. to
-/// add headers or record metrics, you can use that instead of this function.
-///
-/// # Errors
-///
-/// Returns the error from the session if writing the header or the body fails.
+/// add headers or record metrics, you can use that instead of this function. Returns the error
+/// from the session if writing the header or the body fails.
 pub async fn write_plugin_response<DS: DownstreamSession>(
     session: &mut Session<DS>,
     header: Box<ResponseHeader>,

@@ -13,9 +13,6 @@
 // limitations under the License.
 
 //! Loaded guest
-//!
-//! A started guest in its slot, and the reporting to the root callback thread that follows each
-//! guest call.
 
 use super::events::{RootCallbackEvent, RootCallbackLink};
 use crate::callout::{AcceptedCallout, GuestCalloutService};
@@ -66,9 +63,6 @@ impl Loaded {
     }
 
     /// Report the effects of the last guest call to the root callback thread.
-    ///
-    /// This covers changes to the root context's tick period and queue registrations, and every
-    /// held context the guest has since finished with `proxy_done`.
     pub(crate) fn report_to_root_callbacks(&mut self) {
         let changes = self.guest.take_changes();
         if !changes.is_empty() {
@@ -99,15 +93,15 @@ impl Loaded {
 
     /// Record that the guest is keeping `context` after its request ended.
     ///
-    /// `callouts` are the ones the context sent while it was ending. They are passed to the root
-    /// callback thread, which delivers their results. Any other callout the context still has
-    /// open is failed, since the request that would have received its result is gone.
+    /// `callouts` are the ones the context sent while it was ending.
     pub(crate) fn hold_context(
         &mut self,
         context: ContextId,
         needs_on_log: bool,
         callouts: Vec<AcceptedCallout>,
     ) {
+        // Any other callout the context still has open is failed, since the request that would
+        // have received its result is gone
         let open_callouts_to_fail = self
             .guest
             .open_callouts()
@@ -132,9 +126,6 @@ impl Loaded {
         }
     }
 
-    /// Hand callouts no request is waiting for to the root callback thread.
-    ///
-    /// The thread starts them and delivers their results to `context`.
     pub(crate) fn send_callouts_to_root_callbacks(
         &self,
         context: ContextId,
@@ -151,9 +142,6 @@ impl Loaded {
     }
 
     /// Run `body` for `context` outside of a request, under the root stream state.
-    ///
-    /// Returns the result of `body` together with the callouts the guest sent from `context`.
-    /// The effects of the call are reported to the root callback thread before this returns.
     pub(crate) fn run_root_callback<R>(
         &mut self,
         context: ContextId,

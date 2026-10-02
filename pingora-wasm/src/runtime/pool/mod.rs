@@ -40,7 +40,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use warning_rate_limit::WarningRateLimit;
 
-/// The body and trailer phases a plugin runs in, and its body limits.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PluginPhases {
     pub(crate) request: bool,
@@ -51,7 +50,6 @@ pub(crate) struct PluginPhases {
 }
 
 impl PluginPhases {
-    /// Return the phases the plugin runs in as a comma-separated list for logging.
     fn list(&self) -> String {
         let phases = [
             (true, "headers"),
@@ -77,16 +75,13 @@ struct Slot {
     failed_at: Mutex<Option<Instant>>,
 }
 
-/// The outcome of a non-blocking attempt to lock a guest's slot.
 pub(crate) enum SlotLockAttempt<'a> {
     LockedGuest(SlotGuard<'a>),
-    /// The slot is locked by another thread.
     Busy,
     /// The slot now holds a different guest, or none.
     GuestGone,
 }
 
-/// Settings for a pool and the guests it starts.
 pub(crate) struct GuestPoolConf {
     pub(crate) pool_index: usize,
     pub(crate) name: String,
@@ -160,16 +155,11 @@ impl GuestPool {
     }
 
     /// Lock a slot for a new request.
-    ///
-    /// Slots are tried round-robin, and the first unlocked slot with a guest wins. Failing that,
-    /// one slot that lost its guest is rebuilt if its backoff has elapsed. Otherwise this blocks
-    /// until a slot with a guest is unlocked.
-    ///
-    /// Returns `None` if no slot has a guest.
     pub(crate) fn pick(&self) -> Option<(usize, SlotGuard<'_>)> {
         let count = self.slots.len();
         let first = self.next.fetch_add(1, Ordering::Relaxed) % count;
         let order = || (0..count).map(move |i| (first + i) % count);
+        // Slots are tried round-robin, and the first unlocked slot with a guest wins
         for index in order() {
             if let Some(guard) = self.slots[index].guest.try_lock() {
                 if guard.is_some() {
@@ -177,6 +167,7 @@ impl GuestPool {
                 }
             }
         }
+        // Failing that, one slot that lost its guest is rebuilt if its backoff has elapsed
         if let Some(index) = order().find(|index| self.rebuild_due(*index)) {
             self.rebuild(index, None);
             if let Some(guard) = self.slots[index].guest.try_lock() {
@@ -185,6 +176,7 @@ impl GuestPool {
                 }
             }
         }
+        // Otherwise this blocks until a slot with a guest is unlocked
         for index in order() {
             let guard = self.slots[index].guest.lock();
             if guard.is_some() {
@@ -194,7 +186,6 @@ impl GuestPool {
         None
     }
 
-    /// Try to lock the slot holding `guest` without blocking.
     pub(crate) fn try_lock_guest(&self, index: usize, guest: GuestId) -> SlotLockAttempt<'_> {
         let Some(guard) = self.slots[index].guest.try_lock() else {
             return SlotLockAttempt::Busy;
@@ -205,9 +196,6 @@ impl GuestPool {
         }
     }
 
-    /// Lock the slot a request is running on.
-    ///
-    /// Returns `None` if the guest holding the request's context is no longer in the slot.
     pub(crate) fn lock(&self, index: usize, guest: GuestId) -> Option<SlotGuard<'_>> {
         let guard = self.slots[index].guest.lock();
         match guard.as_ref() {
@@ -218,8 +206,7 @@ impl GuestPool {
 
     /// Replace the guest in a slot if `err` left it unusable.
     ///
-    /// A guest is unusable once it has stopped serving, e.g. after a trap, or has run out of
-    /// context ids. Returns `true` if the guest was removed from its slot, even when building its
+    /// Returns `true` if the guest was removed from its slot, even when building its
     /// replacement failed.
     pub(crate) fn replace_if_unusable(
         &self,
@@ -269,8 +256,6 @@ impl GuestPool {
     }
 }
 
-/// Install a started guest in its slot and forward the ticks, queues, and callouts it set up
-/// during startup to the root callback thread.
 fn install_started_guest(guard: &mut SlotGuard<'_>, started: StartedGuest) {
     let mut loaded = started.loaded;
     loaded.report_to_root_callbacks();

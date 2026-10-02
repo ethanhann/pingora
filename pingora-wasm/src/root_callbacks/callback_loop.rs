@@ -13,9 +13,6 @@
 // limitations under the License.
 
 //! Root callback loop state
-//!
-//! The loop tracks scheduled ticks, queue registrations, in-flight callouts, and work that has to
-//! be retried once a busy slot is free again.
 
 use super::queue_registrations::QueueRegistrations;
 use super::root_callouts::{FinishedCallout, RootCallbackCallouts};
@@ -29,10 +26,8 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-/// How long to wait before retrying work whose slot is locked by a request.
 const BUSY_SLOT_RETRY_DELAY: Duration = Duration::from_millis(1);
 
-/// State of the root callback loop.
 #[derive(Default)]
 pub(super) struct RootCallbackLoop {
     pub(super) ticks: TickSchedule,
@@ -45,9 +40,6 @@ pub(super) struct RootCallbackLoop {
 }
 
 impl RootCallbackLoop {
-    /// Wait for the next event, finished callout, or due tick or retry.
-    ///
-    /// Returns `false` once the channel is closed, which means the `WasmRuntime` was dropped.
     pub(super) async fn wait_for_work(
         &mut self,
         events: &mut UnboundedReceiver<RootCallbackEvent>,
@@ -56,6 +48,7 @@ impl RootCallbackLoop {
         tokio::select! {
             event = events.recv() => match event {
                 Some(event) => self.accept_event(event),
+                // The channel is closed, so the `WasmRuntime` was dropped
                 None => return false,
             },
             Some(finished) = self.callouts.next_finished() => {
@@ -142,16 +135,11 @@ impl RootCallbackLoop {
         }
     }
 
-    /// Queue `work` to be retried after `BUSY_SLOT_RETRY_DELAY`.
     pub(super) fn retry_later(&mut self, work: Work) {
         self.retries
             .push((Instant::now() + BUSY_SLOT_RETRY_DELAY, work));
     }
 
-    /// Start pending callouts, then run all work that is due.
-    ///
-    /// Called after `block_on` returns, with the thread's tokio runtime entered so that the
-    /// callouts are spawned on it.
     pub(super) fn run_due_work(&mut self, runtime: &RuntimeInner) {
         for (address, context, callout) in self.callouts_to_start.drain(..) {
             self.callouts.start(runtime, address, context, callout);

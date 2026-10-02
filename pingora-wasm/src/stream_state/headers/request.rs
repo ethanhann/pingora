@@ -32,7 +32,6 @@ use proxy_wasm_host::{HeaderMap, NotAllowed, PairVisitor};
 use std::borrow::Cow;
 use std::ops::ControlFlow;
 
-/// The request header map exposed to a guest.
 pub(crate) struct RequestHeaders {
     pub(crate) header: RequestHeader,
     /// Whether a guest write through this map changed the value of `content-length` or
@@ -64,10 +63,6 @@ impl RequestHeaders {
         }
     }
 
-    /// Return the value of `:path`, in origin form.
-    ///
-    /// For an absolute-form target this is the path and query of its URI. Returns `None` for a
-    /// `CONNECT` request.
     fn path(&self) -> Option<&[u8]> {
         if self.header.method == Method::CONNECT {
             return None;
@@ -76,6 +71,7 @@ impl RequestHeaders {
         if raw.first() == Some(&b'/') || raw == b"*" {
             return Some(raw);
         }
+        // For an absolute-form target this is the path and query of its URI
         Some(
             self.header
                 .uri
@@ -126,11 +122,8 @@ fn set_request_pseudo(
     }
 }
 
-/// Return `true` if a guest may write `value` as `:path`.
-///
-/// Like an HTTP/2 `:path`, the value has to be in origin form or `*`. Spaces and control
-/// characters are rejected as well.
 fn is_origin_path(value: &[u8]) -> bool {
+    // Like an HTTP/2 `:path`, the value has to be in origin form or `*`
     (value.first() == Some(&b'/') || value == b"*")
         && !value.iter().any(|b| *b == b' ' || b.is_ascii_control())
 }

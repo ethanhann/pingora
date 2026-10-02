@@ -13,8 +13,6 @@
 // limitations under the License.
 
 //! Plugin properties
-//!
-//! Values a plugin reads with `proxy_get_property`, keyed by path.
 
 pub(crate) mod built_in;
 
@@ -81,7 +79,27 @@ integer_property_value!(i32 => i64, i64 => i64, u16 => u64, u32 => u64, u64 => u
 ///
 /// You give a path as its segments, so the property a plugin reads as `node.metadata.NAME` has
 /// the path `["node", "metadata", "NAME"]`. Use this to fill
-/// [WasmServices::fixed_properties](crate::WasmServices::fixed_properties).
+/// [WasmServices::fixed_properties](crate::WasmServices::fixed_properties). For a fact about one
+/// request that only your proxy knows, such as the route it chose, use
+/// [WasmCtx::set_property](crate::WasmCtx::set_property).
+///
+/// The runtime provides these properties, where an integer is 8 little-endian bytes and a bool is
+/// one byte:
+///
+/// - `source.address`, `source.port`, `destination.address`, and `destination.port`
+/// - `request.path`, `request.url_path`, `request.host`, `request.scheme`, `request.method`,
+///   and `request.protocol`
+/// - `request.time` in nanoseconds since the Unix epoch, and `request.size`
+/// - `response.code` in the response filters and in `logging`
+/// - `request.duration` in nanoseconds and `response.size`, both in `logging`
+/// - `connection.mtls` and `connection.tls_version` for a TLS downstream
+/// - `upstream.address` and `upstream.port` after
+///   [WasmCtx::upstream_connected](crate::WasmCtx::upstream_connected)
+/// - `plugin_name`, `plugin_root_id`, and `plugin_vm_id`
+///
+/// Pingora does not count header bytes and does not keep the server name of a TLS connection,
+/// so `request.total_size`, `response.total_size`, and `connection.requested_server_name` are
+/// not provided.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WasmProperties {
     values: HashMap<Vec<u8>, Vec<u8>>,
@@ -113,20 +131,16 @@ impl WasmProperties {
         self.values.get(&joined_path).map(Vec::as_slice)
     }
 
-    /// Set the value at a path whose segments are already joined with `\0`.
     pub(crate) fn insert_joined(&mut self, joined_path: &[u8], value: &[u8]) {
         self.values.insert(joined_path.to_vec(), value.to_vec());
     }
 
-    /// Return the value at a path whose segments are already joined with `\0`.
     pub(crate) fn get_joined(&self, joined_path: &[u8]) -> Option<&[u8]> {
         self.values.get(joined_path).map(Vec::as_slice)
     }
 }
 
 /// Join path segments with `\0`, the form the ABI uses for a path.
-///
-/// The result replaces the contents of `joined_path`, which lets a caller reuse one buffer.
 pub(crate) fn join_path<'a>(
     segments: impl IntoIterator<Item = &'a [u8]>,
     joined_path: &mut Vec<u8>,

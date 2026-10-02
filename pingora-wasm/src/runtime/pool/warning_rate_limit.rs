@@ -17,13 +17,11 @@
 //! A plugin that fails on every request gets a new guest each time, and with
 //! `FailPolicy::Open` it is also skipped each time. To limit the log volume, the warning for a
 //! replaced guest and the warning for a skipped plugin are each written at most once per
-//! interval for a plugin, with the number of events since the previous warning if there was more
-//! than one.
+//! interval for a plugin.
 
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
-/// Minimum time between two warnings of the same kind for one plugin.
 const WARNING_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
@@ -32,7 +30,6 @@ struct WarningState {
     events_since_last_warning: u64,
 }
 
-/// Rate limit for one kind of warning from one plugin.
 #[derive(Default)]
 pub(crate) struct WarningRateLimit {
     state: Mutex<WarningState>,
@@ -42,8 +39,7 @@ impl WarningRateLimit {
     /// Count an event at `now` and return whether to warn about it.
     ///
     /// If a warning is due, returns the number of events since the last warning, including this
-    /// one. Returns `None` if the last warning was less than [WARNING_INTERVAL] ago, in which
-    /// case the event is counted towards the next warning.
+    /// one.
     pub(crate) fn count_event(&self, now: Instant) -> Option<u64> {
         let mut state = self.state.lock();
         state.events_since_last_warning += 1;

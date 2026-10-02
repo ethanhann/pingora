@@ -13,9 +13,6 @@
 // limitations under the License.
 
 //! Callout client
-//!
-//! Callouts are sent through a Pingora connector. Every outcome, including a failure, is turned
-//! into a `CalloutResult` for the plugin.
 
 use super::result::{connect_failure, session_failure, OwnedHeaderPairs, PSEUDO_STATUS};
 use super::{AcceptedCallout, CalloutResult, CalloutTarget, CalloutUpstreams};
@@ -35,16 +32,13 @@ use std::time::Instant;
 
 /// The transport a callout is sent over.
 ///
-/// The runtime uses a [ConnectorSender]. Phase tests substitute their own sender so they can run
+/// The runtime uses a [ConnectorSender]. Tests substitute their own sender so they can run
 /// without a socket.
 #[async_trait]
 pub(crate) trait CalloutSender: Send + Sync {
     async fn send(&self, callout: AcceptedCallout) -> CalloutResult;
 }
 
-/// A [CalloutSender] backed by a Pingora connector.
-///
-/// Every failed callout is reported to the metric sink.
 pub(crate) struct ConnectorSender {
     pub(crate) connector: Arc<Connector>,
     pub(crate) upstreams: Arc<dyn CalloutUpstreams>,
@@ -109,14 +103,6 @@ impl CalloutSender for ConnectorSender {
 }
 
 impl ConnectorSender {
-    /// Send the callout's request to a peer of its upstream and read the response header.
-    ///
-    /// A request that fails on a reused connection is retried once.
-    ///
-    /// # Errors
-    ///
-    /// Returns the failure to report together with the result to give the plugin if no
-    /// response header could be read.
     async fn send_to_peer(
         &self,
         callout: &AcceptedCallout,
@@ -167,10 +153,6 @@ impl ConnectorSender {
     }
 }
 
-/// Write the callout's request and read the response header.
-///
-/// The header is returned as the pairs the plugin will read, with `:status` first. On an H1
-/// session, informational responses other than `101` are skipped.
 async fn write_request_and_read_response_header(
     session: &mut HttpSession,
     callout: &AcceptedCallout,
@@ -210,9 +192,6 @@ async fn write_request_and_read_response_header(
     }
 }
 
-/// Read the response body and, on an H2 session, the trailers.
-///
-/// Returns `None` if the body is larger than `limit`.
 async fn read_body_and_trailers(
     session: &mut HttpSession,
     limit: usize,

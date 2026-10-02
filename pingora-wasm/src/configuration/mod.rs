@@ -13,13 +13,6 @@
 // limitations under the License.
 
 //! Configuration from a file
-//!
-//! The configuration types implement serde's `Deserialize`, so a proxy can embed them in its own
-//! configuration struct and read them from its own file. The format has to be self-describing,
-//! such as YAML, JSON, or TOML, because the fixed properties are read with `deserialize_any`. The
-//! crate does not read files itself, so it needs `serde` and no format crate. None of the types
-//! implements `Serialize`, because a plugin configuration may hold a secret and nothing needs to
-//! write one out.
 
 mod plugin;
 mod properties;
@@ -37,7 +30,10 @@ use std::sync::Arc;
 
 /// The plugins, chains, and plugin services of a proxy, as read from a configuration file.
 ///
-/// Add it as a field of your own configuration struct, or parse it from the top level of a file.
+/// It implements serde's `Deserialize`, and this crate does not read the file for you. Add it
+/// as a field of your own configuration struct, or parse it from the top level of a file. The
+/// format has to be self-describing, such as YAML, JSON, or TOML.
+///
 /// At its top level it ignores the keys it does not know, as Pingora's `ServerConf` does, so one
 /// file can hold the settings for Pingora, your proxy, and your plugins. An unknown key inside a
 /// plugin entry, its `limits`, or a callout upstream is an error.
@@ -74,10 +70,6 @@ pub struct WasmConf {
     ///
     /// A relative `path` is resolved against the working directory of the process at the time
     /// the runtime is built.
-    ///
-    /// A plugin entry rejects unknown keys, which serde does not support together with
-    /// `#[serde(flatten)]`. To keep keys of your own next to a plugin, give the
-    /// [WasmPluginConf] a field of its own in your struct.
     pub plugins: Vec<WasmPluginConf>,
     /// The chains by name, each with the names of its plugins in chain order. Default empty.
     pub chains: HashMap<String, Vec<String>>,
@@ -99,16 +91,13 @@ pub struct WasmConf {
 }
 
 /// The peer of one callout upstream in [WasmConf::static_callout_upstreams].
-///
-/// An unknown key is an error.
 #[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CalloutUpstreamConf {
     /// The address of the peer as an IP address and a port, e.g. `10.0.0.5:8181`.
     ///
-    /// A hostname is not accepted, so no DNS lookup can block startup. In a file, a value that
-    /// is not an IP address and a port is an error from your parser when the file is read.
+    /// A hostname is not accepted, so no DNS lookup can block startup.
     pub address: SocketAddr,
     /// Whether to connect to the peer over TLS. Default `false`.
     #[serde(default)]
@@ -120,9 +109,6 @@ pub struct CalloutUpstreamConf {
 
 impl CalloutUpstreamConf {
     /// Create the configuration for a peer at `address`, without TLS and with an empty SNI.
-    ///
-    /// The struct is non-exhaustive, so use this to build one in code, then set
-    /// [tls](Self::tls) and [sni](Self::sni) if the peer needs them.
     pub fn new(address: SocketAddr) -> Self {
         CalloutUpstreamConf {
             address,
@@ -138,12 +124,7 @@ impl WasmConf {
     /// The result has [max_callouts_in_flight](Self::max_callouts_in_flight) if it is set, the
     /// [fixed_properties](Self::fixed_properties), and, unless
     /// [static_callout_upstreams](Self::static_callout_upstreams) is empty, a
-    /// [StaticCalloutUpstreams] with one peer per upstream. Everything else is left at its
-    /// default, so set your log sink, metric sink, connector, or own `CalloutUpstreams` on the
-    /// result.
-    ///
-    /// This cannot fail. [max_callouts_in_flight](Self::max_callouts_in_flight) is only checked
-    /// when the runtime is built.
+    /// [StaticCalloutUpstreams] with one peer per upstream.
     pub fn services(&self) -> WasmServices {
         let mut services = WasmServices::default();
         if let Some(limit) = self.max_callouts_in_flight {
@@ -165,9 +146,6 @@ impl WasmConf {
     /// Return the plugin names of the chain `name`, in chain order.
     ///
     /// Pass the result to [WasmRuntime::chain](crate::WasmRuntime::chain) to build the chain.
-    ///
-    /// # Errors
-    ///
     /// Returns [ERR_INVALID_CONF](crate::ERR_INVALID_CONF) if the configuration has no chain with
     /// that name.
     pub fn chain_plugins(&self, name: &str) -> Result<Vec<&str>> {

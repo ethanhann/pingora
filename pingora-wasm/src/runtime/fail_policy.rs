@@ -32,8 +32,8 @@ use std::fmt;
 ///
 /// Some failures fail the request under both policies:
 ///
-/// - A failure while a body the plugin changed can still have bytes to come. The rest of the
-///   body would go out without the plugin's changes.
+/// - A failure before the end of a body the plugin changed. The rest of the body would go out
+///   without the plugin's changes.
 /// - More held body bytes than
 ///   [request_body_limit](crate::WasmPluginConf::request_body_limit) or
 ///   [response_body_limit](crate::WasmPluginConf::response_body_limit) allows. Otherwise a

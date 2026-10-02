@@ -13,8 +13,6 @@
 // limitations under the License.
 
 //! Root callback work
-//!
-//! The kinds of work the root callback loop runs, and the guest call each one makes.
 
 use super::callback_loop::RootCallbackLoop;
 use super::root_callouts::FinishedCallout;
@@ -27,7 +25,6 @@ use log::{debug, warn};
 use proxy_wasm_host::abi::v0_2_1::{CallScope, ContextId, GuestError, QueueId};
 use std::time::Instant;
 
-/// One item of work for the root callback thread.
 pub(super) enum Work {
     Tick(GuestAddress),
     QueueItem(QueueId),
@@ -39,17 +36,13 @@ pub(super) enum Work {
     },
 }
 
-/// The outcome of running one [Work] item.
 pub(super) enum WorkOutcome {
     Done,
-    /// The slot is locked by a request, so the work has to be retried later.
     SlotBusy,
 }
 
-/// The outcome of a guest call made from the root callback thread.
 enum GuestCallOutcome<R> {
     Ran(R),
-    /// The call failed. The guest has been replaced if the error left it unusable.
     Failed,
     SlotBusy,
     /// The slot now holds a different guest, or none.
@@ -65,7 +58,6 @@ impl<R> GuestCallOutcome<R> {
     }
 }
 
-/// Which context a guest call from the root callback thread targets.
 #[derive(Clone, Copy)]
 enum GuestCallContext {
     RootOfGuest,
@@ -92,6 +84,8 @@ impl RootCallbackLoop {
             scope.on_tick(root)?;
             Ok(scope.guest().tick_period(root))
         });
+        // The period starts when the tick has finished, so ticks of a slot never overlap and a
+        // tick that ran late is not made up for
         if let GuestCallOutcome::Ran(period) = tick {
             self.ticks.set_period(address, period, Instant::now());
         }
@@ -118,10 +112,6 @@ impl RootCallbackLoop {
         }
     }
 
-    /// Deliver a callout result to the guest through `proxy_on_http_call_response`.
-    ///
-    /// The result is silently dropped if the callout is no longer open, which is the case once
-    /// `proxy_on_delete` has ended its context.
     fn deliver_callout_result(
         &mut self,
         runtime: &RuntimeInner,
@@ -131,6 +121,7 @@ impl RootCallbackLoop {
         let callback_name = "proxy_on_http_call_response";
         let delivery = self.call_guest(runtime, finished.address, context, callback_name, {
             |scope, context| {
+                // The callout is no longer open once `proxy_on_delete` has ended its context
                 if scope.guest().open_callout(finished.id).is_none() {
                     return Ok(());
                 }
@@ -141,15 +132,6 @@ impl RootCallbackLoop {
         delivery.work_outcome()
     }
 
-    /// End a context the guest kept after its request, once the guest is done with it.
-    ///
-    /// Runs `proxy_on_log` first if `needs_on_log` is set, then `proxy_on_delete`. A failing
-    /// `proxy_on_log` does not skip `proxy_on_delete`, although the latter does nothing if the
-    /// failure cost the guest its slot. Callouts the context still had open are closed with it,
-    /// so their results are dropped when they arrive.
-    ///
-    /// If the slot is busy by the time `proxy_on_delete` is due, only that call is retried, so
-    /// `proxy_on_log` never runs twice.
     fn end_held_context(
         &mut self,
         runtime: &RuntimeInner,
@@ -165,12 +147,14 @@ impl RootCallbackLoop {
             match logged {
                 GuestCallOutcome::SlotBusy => return WorkOutcome::SlotBusy,
                 GuestCallOutcome::GuestGone => return WorkOutcome::Done,
+                // A failing `proxy_on_log` does not skip `proxy_on_delete`
                 GuestCallOutcome::Ran(()) | GuestCallOutcome::Failed => {}
             }
         }
         let deleted = self.call_guest(runtime, address, call_context, "proxy_on_delete", {
             |scope, context| scope.on_delete(context)
         });
+        // Only `proxy_on_delete` is retried, so `proxy_on_log` never runs twice
         if let GuestCallOutcome::SlotBusy = deleted {
             self.retry_later(Work::EndHeldContext {
                 address,
@@ -181,14 +165,6 @@ impl RootCallbackLoop {
         WorkOutcome::Done
     }
 
-    /// Run `body` against the guest at `address` outside of a request.
-    ///
-    /// `body` is passed the resolved context id. The slot is locked without blocking, and nothing
-    /// runs if it is busy or no longer holds this guest. Callouts the guest made during a
-    /// successful call are started afterwards.
-    ///
-    /// A failed call is logged as a warning with `callback_name` and reported to the metric sink,
-    /// and the guest is replaced if the failure left it unusable.
     fn call_guest<R>(
         &mut self,
         runtime: &RuntimeInner,

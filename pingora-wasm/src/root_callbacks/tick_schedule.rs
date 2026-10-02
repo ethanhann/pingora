@@ -19,19 +19,12 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// When each slot's next `proxy_on_tick` is due, for slots whose guest has set a tick period.
-///
-/// The next tick is scheduled one period after the previous one finished. Ticks of a slot
-/// therefore never overlap, and a tick that ran late is not made up for.
 #[derive(Default)]
 pub(super) struct TickSchedule {
     next_ticks: HashMap<SlotIndex, (GuestAddress, Instant)>,
 }
 
 impl TickSchedule {
-    /// Schedule the next tick of the guest at `address` one `period` after `now`.
-    ///
-    /// A `period` of `None` stops the ticks, unless the slot's entry already belongs to another
-    /// guest, in which case it is left alone.
     pub(super) fn set_period(
         &mut self,
         address: GuestAddress,
@@ -44,6 +37,8 @@ impl TickSchedule {
                 self.next_ticks.insert(key, (address, now + period));
             }
             None => {
+                // A replaced guest's zero period must not cancel the ticks of the guest now in
+                // the slot
                 if self
                     .next_ticks
                     .get(&key)
@@ -55,20 +50,14 @@ impl TickSchedule {
         }
     }
 
-    /// Return `true` if a tick is scheduled for `slot`.
     pub(super) fn has_next_tick(&self, slot: SlotIndex) -> bool {
         self.next_ticks.contains_key(&slot)
     }
 
-    /// Return when the earliest scheduled tick is due, if any.
     pub(super) fn next_due(&self) -> Option<Instant> {
         self.next_ticks.values().map(|(_, due)| *due).min()
     }
 
-    /// Remove and return the guests whose tick is due at `now`.
-    ///
-    /// Nothing is rescheduled here. A slot's next tick is added by calling
-    /// [TickSchedule::set_period] again once the tick has run.
     pub(super) fn take_due(&mut self, now: Instant) -> Vec<GuestAddress> {
         let due: Vec<_> = self
             .next_ticks

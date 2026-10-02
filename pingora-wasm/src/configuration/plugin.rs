@@ -25,10 +25,6 @@ use serde::{Deserialize, Deserializer};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// The keys of one plugin entry in a configuration file.
-///
-/// A key that is left out keeps the default of [WasmPluginConf::new]. Unknown keys are rejected,
-/// so that a misspelled key cannot silently leave a plugin on its default.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PluginConfInFile {
@@ -77,9 +73,6 @@ impl From<LogLevelInFile> for LogLevel {
     }
 }
 
-/// The keys of a plugin's `limits` mapping, one per host limit except the fuel limit.
-///
-/// A key that is left out keeps the default of [Limits]. A file has no way to remove a limit.
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LimitsInFile {

@@ -23,9 +23,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Per-plugin state shared by every [RootStream] of that plugin.
-///
-/// Besides the plugin name and its fixed properties, this remembers whether the plugin has
-/// already been warned about calling a request-only host function outside of a request.
 pub(crate) struct RootCallbackPluginState {
     pub(crate) plugin_name: String,
     pub(crate) fixed_properties: Arc<WasmProperties>,
@@ -57,9 +54,6 @@ impl RootCallbackPluginState {
 /// Stream state for a callback that runs outside of a request.
 ///
 /// Used for root context callbacks and for ending a context the guest kept after its request.
-/// With no request, header maps read as empty, buffers are not found, and the only
-/// properties this state resolves are the runtime's fixed properties. `proxy_continue_stream` and
-/// `proxy_send_local_response` return `Ok` and do nothing.
 pub(crate) struct RootStream {
     plugin: Arc<RootCallbackPluginState>,
     empty_header_map: VecHeaderMap,
@@ -77,8 +71,6 @@ impl RootStream {
 }
 
 impl StreamState for RootStream {
-    // Reads return an empty map rather than an error, because the Rust SDK panics on any status
-    // other than `Ok` when it reads header pairs.
     fn header_map(
         &mut self,
         _call: Invocation,
@@ -88,6 +80,8 @@ impl StreamState for RootStream {
         if access != Access::Read {
             return Err(Status::NotFound);
         }
+        // An empty map rather than an error, because the Rust SDK panics on any status other
+        // than `Ok` when it reads header pairs
         Ok(&mut self.empty_header_map)
     }
 

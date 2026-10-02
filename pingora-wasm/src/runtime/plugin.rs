@@ -73,8 +73,7 @@ pub struct WasmPluginConf {
     ///
     /// When enabled, `proxy_on_request_body` is called once for each chunk of a request body. A
     /// guest runs one callback at a time, so a chunk has to wait while another request is running
-    /// a callback in the same guest. Only enable this for a plugin that reads request bodies, and
-    /// set [slots](Self::slots) to the thread count of the service.
+    /// a callback in the same guest. Only enable this for a plugin that reads request bodies.
     pub request_body: bool,
     /// Whether to run the plugin on response bodies. Default `false`.
     ///
@@ -120,10 +119,8 @@ pub struct WasmPluginConf {
     /// this limit below the `read_timeout` of your upstream peers. Must be greater than
     /// [callout_timeout_limit](Self::callout_timeout_limit).
     ///
-    /// A timeout of your own around a filter cannot replace this limit. Once the future of a
-    /// filter has been dropped during a callout wait, every later header or trailer filter of the
-    /// request, and every later body filter that has a plugin to run, returns an error, whatever
-    /// the fail policy.
+    /// A timeout of your own around a filter cannot replace this limit. A filter cancelled during
+    /// a callout wait fails every later filter of the request. See [FailPolicy].
     pub callout_wait_limit: Duration,
     /// The maximum size in bytes of a callout response body. Default 1 MiB.
     ///
@@ -140,9 +137,9 @@ pub struct WasmPluginConf {
     pub fail_policy: FailPolicy,
 }
 
-// Either configuration may hold a secret, so only their lengths are printed
 impl fmt::Debug for WasmPluginConf {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Either configuration may hold a secret, so only their lengths are printed
         let bytes = |configuration: &[u8]| format!("{} bytes", configuration.len());
         f.debug_struct("WasmPluginConf")
             .field("name", &self.name)

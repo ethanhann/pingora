@@ -61,18 +61,7 @@ const HISTOGRAM_BUCKETS: [f64; 19] = [
 ///
 /// Create one sink and pass it to every runtime you build, including the ones you build to
 /// reload plugins. A registry accepts each metric name only once, so a second sink on the same
-/// registry cannot be created. With a shared sink, a reloaded plugin keeps reporting into the
-/// existing series. Counters and histograms continue from where they were, and a gauge drops by
-/// whatever the old runtime had added once that runtime is dropped.
-///
-/// ```no_run
-/// use pingora_wasm::{PrometheusMetricSink, WasmServices};
-/// use std::sync::Arc;
-///
-/// let registry = pingora_wasm::prometheus::default_registry().clone();
-/// let mut services = WasmServices::default();
-/// services.metric_sink = Arc::new(PrometheusMetricSink::new(registry).unwrap());
-/// ```
+/// registry cannot be created.
 pub struct PrometheusMetricSink {
     registry: Registry,
     callout_failures: IntCounterVec,
@@ -82,7 +71,6 @@ pub struct PrometheusMetricSink {
     skipped_names: Mutex<HashSet<String>>,
 }
 
-/// The vector registered under one Prometheus name, and the plugin metric name that claimed it.
 struct Family {
     name_in_plugin: String,
     vector: FamilyVector,
@@ -157,8 +145,6 @@ impl std::fmt::Debug for PrometheusMetricSink {
 impl PrometheusMetricSink {
     /// Create a sink that registers metrics in `registry`.
     ///
-    /// # Errors
-    ///
     /// Returns an error if `wasm_callout_failures_total`, `wasm_plugin_failures_total`, or
     /// `wasm_guests_replaced_total` is already registered in `registry`, e.g. by another sink
     /// using the same registry.
@@ -189,10 +175,6 @@ impl PrometheusMetricSink {
     }
 
     /// Warn, once per metric name, that a plugin metric is not being published.
-    ///
-    /// `prometheus_name` is the name the metric would have been published under, or `None` if
-    /// its name in the plugin is empty. Always returns `None` so the caller can return it from
-    /// `register_metric`.
     fn skip_metric(
         &self,
         metric: &WasmMetric,
@@ -268,10 +250,6 @@ impl WasmMetricSink for PrometheusMetricSink {
     }
 }
 
-/// Convert a plugin metric name into a valid Prometheus name.
-///
-/// Characters Prometheus does not allow are replaced with `_`, and a name starting with a digit
-/// is prefixed with `_`. Returns `None` for an empty name.
 fn prometheus_name(name: &str) -> Option<String> {
     if name.is_empty() {
         return None;

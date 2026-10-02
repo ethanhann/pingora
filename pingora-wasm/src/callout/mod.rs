@@ -16,7 +16,7 @@
 //!
 //! A plugin makes a callout with `proxy_http_call`. The call is checked and recorded by the
 //! guest's callout service, and a spawned task then sends the request to a peer of the chosen
-//! upstream. The result is delivered to `proxy_on_http_call_response` by the phase that ran the
+//! upstream. The result is delivered to `proxy_on_http_call_response` by the filter that ran the
 //! plugin, or by the root callback thread when the callout was made from a root context.
 
 mod client;
@@ -41,12 +41,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Callout settings for one plugin, shared by all of its guests.
 pub(crate) struct PluginCalloutConf {
     pub(crate) plugin_name: String,
     pub(crate) upstreams: Arc<dyn CalloutUpstreams>,
     pub(crate) timeout_limit: Duration,
-    /// How long a filter may wait on the plugin's callouts in a single callout wait.
     pub(crate) wait_limit: Duration,
     pub(crate) response_limit: usize,
     zero_timeout_warning_logged: AtomicBool,
@@ -76,10 +74,6 @@ impl PluginCalloutConf {
         }
     }
 
-    /// Return the timeout to apply to a callout for which the plugin requested `passed`.
-    ///
-    /// A timeout of zero, or one longer than `timeout_limit`, is replaced by the limit. Each of
-    /// the two cases is logged the first time it happens for the plugin.
     pub(crate) fn effective_timeout(&self, passed: Duration) -> Duration {
         if !passed.is_zero() && passed <= self.timeout_limit {
             return passed;
@@ -102,9 +96,6 @@ impl PluginCalloutConf {
         limit
     }
 
-    /// Warn that a callout failed because `max_callouts_in_flight` was reached.
-    ///
-    /// Only the first call for the plugin logs anything.
     pub(crate) fn warn_of_overflow_once(&self) {
         if !self.overflow_warning_logged.swap(true, Ordering::Relaxed) {
             warn!(
@@ -114,9 +105,6 @@ impl PluginCalloutConf {
         }
     }
 
-    /// Warn that a callout was rejected because of `header`.
-    ///
-    /// Only the first call for the plugin logs anything.
     pub(crate) fn warn_of_rejected_header_once(&self, header: &RejectedCalloutHeader) {
         if !self
             .rejected_header_warning_logged
@@ -138,7 +126,6 @@ pub(crate) struct AcceptedCallout {
     pub(crate) request: Box<RequestHeader>,
     pub(crate) body: Bytes,
     pub(crate) timeout: Duration,
-    /// The callback the plugin sent the callout from, for log messages.
     pub(crate) callback: Option<Callback>,
 }
 

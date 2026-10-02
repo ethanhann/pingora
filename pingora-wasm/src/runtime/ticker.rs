@@ -43,11 +43,6 @@ impl Ticker {
         }
     }
 
-    /// Spawn the ticker thread, which exits once the runtime has been dropped.
-    ///
-    /// # Errors
-    ///
-    /// Returns [ERR_PLUGIN_FAILED] if the thread cannot be spawned.
     pub(crate) fn start(&self, runtime: &Arc<RuntimeInner>) -> Result<()> {
         let weak = Arc::downgrade(runtime);
         let period = runtime.engine.epoch_period();
@@ -81,9 +76,6 @@ fn tick(runtime: &Weak<RuntimeInner>, period: Duration) {
 }
 
 /// Run `f` with a temporary ticker that stops when `f` returns.
-///
-/// Guests are started while the runtime is being built, before its own ticker thread exists.
-/// This keeps the CPU time limit in force for a guest that loops forever during startup.
 pub(super) fn with_ticker<R>(engine: &Engine, f: impl FnOnce() -> R) -> R {
     struct Done<'a>(&'a AtomicBool);
 

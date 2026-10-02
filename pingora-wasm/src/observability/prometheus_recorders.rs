@@ -13,9 +13,6 @@
 // limitations under the License.
 
 //! Prometheus recorders
-//!
-//! The recorders that pass changes to a plugin's counter, gauge, or histogram on to its
-//! Prometheus metric.
 
 use super::WasmMetricRecorder;
 use prometheus::{Histogram, IntCounter, IntGauge};

@@ -26,37 +26,22 @@ use pingora_error::{Error, Result};
 use proxy_wasm_host::abi::v0_2_1::{Callback, GuestError};
 use std::sync::Arc;
 
-/// A started guest and the callouts its root context sent during startup.
 pub(super) struct StartedGuest {
     pub(super) loaded: Loaded,
     pub(super) root_callouts: Vec<AcceptedCallout>,
 }
 
-/// The outcome of a startup in which no callback failed.
 enum StartOutcome {
     Started,
     Refused(Callback),
 }
 
 impl GuestPool {
-    /// Build the [ERR_INVALID_CONF] error for a guest that failed to start.
-    ///
-    /// `what` is the part of the message after the plugin name.
     fn guest_start_error(&self, detail: &str, cause: GuestError) -> Box<Error> {
         let context = format!("wasm plugin {}: {detail}", self.name);
         Error::because(ERR_INVALID_CONF, context, cause)
     }
 
-    /// Build a guest for `slot` and start it.
-    ///
-    /// Startup runs under the root stream state, which lets the plugin read the fixed properties
-    /// from `proxy_on_vm_start` and `proxy_on_configure`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [ERR_INVALID_CONF] if the guest cannot be built, if creating the root context or
-    /// one of the two callbacks fails, or if one of the callbacks returns `false`. A rebuild gets
-    /// the same error type, but only logs it.
     pub(super) fn start_guest(&self, slot: usize) -> Result<StartedGuest> {
         let mut guest = self
             .spec
@@ -69,6 +54,8 @@ impl GuestPool {
             .clone()
             .with_callouts(callout_service.clone());
         *guest.services_mut() = services;
+        // Startup runs under the root stream state, which lets the plugin read the fixed
+        // properties from `proxy_on_vm_start` and `proxy_on_configure`
         let mut scope = guest.enter(RootStream::new(self.root_callback_plugin.clone()));
         let root = match scope.on_context_create(None) {
             Ok(root) => root,

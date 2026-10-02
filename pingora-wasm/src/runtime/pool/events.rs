@@ -13,9 +13,6 @@
 // limitations under the License.
 
 //! Root callback events
-//!
-//! Events sent to the root callback thread about the effects of guest calls, and the types that
-//! identify the guest an event is about.
 
 use crate::callout::AcceptedCallout;
 use crate::root_callbacks::RootCallbackPluginState;
@@ -23,23 +20,19 @@ use proxy_wasm_host::abi::v0_2_1::{CalloutId, Changes, ContextId, GuestId, Queue
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
-/// A slot, identified by its pool and its index within that pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SlotIndex {
     pub(crate) pool_index: usize,
     pub(crate) slot_index: usize,
 }
 
-/// A guest together with the slot it runs in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct GuestAddress {
     pub(crate) slot: SlotIndex,
     pub(crate) guest: GuestId,
 }
 
-/// An event sent to the root callback thread.
 pub(crate) enum RootCallbackEvent {
-    /// A guest call changed the root context's tick period or registered a queue.
     TicksOrQueuesChanged {
         address: GuestAddress,
         root: ContextId,
@@ -71,7 +64,6 @@ pub(crate) enum RootCallbackEvent {
 
 pub(crate) type RootCallbackSender = UnboundedSender<RootCallbackEvent>;
 
-/// A guest's address and plugin state, with the sender for its root callback events.
 pub(crate) struct RootCallbackLink {
     pub(crate) address: GuestAddress,
     pub(crate) plugin: Arc<RootCallbackPluginState>,

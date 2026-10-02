@@ -25,7 +25,6 @@ use proxy_wasm_host::{Buffer, NotAllowed};
 pub(crate) enum BodyBuffer {
     Shared(Bytes),
     Owned(Vec<u8>),
-    /// Owned bytes a guest has written to.
     WrittenByGuest(Vec<u8>),
 }
 
@@ -36,10 +35,6 @@ impl Default for BodyBuffer {
 }
 
 impl BodyBuffer {
-    /// Create a buffer from the bytes held from earlier chunks, followed by the new chunk.
-    ///
-    /// With nothing held the chunk is used as is. Otherwise it is appended to `held`, reusing
-    /// that allocation.
     pub(crate) fn new(mut held: Vec<u8>, chunk: Bytes) -> Self {
         if held.is_empty() {
             return BodyBuffer::Shared(chunk);
@@ -62,7 +57,6 @@ impl BodyBuffer {
         }
     }
 
-    /// Return `true` if a guest wrote to the buffer.
     pub(crate) fn was_written_by_guest(&self) -> bool {
         matches!(self, BodyBuffer::WrittenByGuest(_))
     }

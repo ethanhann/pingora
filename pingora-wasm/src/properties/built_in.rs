@@ -13,8 +13,6 @@
 // limitations under the License.
 
 //! Built-in properties
-//!
-//! Properties resolved from the session and from the request and response headers.
 
 use crate::stream_state::RequestHeaders;
 use http::header::CONTENT_LENGTH;
@@ -25,7 +23,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime};
 
 /// Per-request values for the built-in properties that the headers do not have, recorded as
-/// the phases run.
+/// the filters run.
 #[derive(Debug, Default)]
 pub(crate) struct RequestFacts {
     pub(crate) client_address: Option<SocketAddr>,
@@ -34,18 +32,13 @@ pub(crate) struct RequestFacts {
     pub(crate) start: Option<RequestStart>,
     pub(crate) request_body_bytes: usize,
     pub(crate) upstream_address: Option<SocketAddr>,
-    /// The response status, recorded in `response_filter`.
     pub(crate) response_code: Option<u16>,
-    /// Values only known once `logging` runs.
     pub(crate) logging: Option<LoggingFacts>,
 }
 
-/// When `request_filter` started.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RequestStart {
-    /// Wall-clock time, used for `request.time`.
     pub(crate) wall_time: SystemTime,
-    /// Monotonic time, used for `request.duration`.
     pub(crate) monotonic_time: Instant,
 }
 
@@ -71,7 +64,6 @@ pub(crate) struct LoggingFacts {
     pub(crate) response_body_bytes: usize,
 }
 
-/// The headers present during the current callback, for the properties derived from them.
 pub(crate) struct ReadableHeaders<'a> {
     pub(crate) request: Option<&'a RequestHeaders>,
     pub(crate) response: Option<&'a ResponseHeader>,
@@ -79,8 +71,7 @@ pub(crate) struct ReadableHeaders<'a> {
 
 /// Append the value of a built-in property to `out`.
 ///
-/// `joined_path` is the property path with its segments joined by `\0`. Returns `false` if the
-/// path is not a built-in property or its value is not known yet.
+/// Returns `false` if the path is not a built-in property or its value is not known yet.
 pub(crate) fn write_built_in_property(
     joined_path: &[u8],
     facts: &RequestFacts,
@@ -152,10 +143,8 @@ pub(crate) fn write_built_in_property(
     }
 }
 
-/// Normalize a TLS version string to the form OpenSSL uses, e.g. `TLSv1.3`.
-///
-/// rustls reports `TLSv1_3` and s2n reports `TLS13`. Anything else is passed through unchanged.
 fn openssl_tls_version(version: &str) -> String {
+    // rustls reports `TLSv1_3` and s2n reports `TLS13`
     match version {
         "TLSv1_3" | "TLS13" => "TLSv1.3".to_string(),
         "TLSv1_2" | "TLS12" => "TLSv1.2".to_string(),

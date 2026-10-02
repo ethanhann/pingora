@@ -13,9 +13,6 @@
 // limitations under the License.
 
 //! Guest rebuild
-//!
-//! A slot that lost its guest gets a new one here. A failed rebuild starts a backoff for the
-//! slot. Each new guest is reported to the metric sink, and the warning for it is rate limited.
 
 use super::{install_started_guest, GuestPool};
 use log::{error, warn};
@@ -38,11 +35,7 @@ impl GuestPool {
     /// Start a new guest in an empty slot.
     ///
     /// `failure` is the error that emptied the slot when the rebuild immediately follows it, and
-    /// is only used for logging. A failed rebuild starts the slot's backoff.
-    ///
-    /// Each guest installed here is reported to the metric sink. The warning for it is rate
-    /// limited per plugin, and gives the number of guests replaced since the last warning if
-    /// there was more than one.
+    /// is only used for logging.
     pub(super) fn rebuild(&self, index: usize, failure: Option<&GuestError>) {
         let slot = &self.slots[index];
         let name = &self.name;

@@ -13,9 +13,6 @@
 // limitations under the License.
 
 //! Slot locking for filters
-//!
-//! A filter locks the slot holding a plugin's guest for the length of each guest call. The
-//! same lock is used to replace a guest that a failure left unusable.
 
 use super::ctx::PluginRecord;
 use crate::plugin_unavailable;
@@ -23,7 +20,6 @@ use crate::runtime::pool::{GuestPool, Loaded, SlotGuard};
 use pingora_error::Result;
 use proxy_wasm_host::abi::v0_2_1::GuestError;
 
-/// A locked slot in a plugin's guest pool.
 pub(super) struct LockedSlot<'a> {
     pub(super) pool: &'a GuestPool,
     pub(super) slot: usize,
@@ -31,19 +27,13 @@ pub(super) struct LockedSlot<'a> {
 }
 
 impl<'a> LockedSlot<'a> {
-    /// Lock a slot for a new request.
-    ///
-    /// Returns `None` if none of the plugin's slots has a guest.
     pub(super) fn for_new_request(pool: &'a GuestPool) -> Option<Self> {
         let (slot, guard) = pool.pick()?;
         Some(LockedSlot { pool, slot, guard })
     }
 
-    /// Lock the slot whose guest holds a request's context.
-    ///
-    /// Returns `None` if the guest that held the context is no longer in its slot, because it
-    /// was replaced or lost.
     pub(super) fn of_request(pool: &'a GuestPool, record: &PluginRecord) -> Option<Self> {
+        // `None` if the guest that held the context was replaced or lost
         let guard = pool.lock(record.slot, record.guest)?;
         Some(LockedSlot {
             pool,
@@ -52,11 +42,6 @@ impl<'a> LockedSlot<'a> {
         })
     }
 
-    /// Return the guest in the locked slot.
-    ///
-    /// # Errors
-    ///
-    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if the slot is empty.
     pub(super) fn loaded(&mut self) -> Result<&mut Loaded> {
         match self.guard.as_mut() {
             Some(loaded) => Ok(loaded),
@@ -67,7 +52,6 @@ impl<'a> LockedSlot<'a> {
         }
     }
 
-    /// Replace the slot's guest if `cause` left it unusable.
     pub(super) fn replace_guest_if_unusable(self, cause: &GuestError) {
         self.pool.replace_if_unusable(self.slot, self.guard, cause);
     }

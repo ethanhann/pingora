@@ -23,17 +23,14 @@ use pingora_proxy::Session;
 use proxy_wasm_host::abi::v0_2_1::{CallScope, Callback, ContextId, GuestError, StreamState};
 
 impl WasmCtx {
-    /// Run the end-of-request callbacks for each plugin that saw the request, in reverse chain order.
+    /// Run the end-of-request callbacks for each plugin, in reverse chain order.
     ///
     /// Call this from your `logging` for every request that created a `WasmCtx`. Each plugin runs
     /// `proxy_on_done`, `proxy_on_log`, and `proxy_on_delete`, and can read the request headers
-    /// and the headers of the response that was written. A plugin that failed open earlier in the
-    /// request still runs them, as long as its guest is usable. A plugin whose guest was replaced
-    /// or lost during the request does not, because its context was in that guest.
+    /// and the headers of the response that was written.
     ///
     /// A plugin failure here is logged rather than returned, under both fail policies, since the
-    /// response has already been sent. It is also reported to the metric sink, unless that plugin
-    /// already had a failure reported for this request.
+    /// response has already been sent.
     ///
     /// A plugin whose `proxy_on_done` returns `false` keeps its context. Its `proxy_on_log` runs
     /// later, once it has called `proxy_done`, and sees empty header maps.
@@ -75,16 +72,12 @@ impl WasmCtx {
         }
     }
 
-    /// Log the body bytes each plugin is still holding at the end of the request.
-    ///
-    /// Request bytes are logged at debug level, since a client that disconnects mid-upload
-    /// routinely leaves some held. Response bytes are logged as a warning because they were never
-    /// sent downstream.
     pub(super) fn log_bytes_still_held(&self) {
         for position in 0..self.records.len() {
             let plugin = &self.pool_at(position).name;
             let held = self.held.len(BodyDirection::Request, position);
             if held > 0 {
+                // A client that disconnects mid-upload routinely leaves some held
                 debug!(
                     "wasm plugin {plugin}: request ended with {held} request body bytes still held"
                 );
@@ -96,13 +89,6 @@ impl WasmCtx {
         }
     }
 
-    /// Finish the bookkeeping for the context of the plugin at `position` once [finish] has run.
-    ///
-    /// If the context was deleted, the callouts it sent while ending are started and their
-    /// results are discarded. A context the guest kept is passed to the root callback thread
-    /// along with those callouts, and `needs_on_log` records whether it still needs
-    /// `proxy_on_log`. A guest failure is logged and reported to the metric sink, and the guest
-    /// is replaced if the failure left it unusable.
     pub(super) fn end_or_hold_context(
         &mut self,
         position: usize,
@@ -114,6 +100,8 @@ impl WasmCtx {
         match result {
             Ok(true) => {
                 locked.pool.deleted(locked.slot);
+                // The callouts the context sent while ending are started, and their results are
+                // discarded
                 self.start_callouts(position, false);
             }
             Ok(false) => {
@@ -123,6 +111,8 @@ impl WasmCtx {
                 );
                 locked.pool.deleted(locked.slot);
                 if let Ok(loaded) = locked.loaded() {
+                    // The guest keeps the context, and the root callback thread starts the
+                    // callouts it sent
                     loaded.hold_context(context, needs_on_log, self.callouts.take_accepted());
                 }
             }
@@ -136,15 +126,6 @@ impl WasmCtx {
     }
 }
 
-/// Run the end-of-request callbacks for `context`.
-///
-/// `proxy_on_done` runs first, then `proxy_on_log` if `log` is set, then `proxy_on_delete`.
-/// Returns `false` without running the last two if `proxy_on_done` returned `false`, which means
-/// the guest is keeping the context.
-///
-/// # Errors
-///
-/// Returns the failed callback with its error. The callbacks after it are not run.
 pub(super) fn finish<H: StreamState>(
     scope: &mut CallScope<'_, H>,
     context: ContextId,
@@ -152,6 +133,7 @@ pub(super) fn finish<H: StreamState>(
 ) -> Result<bool, (Callback, GuestError)> {
     let failed_in = |callback| move |e| (callback, e);
     if !scope.on_done(context).map_err(failed_in(Callback::Done))? {
+        // The guest keeps the context
         return Ok(false);
     }
     if log {

@@ -32,7 +32,7 @@ use proxy_wasm_host::HeaderMap;
 use std::fmt;
 use std::mem;
 
-/// Where one plugin's context for a request is, given as its slot, guest, and context id.
+/// Where one plugin's context for a request is.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PluginRecord {
     pub(crate) slot: usize,
@@ -43,11 +43,8 @@ pub(crate) struct PluginRecord {
 /// Whether plugins have run on a response header yet, and where that response came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ResponseProgress {
-    /// No response header has been run through the plugins.
     NotStarted,
-    /// The plugins ran on the upstream response header.
     FromUpstream,
-    /// A plugin sent its own response.
     FromPlugin,
 }
 
@@ -58,8 +55,12 @@ pub(super) enum ResponseProgress {
 ///
 /// If any of the filters returns an `Err`, return it from your own filter so that Pingora fails
 /// the request. If [WasmCtx::plugin_responded] returns `true`, a plugin sent its own response
-/// and the error stops the request. Otherwise the request failed, most often because a plugin
-/// failed, see [FailPolicy](crate::FailPolicy).
+/// and the error stops the request. Otherwise the request failed, most often with
+/// [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) because a plugin failed. See
+/// [FailPolicy](crate::FailPolicy).
+///
+/// No plugin runs for a subrequest, and the response filters do nothing once a plugin has sent
+/// its own response.
 ///
 /// Call [WasmCtx::logging] for every `WasmCtx` you create, so that each plugin sees the end of
 /// its request. If the request task ends before `logging`, dropping the `WasmCtx` ends each open
@@ -107,7 +108,6 @@ impl WasmCtx {
         }
     }
 
-    /// Run `body` on the guest, lending it this request's stream state for the call.
     pub(crate) fn run<R>(
         &mut self,
         guest: &mut Guest,
@@ -118,10 +118,6 @@ impl WasmCtx {
         result
     }
 
-    /// Run `body` on the guest on behalf of `context`, one plugin's context for this request.
-    ///
-    /// Only callouts sent from `context` are accepted during the call. They are kept on the
-    /// request until the filter starts them, and are discarded by the next call if it does not.
     pub(crate) fn run_for_context<R>(
         &mut self,
         loaded: &mut Loaded,
@@ -132,6 +128,8 @@ impl WasmCtx {
         self.stream.plugin_name = loaded.plugin_name.clone();
         let service = loaded.callout_service.clone();
         let guest_call = || self.run(&mut loaded.guest, body);
+        // Only callouts sent from `context` are accepted. They are kept until the filter starts
+        // them, and the next call discards them if it does not
         let (result, accepted) = service.record_callouts(context, guest_call);
         self.callouts.set_accepted(accepted);
         loaded.report_to_root_callbacks();
@@ -148,8 +146,6 @@ impl WasmCtx {
     }
 
     /// Return a property that a plugin set on this request with `proxy_set_property`.
-    ///
-    /// Returns `None` if no plugin has set a value at `path`.
     pub fn guest_property(&self, path: &[&str]) -> Option<&[u8]> {
         self.stream.guest_properties.get(path)
     }
@@ -163,21 +159,15 @@ impl WasmCtx {
         self.stream.request_facts.upstream_address = peer.address().as_inet().copied();
     }
 
-    /// Return the guest pool of the plugin at `position` in the chain.
     pub(crate) fn pool_at(&self, position: usize) -> &GuestPool {
         &self.chain.runtime.pools[self.chain.plugins[position]]
     }
 
-    /// Build an [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) error for the plugin at `position`.
-    ///
-    /// `what` is the part of the message after the plugin name.
     pub(crate) fn plugin_error(&self, position: usize, what: &str) -> Box<Error> {
         plugin_unavailable(&self.pool_at(position).name, what)
     }
 
     /// Move the session's request header into the stream state for the duration of a callback.
-    ///
-    /// The session is left with a placeholder header until [Self::request_out] is called.
     pub(crate) fn request_in(&mut self, header: &mut RequestHeader) {
         let spare = self
             .spare_request
@@ -188,12 +178,10 @@ impl WasmCtx {
     }
 
     /// Move the request header back into the session, keeping the placeholder for reuse.
-    ///
-    /// If a write by the plugin at `position` changed the value of `content-length` or
-    /// `transfer-encoding` of the request, that is recorded as a change to the request body. A
-    /// write that left both headers as they were does not count.
     pub(crate) fn request_out(&mut self, position: usize, header: &mut RequestHeader) {
         if let Some(request) = self.stream.request.take() {
+            // A write that left `content-length` and `transfer-encoding` as they were does not
+            // count as a change to the body
             if request.length_changed {
                 self.record_body_change(BodyDirection::Request, position);
             }
@@ -210,11 +198,6 @@ impl WasmCtx {
         self.stream.response = Some(ResponseHeaders::new(response));
     }
 
-    /// Move the response header back into `header`, keeping the placeholder for reuse.
-    ///
-    /// If a write by the plugin at `position` changed the value of `content-length` or
-    /// `transfer-encoding` of the response, that is recorded as a change to the response body. A
-    /// write that left both headers as they were does not count.
     pub(crate) fn response_out(&mut self, position: usize, header: &mut ResponseHeader) {
         if let Some(response) = self.stream.response.take() {
             if response.length_changed {

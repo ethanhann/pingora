@@ -27,11 +27,6 @@ pub(crate) struct PluginResponse {
 }
 
 impl PluginResponse {
-    /// Build the response from what the plugin passed to `proxy_send_local_response`.
-    ///
-    /// `content-length` is always set from the body, and any `content-length` or
-    /// `transfer-encoding` header from the plugin is dropped. Returns `None` if the status is not
-    /// in the range 200 to 599, or if a header is a pseudo header or has an invalid name or value.
     pub(crate) fn build(response: &LocalResponse<'_>) -> Option<Self> {
         let status = u16::try_from(response.status_code)
             .ok()
@@ -46,6 +41,7 @@ impl PluginResponse {
             if name.eq_ignore_ascii_case(CONTENT_LENGTH.as_str())
                 || name.eq_ignore_ascii_case(TRANSFER_ENCODING.as_str())
             {
+                // `content-length` is always set from the body
                 continue;
             }
             let value = HeaderValue::from_bytes(value).ok()?;
@@ -61,7 +57,6 @@ impl PluginResponse {
     }
 }
 
-/// Return `true` if `status` is a final status, i.e. 200 to 599.
 fn is_final(status: &StatusCode) -> bool {
     status.is_success()
         || status.is_redirection()

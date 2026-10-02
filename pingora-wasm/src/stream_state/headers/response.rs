@@ -24,7 +24,6 @@ use proxy_wasm_host::{HeaderMap, NotAllowed, PairVisitor};
 use std::borrow::Cow;
 use std::ops::ControlFlow;
 
-/// The response header map exposed to a guest.
 pub(crate) struct ResponseHeaders {
     pub(crate) header: ResponseHeader,
     /// Whether a guest write through this map changed the value of `content-length` or

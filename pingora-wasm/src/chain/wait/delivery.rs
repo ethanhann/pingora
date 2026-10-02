@@ -30,10 +30,8 @@ use proxy_wasm_host::abi::v0_2_1::types::StreamType;
 use proxy_wasm_host::abi::v0_2_1::{Callback, CalloutId};
 use std::mem;
 
-/// The phase a plugin is paused in.
-///
-/// The response header and trailer variants hold what their filter was given, since neither can
-/// be reached through the session.
+/// The phase a plugin is paused in. The response header and trailer variants hold what their
+/// filter was given, since neither can be reached through the session.
 pub(in crate::chain) enum PausedPhase<'a> {
     RequestHeaders,
     RequestBody,
@@ -43,9 +41,6 @@ pub(in crate::chain) enum PausedPhase<'a> {
 }
 
 impl PausedPhase<'_> {
-    /// Return the callback that belongs to the phase.
-    ///
-    /// While a result is being delivered, the plugin gets the access it has in this callback.
     pub(super) fn callback(&self) -> Callback {
         match self {
             PausedPhase::RequestHeaders => Callback::RequestHeaders,
@@ -64,7 +59,6 @@ impl PausedPhase<'_> {
         }
     }
 
-    /// Return which body the plugin is holding, or `None` outside of a body phase.
     pub(super) fn body_direction(&self) -> Option<BodyDirection> {
         match self {
             PausedPhase::RequestBody => Some(BodyDirection::Request),
@@ -77,17 +71,7 @@ impl PausedPhase<'_> {
 impl WasmCtx {
     /// Deliver the result of callout `id` to the plugin at `position`.
     ///
-    /// Runs `proxy_on_http_call_response` with the access of the phase the plugin paused in.
-    /// Returns `true` once the callback has run.
-    ///
-    /// A failed callback is a plugin failure like any other, so the guest may be replaced and the
-    /// plugin's fail policy applies. The same goes for a guest that is no longer in its slot.
     /// Returns `false` if the plugin was skipped.
-    ///
-    /// # Errors
-    ///
-    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if the delivery failed and the plugin
-    /// was not skipped, or if the plugin has no context for this request.
     pub(super) fn deliver_callout_result<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -121,11 +105,6 @@ impl WasmCtx {
         }
     }
 
-    /// Run `guest_call` with the stream state set up for `phase`.
-    ///
-    /// The request header, the response header or trailers of the phase, and the body bytes held
-    /// for the plugin at `position` are moved into the stream state for the call and moved back
-    /// afterwards.
     fn with_phase_in_stream<DS: DownstreamSession, R>(
         &mut self,
         session: &mut Session<DS>,
@@ -133,6 +112,8 @@ impl WasmCtx {
         phase: &mut PausedPhase<'_>,
         guest_call: impl FnOnce(&mut Self) -> R,
     ) -> R {
+        // While a result is being delivered, the plugin gets the access it has in the callback
+        // it paused in
         self.stream().delivery_callback = Some(phase.callback());
         self.request_in(session.req_header_mut());
         match phase {

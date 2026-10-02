@@ -22,7 +22,6 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
 use proxy_wasm_host::abi::v0_2_1::{CalloutId, ContextId};
 
-/// A callout result to be delivered by the root callback thread.
 pub(super) struct FinishedCallout {
     pub(super) address: GuestAddress,
     pub(super) context: ContextId,
@@ -37,10 +36,6 @@ pub(super) struct RootCallbackCallouts {
 }
 
 impl RootCallbackCallouts {
-    /// Start `callout` with the root callback thread's callout sender.
-    ///
-    /// Must be called with the thread's tokio runtime entered. Without one the callout is dropped
-    /// and no result is delivered for it.
     pub(super) fn start(
         &mut self,
         runtime: &RuntimeInner,
@@ -49,6 +44,8 @@ impl RootCallbackCallouts {
         callout: AcceptedCallout,
     ) {
         let id = callout.id;
+        // Without the thread's tokio runtime entered, the callout is dropped and no result is
+        // delivered for it
         let Some(pending) = runtime.callout_launcher.spawn_for_root_callback(callout) else {
             return;
         };
@@ -69,10 +66,8 @@ impl RootCallbackCallouts {
         );
     }
 
-    /// Wait for the next callout to finish.
-    ///
-    /// Never resolves while no callout is in flight, so it can be used in a `select!` branch.
     pub(super) async fn next_finished(&mut self) -> Option<FinishedCallout> {
+        // Never resolve while no callout is in flight, so that this can be a `select!` branch
         if self.results.is_empty() {
             return std::future::pending().await;
         }

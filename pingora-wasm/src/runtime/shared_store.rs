@@ -13,8 +13,6 @@
 // limitations under the License.
 
 //! Shared data, queues, and metrics
-//!
-//! All plugins of a runtime use the same store.
 
 use crate::observability::{WasmMetric, WasmMetricKind, WasmMetricRecorder, WasmMetricSink};
 use parking_lot::Mutex;
@@ -26,12 +24,6 @@ use proxy_wasm_host::abi::v0_2_1::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// The [SharedServices] implementation of a runtime.
-///
-/// Shared data and queues are delegated to an [InMemoryStore]. Metrics are kept here instead,
-/// for two reasons. Plugins expect `proxy_record_metric` to add to a counter, whereas
-/// [InMemoryStore] would overwrite the value. Every change also has to be forwarded to the
-/// metric sink.
 pub(crate) struct SharedStore {
     data_and_queues: InMemoryStore,
     metrics: Mutex<Metrics>,
@@ -53,11 +45,6 @@ struct MetricEntry {
 }
 
 impl SharedStore {
-    /// Create a store with the given limits.
-    ///
-    /// `enqueue_observer` is called for every item enqueued on a shared queue. Each metric a
-    /// plugin defines is registered with `metric_sink`, which may return a recorder to receive
-    /// the metric's changes.
     pub(crate) fn new(
         limits: InMemoryStoreLimits,
         enqueue_observer: Arc<dyn Fn(QueueEnqueued<'_>) + Send + Sync>,
@@ -73,10 +60,6 @@ impl SharedStore {
         }
     }
 
-    /// Apply `change` to `metric` and forward the outcome to the metric's recorder, if any.
-    ///
-    /// The recorder is called after the lock has been released, so a slow recorder cannot stall
-    /// other metric calls. A delta of zero is not forwarded.
     fn change_metric(
         &self,
         metric: MetricId,
@@ -87,6 +70,8 @@ impl SharedStore {
             let entry = metrics.entries.get_mut(&metric).ok_or(Status::NotFound)?;
             (change(entry)?, entry.recorder.clone())
         };
+        // The recorder is called after the lock has been released, so a slow recorder cannot
+        // stall other metric calls
         if let Some(recorder) = recorder {
             match recorder_call {
                 RecorderCall::Add(0) => {}
@@ -98,11 +83,11 @@ impl SharedStore {
     }
 }
 
-// A runtime that replaces this one may be given the same sink, and with it the same recorders.
-// Subtract what each gauge has added when the store is dropped, so that a gauge in the sink is
-// the sum over the runtimes still alive.
 impl Drop for SharedStore {
     fn drop(&mut self) {
+        // A runtime that replaces this one may be given the same sink, and with it the same
+        // recorders. Subtract what each gauge has added, so that a gauge in the sink is the sum
+        // over the runtimes still alive.
         let metrics = self.metrics.get_mut();
         for entry in metrics.entries.values() {
             if let (MetricType::Gauge, Some(recorder)) = (entry.kind, &entry.recorder) {
@@ -118,9 +103,8 @@ enum RecorderCall {
 }
 
 /// Return the sum of the deltas a gauge at `value` has sent to its recorder.
-///
-/// The sum is capped at `i64::MAX` because a recorder takes `i64` deltas.
 fn gauge_total_sent(value: u64) -> i64 {
+    // The sum is capped at `i64::MAX` because a recorder takes `i64` deltas
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
@@ -239,6 +223,8 @@ impl SharedServices for SharedStore {
     fn record_metric(&self, _call: Invocation, metric: MetricId, value: u64) -> Result<(), Status> {
         self.change_metric(metric, |entry| match entry.kind {
             MetricType::Counter => {
+                // Plugins expect `proxy_record_metric` to add to a counter, whereas
+                // `InMemoryStore` would overwrite the value, so metrics are kept here instead
                 let before = entry.value;
                 entry.value = entry.value.saturating_add(value);
                 Ok(RecorderCall::Add(saturating_delta(before, entry.value)))

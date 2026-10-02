@@ -37,10 +37,8 @@ const RESET_REASON_CONNECT_FAILURE: &str = "remote connection failure";
 const RESET_REASON_PROTOCOL_ERROR: &str = "protocol error";
 const RESET_REASON_TERMINATION: &str = "connection termination";
 
-/// Header pairs that own their bytes.
 pub(crate) type OwnedHeaderPairs = Vec<(Vec<u8>, Vec<u8>)>;
 
-/// The outcome of a callout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CalloutResult {
     /// A response from the peer, or a synthetic one if no response header was received.
@@ -55,7 +53,6 @@ pub(crate) enum CalloutResult {
 }
 
 impl CalloutResult {
-    /// Borrow the result as the response passed to `proxy_on_http_call_response`.
     pub(crate) fn as_http_call_response(&self) -> HttpCallResponse<'_> {
         match self {
             CalloutResult::Response {
@@ -69,7 +66,6 @@ impl CalloutResult {
         }
     }
 
-    /// Create a `text/plain` response for a callout that received no response header.
     fn synthetic_response(status: StatusCode, body: String) -> Self {
         let length = body.len().to_string().into_bytes();
         let headers = vec![
@@ -87,28 +83,23 @@ impl CalloutResult {
         }
     }
 
-    /// Create a synthetic response whose body reports `reason` as the reset reason.
     fn reset_response(status: StatusCode, reason: &str) -> Self {
         Self::synthetic_response(status, format!("{RESET_BODY_PREFIX}{reason}"))
     }
 
-    /// Create the 504 response for a callout that timed out.
     pub(crate) fn timeout_response() -> Self {
         Self::synthetic_response(StatusCode::GATEWAY_TIMEOUT, TIMEOUT_BODY.to_string())
     }
 
-    /// Create the 503 response for a callout whose upstream had no peer to offer.
     pub(crate) fn no_healthy_upstream_response() -> Self {
         let body = NO_HEALTHY_UPSTREAM_BODY.to_string();
         Self::synthetic_response(StatusCode::SERVICE_UNAVAILABLE, body)
     }
 
-    /// Create the 503 response for a callout made once `max_callouts_in_flight` was reached.
     pub(crate) fn overflow_response() -> Self {
         Self::reset_response(StatusCode::SERVICE_UNAVAILABLE, RESET_REASON_OVERFLOW)
     }
 
-    /// Create the 503 response for a connection attempt that failed with `e`.
     pub(crate) fn connect_failure_response(e: &Error) -> Self {
         let reason = match e.etype() {
             ErrorType::ConnectTimedout | ErrorType::TLSHandshakeTimedout => {
@@ -119,10 +110,6 @@ impl CalloutResult {
         Self::reset_response(StatusCode::SERVICE_UNAVAILABLE, reason)
     }
 
-    /// Create the response for a session that failed with `e` before its response header was
-    /// read.
-    ///
-    /// A read or write timeout maps to 504, a protocol error to 502, and anything else to 503.
     pub(crate) fn response_for_session_error(e: &Error) -> Self {
         match e.etype() {
             ErrorType::ReadTimedout | ErrorType::WriteTimedout => Self::timeout_response(),
@@ -145,7 +132,6 @@ fn borrowed_header_pairs(pairs: &[(Vec<u8>, Vec<u8>)]) -> HeaderPairs<'_> {
         .collect()
 }
 
-/// Return the failure to report for a connection attempt that failed with `e`.
 pub(crate) fn connect_failure(e: &Error) -> CalloutFailure {
     match e.etype() {
         ErrorType::ConnectTimedout | ErrorType::TLSHandshakeTimedout => {
@@ -155,8 +141,6 @@ pub(crate) fn connect_failure(e: &Error) -> CalloutFailure {
     }
 }
 
-/// Return the failure to report for a session that failed with `e` before its response header
-/// was read.
 pub(crate) fn session_failure(e: &Error) -> CalloutFailure {
     match e.etype() {
         ErrorType::ReadTimedout | ErrorType::WriteTimedout => CalloutFailure::Timeout,

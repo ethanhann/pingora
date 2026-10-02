@@ -13,9 +13,6 @@
 // limitations under the License.
 
 //! Body and trailer filters
-//!
-//! The request body, response body, and response trailer filters are in this module, along with the
-//! pass over the chain that the two body filters share.
 
 mod direction;
 mod held;
@@ -39,7 +36,6 @@ use pingora_proxy::Session;
 use proxy_wasm_host::Buffer;
 use std::mem;
 
-/// Outcome of running a chain's body callbacks on one chunk.
 pub(super) enum BodyOutcome {
     /// The bytes to pass on, which are empty if a plugin is holding them back.
     Released(Bytes),
@@ -47,19 +43,15 @@ pub(super) enum BodyOutcome {
     Respond(usize, Box<PluginResponse>),
 }
 
-/// Outcome of [WasmCtx::run_body_callbacks_from].
 enum BodyCallbacksOutcome {
-    /// The pass is over. Either every plugin ran, or one held its bytes or sent its own response.
     Finished(BodyOutcome),
     /// The plugin at this step paused with a callout pending.
     WaitsForCallout(usize),
 }
 
-/// Convert the output of a body pass into what the filter leaves in `body`.
-///
-/// Pingora treats `None` from `request_body_filter` as the end of the request body, so empty
-/// output only becomes `None` at the end of the stream.
 pub(super) fn filter_output(output: Bytes, end_of_stream: bool) -> Option<Bytes> {
+    // Pingora treats `None` from `request_body_filter` as the end of the request body, so empty
+    // output only becomes `None` at the end of the stream
     if output.is_empty() && end_of_stream {
         None
     } else {
@@ -68,10 +60,6 @@ pub(super) fn filter_output(output: Bytes, end_of_stream: bool) -> Option<Bytes>
 }
 
 impl WasmCtx {
-    /// Return `true` if the body filter for `direction` has nothing to do for this request.
-    ///
-    /// That is the case when no plugin in the chain runs on that body, once a plugin has sent its
-    /// own response, for a subrequest, and after an upgrade.
     pub(super) fn skips_body<DS: DownstreamSession>(
         &self,
         session: &Session<DS>,
@@ -88,10 +76,6 @@ impl WasmCtx {
     }
 
     /// Run the body callback of each plugin on `chunk`, waiting for callouts along the way.
-    ///
-    /// Plugins run in the order given by `direction`. When a plugin pauses with a callout pending,
-    /// the pass waits for it. Once the plugin continues, the bytes it was holding are passed to
-    /// the plugins after it.
     pub(super) async fn run_body_callbacks<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -130,21 +114,12 @@ impl WasmCtx {
             if !released_by_plugin {
                 return Ok(BodyOutcome::Released(Bytes::new()));
             }
+            // The bytes the plugin was holding are passed to the plugins after it
             current = self.prepend_held_bytes(direction, position, Bytes::new());
             first_step = step + 1;
         }
     }
 
-    /// Run the body callbacks on `chunk`, starting at `first_step` of the pass.
-    ///
-    /// Each plugin gets the output of the one before it, preceded by any bytes it was already
-    /// holding. The pass stops early when a plugin pauses, which leaves its bytes held, when a
-    /// plugin sends its own response, and when there is nothing left to pass on before the end of
-    /// the stream.
-    ///
-    /// A skipped plugin is not run. The bytes held for it, including what it was given in a call
-    /// that failed, are passed on to the next plugin as they are. If a failing plugin is not
-    /// skipped, those bytes stay held and the error is returned.
     fn run_body_callbacks_from<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -166,6 +141,8 @@ impl WasmCtx {
                 continue;
             }
             if self.is_skipped(position) {
+                // The bytes held for a skipped plugin, including what it was given in a call
+                // that failed, are passed on to the next plugin as they are
                 current = self.prepend_held_bytes(direction, position, current);
                 continue;
             }
@@ -202,6 +179,8 @@ impl WasmCtx {
             let action = match action {
                 Ok(action) => action,
                 Err(e) => {
+                    // If the failing plugin is not skipped, its bytes stay held and the error
+                    // is returned
                     self.held.put(direction, position, buffer.into_vec());
                     self.guest_call_failed(position, locked, direction.callback(), e)?;
                     current = self.prepend_held_bytes(direction, position, Bytes::new());

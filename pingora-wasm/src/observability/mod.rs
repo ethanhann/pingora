@@ -49,26 +49,14 @@ pub trait WasmMetricSink: Send + Sync {
 
     /// Report a failed callout made by the plugin `plugin_name`.
     ///
-    /// This is called for each callout that fails, with the reason in `failure`. By default it
-    /// does nothing.
+    /// By default it does nothing.
     fn callout_failed(&self, _plugin_name: &str, _failure: CalloutFailure) {}
 
     /// Report a plugin failure.
     ///
-    /// This is called when a plugin fails during a request, under both fail policies. `report`
-    /// has the outcome, either a failed request or a skipped plugin. Only the first failure of a
-    /// plugin on a request is reported. By default it does nothing.
-    ///
-    /// The outcome is [PluginFailureOutcome::Failed] in three cases where no request fails. One is a
-    /// failure in [WasmCtx::response_trailer_filter](crate::WasmCtx::response_trailer_filter)
-    /// that does not skip the plugin, because Pingora still sends the trailers. Another is a failure in [WasmCtx::logging](crate::WasmCtx::logging),
-    /// or in the end-of-request callbacks that run when a `WasmCtx` is dropped without it. The
-    /// third is a failure outside of a request, e.g. a trap in `proxy_on_tick`.
-    ///
-    /// A request error that is not a plugin failure is not reported, e.g. a body chunk received
-    /// after the end of the body, a missing call to
-    /// [WasmCtx::upstream_attempt](crate::WasmCtx::upstream_attempt), or runtime threads that
-    /// cannot be started.
+    /// This is called when a plugin fails, under both fail policies. `report` has the outcome,
+    /// either a failed request or a skipped plugin. Only the first failure of a plugin on a
+    /// request is reported. By default it does nothing.
     fn plugin_failed(&self, _report: &PluginFailureReport<'_>) {}
 
     /// Report that a guest of the plugin `plugin_name` was replaced after a failure.
@@ -85,8 +73,7 @@ pub trait WasmMetricSink: Send + Sync {
 pub trait WasmMetricRecorder: Send + Sync {
     /// Add `delta` to a counter or gauge.
     ///
-    /// A counter only gets positive deltas. A gauge gets negative ones as well, including
-    /// when its runtime is dropped and subtracts what it had added.
+    /// A counter only gets positive deltas. A gauge gets negative ones as well.
     fn add(&self, _delta: i64) {}
 
     /// Record one value in a histogram.
@@ -176,7 +163,6 @@ impl CalloutFailure {
     }
 }
 
-/// The default sink, which publishes nothing.
 pub(crate) struct NoMetricSink;
 
 impl WasmMetricSink for NoMetricSink {}

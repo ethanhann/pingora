@@ -36,30 +36,15 @@ impl WasmCtx {
     /// Run `proxy_on_request_headers` for each plugin, in chain order.
     ///
     /// Call this from your `request_filter`, after any checks your proxy does itself. Plugins can
-    /// read and change the request headers. This filter does nothing for a subrequest.
+    /// read and change the request headers.
     ///
     /// A plugin may pause the request while waiting for a callout, in which case this filter
-    /// waits with it. The callout response is delivered to the plugin's
-    /// `proxy_on_http_call_response`, where it can still change the request headers. The rest of
-    /// the chain runs once the plugin continues.
+    /// waits with it, up to its [callout_wait_limit](crate::WasmPluginConf::callout_wait_limit).
+    /// The rest of the chain runs once the plugin continues.
     ///
     /// A plugin may send its own response instead. The plugins after it are not run, and it and
     /// the plugins ahead of it run `proxy_on_response_headers` on that response before it is
     /// returned as [RequestOutcome::Respond].
-    ///
-    /// # Errors
-    ///
-    /// For a plugin with [FailPolicy::Closed](crate::FailPolicy::Closed), returns
-    /// [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if the plugin traps or otherwise fails, has
-    /// no guest available, pauses the request with no callout pending, waits for callouts longer
-    /// than its [callout_wait_limit](crate::WasmPluginConf::callout_wait_limit), or loses the
-    /// guest holding this request during a callout wait. A plugin with
-    /// [FailPolicy::Open](crate::FailPolicy::Open) is skipped instead, unless it runs on the
-    /// request body, the request has one, and the plugin has already changed `content-length` or
-    /// `transfer-encoding`. See [fail_policy](crate::WasmPluginConf::fail_policy) for the full
-    /// rule.
-    ///
-    /// Under both policies, the same error is returned if the runtime's threads cannot be started.
     pub async fn request_filter<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -110,13 +95,6 @@ impl WasmCtx {
         Ok(RequestOutcome::Continue)
     }
 
-    /// Create a context for the plugin at `position` and run its `proxy_on_request_headers`.
-    ///
-    /// Returns `None` if the plugin failed and was skipped.
-    ///
-    /// # Errors
-    ///
-    /// Returns the failure's error if the plugin failed and was not skipped.
     fn run_request_headers_at<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -165,10 +143,6 @@ impl WasmCtx {
         }
     }
 
-    /// Turn the response sent by the plugin at `position` into a [RequestOutcome::Respond].
-    ///
-    /// That plugin and the ones ahead of it in the chain run `proxy_on_response_headers` on the
-    /// response first.
     fn respond_to_request_headers<DS: DownstreamSession>(
         &mut self,
         session: &mut Session<DS>,
@@ -185,8 +159,6 @@ impl WasmCtx {
 
 impl WasmCtx {
     /// Record what the built-in properties need and the request header does not have.
-    ///
-    /// These are the client and server addresses, the TLS digest, and the start time.
     fn record_request_facts<DS: DownstreamSession>(&mut self, session: &Session<DS>) {
         let facts = &mut self.stream().request_facts;
         facts.client_address = session.client_addr().and_then(|a| a.as_inet()).copied();

@@ -13,9 +13,6 @@
 // limitations under the License.
 
 //! Wasm runtime
-//!
-//! A [WasmRuntime] holds the compiled plugins of a proxy and their guest pools. It is built once
-//! and shared by every request.
 
 mod build;
 use build::{build_pool, checked_plugin_indexes, new_shared_store, PoolInputs};
@@ -58,6 +55,17 @@ use ticker::{with_ticker, Ticker};
 ///
 /// To reload plugins, build a new runtime and switch new requests over to it. Requests that
 /// started on the old runtime will finish on it.
+///
+/// Some plugins do work on a timer in `proxy_on_tick`, and some wait for items on a shared
+/// queue. The runtime runs this work on a thread of its own, named `wasm-root-calls`, so it
+/// never runs on the threads of your Pingora services. The thread starts with the first request
+/// and stops when the runtime is dropped.
+///
+/// Each slot of a plugin is a separate guest, so each slot gets its own ticks. A tick waits
+/// while a request callback runs in the same slot, and a request waits while a tick runs in its
+/// slot. When a queue gets an item, the guest that registered the queue last receives
+/// `proxy_on_queue_ready`. A plugin can send callouts from these callbacks to the upstreams in
+/// [WasmServices::callout_upstreams].
 #[derive(Clone)]
 pub struct WasmRuntime {
     pub(crate) inner: Arc<RuntimeInner>,
@@ -81,21 +89,9 @@ impl WasmRuntime {
     /// Guest log lines are written to the `log` crate under the target `pingora_wasm::guest`,
     /// and plugins cannot send callouts. Use [WasmRuntime::new_with_services] to change either.
     ///
-    /// # Errors
-    ///
-    /// Returns [ERR_INVALID_CONF](crate::ERR_INVALID_CONF) if `plugins` is empty or two plugins
-    /// have the same name. The same error, with the plugin's name in its message, is returned
-    /// if a plugin's file is not a supported Proxy-Wasm module, if the plugin
-    /// traps or otherwise fails during startup, if its `proxy_on_vm_start` or
-    /// `proxy_on_configure` returns `false`, or if its configuration is invalid. A configuration
-    /// is invalid when [slots](WasmPluginConf::slots) is zero, when
-    /// [limits](WasmPluginConf::limits) sets a fuel limit, when one of the body or callout limits
-    /// is zero, or when [callout_wait_limit](WasmPluginConf::callout_wait_limit) is not greater
-    /// than [callout_timeout_limit](WasmPluginConf::callout_timeout_limit). A plugin's
-    /// [fail_policy](WasmPluginConf::fail_policy) has no effect on these errors.
-    ///
-    /// Returns `ReadError` if a plugin's file cannot be read, and `InternalError` if the wasm
-    /// engine cannot be built.
+    /// Returns [ERR_INVALID_CONF](crate::ERR_INVALID_CONF) if `plugins` is empty, if two plugins
+    /// have the same name, if a plugin's configuration is invalid, or if a plugin cannot be
+    /// compiled or does not start.
     pub fn new(plugins: Vec<WasmPluginConf>) -> Result<Self> {
         Self::new_with_services(plugins, WasmServices::default())
     }
@@ -106,12 +102,9 @@ impl WasmRuntime {
     /// when guest log lines should go to your own logger, e.g. to keep them in the request's
     /// `tracing` span. With [WasmServices::default] this is the same as [WasmRuntime::new].
     ///
-    /// # Errors
-    ///
     /// Returns the same errors as [WasmRuntime::new]. Also returns
     /// [ERR_INVALID_CONF](crate::ERR_INVALID_CONF) if
-    /// [max_callouts_in_flight](WasmServices::max_callouts_in_flight) is zero or greater than
-    /// `tokio::sync::Semaphore::MAX_PERMITS`.
+    /// [max_callouts_in_flight](WasmServices::max_callouts_in_flight) is out of range.
     pub fn new_with_services(plugins: Vec<WasmPluginConf>, services: WasmServices) -> Result<Self> {
         let connector = services
             .callout_connector
@@ -180,6 +173,8 @@ impl WasmRuntime {
             fixed_properties: fixed_properties.clone(),
             root_callback_thread: &root_callback_thread,
         };
+        // Guests are started here, before the runtime's own ticker thread exists. The temporary
+        // ticker keeps the CPU time limit in force for a guest that loops forever during startup.
         let pools = with_ticker(&engine, || {
             let indexed_plugins = plugins.iter().enumerate();
             indexed_plugins
@@ -205,8 +200,6 @@ impl WasmRuntime {
     ///
     /// Plugins run in the given order on the request and in reverse order on the response. A
     /// plugin may be part of several chains, which then share its guests.
-    ///
-    /// # Errors
     ///
     /// Returns [ERR_INVALID_CONF](crate::ERR_INVALID_CONF) if `names` is empty, if a name does
     /// not belong to a plugin of this runtime, or if a name is listed more than once.
@@ -266,17 +259,10 @@ impl fmt::Debug for WasmRuntime {
 }
 
 impl RuntimeInner {
-    /// Start the root callback thread and the epoch ticker if they are not running yet.
-    ///
-    /// The threads cannot be started in [WasmRuntime::new]. When daemonizing, Pingora forks after
-    /// the runtime has been built, and threads do not survive a fork. This is called on the
-    /// request path instead, where only the first successful call does any work.
-    ///
-    /// # Errors
-    ///
-    /// Returns [ERR_PLUGIN_FAILED](crate::ERR_PLUGIN_FAILED) if a thread cannot be started. The
-    /// next call will try again.
     pub(crate) fn start_threads(self: &Arc<Self>) -> Result<()> {
+        // The threads cannot be started in `WasmRuntime::new`. When daemonizing, Pingora forks
+        // after the runtime has been built, and threads do not survive a fork. This is called on
+        // the request path instead, where only the first successful call does any work.
         self.threads_started.get_or_try_init(|| {
             self.root_callback_thread.start(Arc::downgrade(self))?;
             self.ticker.start(self)

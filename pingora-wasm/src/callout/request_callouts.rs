@@ -22,10 +22,8 @@ use std::pin::Pin;
 use std::task::Poll;
 use tokio::task::JoinHandle;
 
-/// The result of a started callout that has not been delivered to the plugin yet.
 #[derive(Debug)]
 pub(crate) enum PendingResult {
-    /// The result will be returned by the task sending the callout.
     FromTask(JoinHandle<CalloutResult>),
     /// The result was decided without sending the callout.
     Known(CalloutResult),
@@ -39,32 +37,26 @@ struct PendingCallout {
 
 /// Callouts made by the plugins of one request.
 ///
-/// Callouts made during a guest call are kept in `accepted` until the phase starts their tasks.
+/// Callouts made during a guest call are kept in `accepted` until the filter starts their tasks.
 /// If the plugin is paused at that point, the started callouts move to `pending`, where the
-/// phase waits for their results. Both lists stay empty, and allocate nothing, for a request
-/// that makes no callouts.
+/// filter waits for their results.
 #[derive(Default)]
 pub(crate) struct RequestCallouts {
     accepted: Vec<AcceptedCallout>,
     pending: Vec<PendingCallout>,
-    /// The chain position of the plugin a filter is waiting on for a callout result. This is
-    /// left set if the filter's future is dropped mid-wait, which makes the following filters
-    /// fail the request.
+    /// The chain position of the plugin a filter is waiting on for a callout result.
     pub(crate) waiting_position: Option<usize>,
 }
 
 impl RequestCallouts {
-    /// Replace the accepted callouts with those of the latest guest call.
     pub(crate) fn set_accepted(&mut self, accepted: Vec<AcceptedCallout>) {
         self.accepted = accepted;
     }
 
-    /// Take the callouts accepted during the latest guest call.
     pub(crate) fn take_accepted(&mut self) -> Vec<AcceptedCallout> {
         mem::take(&mut self.accepted)
     }
 
-    /// Track a started callout of the plugin at `position` so the phase can wait for its result.
     pub(crate) fn add_pending(&mut self, position: usize, id: CalloutId, result: PendingResult) {
         self.pending.push(PendingCallout {
             position,
@@ -73,30 +65,20 @@ impl RequestCallouts {
         });
     }
 
-    /// Return `true` if the plugin at `position` has a pending callout.
     pub(crate) fn has_pending(&self, position: usize) -> bool {
         self.pending.iter().any(|p| p.position == position)
     }
 
-    /// Stop tracking the pending callouts of the plugin at `position`.
-    ///
-    /// Their tasks keep running.
     pub(crate) fn forget_pending(&mut self, position: usize) {
         self.pending.retain(|p| p.position != position);
     }
 
-    /// Drop every callout of the request.
-    ///
-    /// Tasks that are already running are not cancelled.
     pub(crate) fn clear(&mut self) {
+        // Tasks that are already running are not cancelled
         self.accepted.clear();
         self.pending.clear();
     }
 
-    /// Wait for the next pending callout of the plugin at `position` to finish.
-    ///
-    /// Returns `None` if the plugin has no pending callout. A task that panicked or was
-    /// cancelled yields [CalloutResult::Failed].
     pub(crate) async fn next_result(
         &mut self,
         position: usize,
@@ -111,6 +93,7 @@ impl RequestCallouts {
                 }
                 let ready = match &mut pending.result {
                     PendingResult::Known(result) => Poll::Ready(result.clone()),
+                    // A task that panicked or was cancelled yields `Failed`
                     PendingResult::FromTask(task) => Pin::new(task)
                         .poll(cx)
                         .map(|joined| joined.unwrap_or(CalloutResult::Failed)),

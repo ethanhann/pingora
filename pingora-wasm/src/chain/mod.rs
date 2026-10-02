@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Plugin chain and its per-request phases
+//! Plugin chain and its per-request filters
 
 mod body;
 mod ctx;
@@ -56,6 +56,12 @@ struct ChainPhases {
 }
 
 /// What to do with a request after [WasmCtx::request_filter].
+///
+/// A plugin can respond to a request itself, for example to deny it with 403. From
+/// [WasmCtx::request_filter] you get that response as [RequestOutcome::Respond], and you write
+/// it to the downstream. [WasmCtx::request_body_filter] and [WasmCtx::response_filter] write the
+/// response for you, and then return an error with the status of the response to stop the
+/// request. After that error, [WasmCtx::plugin_responded] returns `true`.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RequestOutcome {

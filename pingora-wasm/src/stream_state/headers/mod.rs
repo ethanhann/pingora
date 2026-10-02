@@ -13,8 +13,6 @@
 // limitations under the License.
 
 //! Header and trailer maps
-//!
-//! The maps a plugin reads and writes, along with the header name and value handling they share.
 
 mod request;
 mod response;
@@ -66,9 +64,6 @@ pub(super) fn classify(key: &[u8]) -> Option<Name<'_>> {
 }
 
 /// Return the values of `key` in `headers` if `key` is `content-length` or `transfer-encoding`.
-///
-/// Returns `None` for any other key. Comparing the result from before a write with the one from
-/// after it shows whether the write changed the framing of the message.
 pub(super) fn framing_header_values(
     headers: &http::HeaderMap,
     key: &[u8],
@@ -79,7 +74,6 @@ pub(super) fn framing_header_values(
     Some(headers.get_all(name).iter().cloned().collect())
 }
 
-/// Return `true` if `content-length` or `transfer-encoding` differs between the two maps.
 pub(super) fn framing_headers_differ(before: &http::HeaderMap, after: &http::HeaderMap) -> bool {
     [CONTENT_LENGTH, TRANSFER_ENCODING]
         .iter()

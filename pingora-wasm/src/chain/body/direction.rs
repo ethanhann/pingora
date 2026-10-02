@@ -13,9 +13,6 @@
 // limitations under the License.
 
 //! Body direction
-//!
-//! [BodyDirection] selects the request body or the response body, and provides everything that
-//! differs between the two in the shared body pass.
 
 use crate::chain::wait::PausedPhase;
 use crate::runtime::pool::PluginPhases;
@@ -52,7 +49,6 @@ impl BodyDirection {
         }
     }
 
-    /// Return the body's name and the name of its limit setting, for use in messages.
     pub(crate) fn body_and_limit_names(self) -> (&'static str, &'static str) {
         match self {
             BodyDirection::Request => ("request", "request_body_limit"),
@@ -74,9 +70,6 @@ impl BodyDirection {
         }
     }
 
-    /// Return the chain position of the plugin that runs at `step` of a pass over `count` plugins.
-    ///
-    /// Request bodies run in chain order and response bodies in reverse.
     pub(super) fn position_at_step(self, step: usize, count: usize) -> usize {
         match self {
             BodyDirection::Request => step,
@@ -84,7 +77,6 @@ impl BodyDirection {
         }
     }
 
-    /// Return the body callback for this direction.
     pub(crate) fn callback(self) -> Callback {
         match self {
             BodyDirection::Request => Callback::RequestBody,
