@@ -61,8 +61,8 @@ pub(crate) enum RootCallbackEvent {
         context: ContextId,
         needs_on_log: bool,
     },
-    /// The runtime is ending and has no request left. The thread ends the plugins and reports
-    /// its progress here.
+    /// The runtime has no request left. The thread ends the plugins and sends its progress on
+    /// the channel.
     End(watch::Sender<EndProgress>),
 }
 

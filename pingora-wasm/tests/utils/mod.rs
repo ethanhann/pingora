@@ -14,7 +14,7 @@
 
 pub mod callout_origins;
 pub mod guests;
-mod proxy;
+pub mod proxy;
 pub mod raw;
 mod services;
 

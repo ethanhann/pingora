@@ -415,3 +415,24 @@ pub fn context_holder_with_an_earlier_callout(name: &str, log_text: &str) -> Was
         write_module(name, &exports.into_wat(&texts.data_segments)),
     )
 }
+
+/// Build the conf for a plugin that logs `tick_text` on every tick of 50 ms and `done_text`
+/// when its root context gets `proxy_on_done`.
+pub fn root_lifecycle_logger(name: &str, tick_text: &str, done_text: &str) -> WasmPluginConf {
+    let mut texts = MemoryTexts::new();
+    let log_done = texts.log_call(done_text);
+    let exports = Exports {
+        configure: "(i32.store (i32.const 600) (local.get 0))
+            (drop (call $set_tick_period (i32.const 50))) i32.const 1"
+            .to_string(),
+        tick: texts.log_call(tick_text),
+        done: format!(
+            "(if (i32.eq (local.get 0) (i32.load (i32.const 600))) (then {log_done})) i32.const 1"
+        ),
+        ..Exports::default()
+    };
+    one_slot_plugin(
+        name,
+        write_module(name, &exports.into_wat(&texts.data_segments)),
+    )
+}

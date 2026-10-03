@@ -71,14 +71,12 @@ impl RootCallbackThread {
         self.sender.clone()
     }
 
-    /// Tell the thread to end the plugins, and return a receiver of its progress.
     pub(crate) fn send_end(&self, waiting_for: Vec<Arc<str>>) -> watch::Receiver<EndProgress> {
         let progress = EndProgress {
             finished: false,
             waiting_for,
         };
         let (sender, receiver) = watch::channel(progress);
-        // A thread that has already stopped drops the sender, which the receiver sees as the end
         let _ = self.sender.send(RootCallbackEvent::End(sender));
         receiver
     }

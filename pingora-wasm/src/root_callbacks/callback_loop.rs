@@ -38,7 +38,6 @@ pub(super) struct RootCallbackLoop {
     callouts_to_start: Vec<(GuestAddress, ContextId, AcceptedCallout)>,
     ready_work: VecDeque<Work>,
     retries: Vec<(Instant, Work)>,
-    /// Set once the runtime is ending. Ticks and queue wakes stop from then on.
     pub(super) ending: Option<Ending>,
 }
 

@@ -23,11 +23,28 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{Error, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
-use pingora_wasm::{write_plugin_response, RequestOutcome, WasmChain, WasmCtx};
+use pingora_wasm::{write_plugin_response, RequestOutcome, WasmChain, WasmChainHandle, WasmCtx};
 use std::time::Duration;
 
-pub struct TestProxy {
-    pub chain: WasmChain,
+/// A chain to create each request's `WasmCtx` from.
+pub trait NewWasmCtx: Send + Sync + 'static {
+    fn new_wasm_ctx(&self) -> WasmCtx;
+}
+
+impl NewWasmCtx for WasmChain {
+    fn new_wasm_ctx(&self) -> WasmCtx {
+        self.new_ctx()
+    }
+}
+
+impl NewWasmCtx for WasmChainHandle {
+    fn new_wasm_ctx(&self) -> WasmCtx {
+        self.new_ctx()
+    }
+}
+
+pub struct TestProxy<C> {
+    pub chain: C,
 }
 
 #[derive(Default)]
@@ -46,7 +63,7 @@ const ORIGIN: &str = "x-test-origin";
 const SKIPPED_PLUGINS: &str = "x-test-skipped";
 
 #[async_trait]
-impl ProxyHttp for TestProxy {
+impl<C: NewWasmCtx> ProxyHttp for TestProxy<C> {
     type CTX = TestCtx;
 
     fn new_ctx(&self) -> Self::CTX {
@@ -54,7 +71,7 @@ impl ProxyHttp for TestProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-        let wasm = ctx.wasm.insert(self.chain.new_ctx());
+        let wasm = ctx.wasm.insert(self.chain.new_wasm_ctx());
         wasm.set_property(&["xds", "route_name"], "test-route");
         match wasm.request_filter(session).await? {
             RequestOutcome::Respond(header, body) => {

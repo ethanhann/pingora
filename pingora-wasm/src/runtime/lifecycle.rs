@@ -70,7 +70,6 @@ impl Lifecycle {
 
     pub(crate) async fn wait_for_no_live_ctx(&self) {
         loop {
-            // Enabled before the count is read, so a drop between the two still wakes this task
             let mut dropped = pin!(self.last_ctx_dropped.notified());
             dropped.as_mut().enable();
             if self.live_ctxs.load(Ordering::SeqCst) == 0 {
@@ -100,7 +99,7 @@ impl RuntimeInner {
         let plugin_names = self.pools.iter().map(|pool| pool.name.clone()).collect();
         let mut progress = self.root_callback_thread.send_end(plugin_names);
         let finished = async {
-            // An error means the thread has stopped, so nothing is left to wait for
+            // An error means the root callback thread has stopped, so no plugin is left
             let _ = progress.wait_for(|progress| progress.finished).await;
         };
         if timeout(self.shutdown_wait_limit, finished).await.is_ok() {

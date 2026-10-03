@@ -59,7 +59,9 @@ pub struct WasmServices {
     /// connections are kept.
     ///
     /// Callouts a plugin sends outside of a request, e.g. from `proxy_on_tick`, do not use this
-    /// connector. They are sent through a separate connector with the default options.
+    /// connector. They are sent through a separate connector with the default options. If a peer
+    /// needs a client certificate or its own CA, set them on the [HttpPeer](pingora_core::upstreams::peer::HttpPeer) that
+    /// [CalloutUpstreams::callout_peer] returns, which both kinds of callouts use.
     pub callout_connector: Option<Arc<Connector>>,
     /// The maximum number of callouts the runtime will have in flight at once. Default 1024.
     ///

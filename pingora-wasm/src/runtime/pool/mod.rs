@@ -233,7 +233,6 @@ impl GuestPool {
         true
     }
 
-    /// Leave a slot that loses its guest empty from now on.
     pub(crate) fn stop_rebuilds(&self) {
         self.rebuilds_stopped.store(true, Ordering::Relaxed);
     }

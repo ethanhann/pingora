@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::sync::watch;
 
-/// How far the end of a runtime's plugins has come.
+/// Progress of the end of a runtime's plugins.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EndProgress {
     pub(crate) finished: bool,
@@ -43,7 +43,7 @@ pub(super) struct Ending {
     progress: watch::Sender<EndProgress>,
     step: EndStep,
     roots: Vec<GuestAddress>,
-    /// Roots whose `proxy_on_done` failed. They cannot finish, so the end does not wait for them.
+    /// Roots whose `proxy_on_done` failed, which the end does not wait for.
     pub(super) failed_roots: Vec<GuestAddress>,
 }
 
@@ -59,7 +59,7 @@ impl Ending {
 }
 
 impl RootCallbackLoop {
-    /// Move the end of the plugins forward, and return `true` once it has finished.
+    /// Run the next step of the end, and return `true` once the end has finished.
     pub(super) fn advance_end(&mut self, runtime: &RuntimeInner) -> bool {
         let Some(step) = self.ending.as_ref().map(|ending| ending.step) else {
             return false;
@@ -114,7 +114,6 @@ impl RootCallbackLoop {
         }
     }
 
-    /// Return the roots that the end still runs callbacks on.
     fn end_roots(&self) -> Vec<GuestAddress> {
         let Some(ending) = &self.ending else {
             return Vec::new();

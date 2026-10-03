@@ -193,7 +193,6 @@ impl BackgroundService for WasmPlugins {
         if let Err(e) = self.current.load().runtime.inner.start_threads() {
             error!("wasm plugins: failed to start: {e}");
         }
-        // An error means the server dropped its shutdown signal, which also ends the service
         let _ = shutdown.changed().await;
         let current = self.current.load_full();
         current.runtime.inner.end().await;
@@ -208,10 +207,11 @@ impl WasmChainHandle {
         loop {
             let current = self.current.load_full();
             let ctx = current.chains[self.index].new_ctx();
-            // A runtime that has started to end is used only while no other has replaced it,
-            // as at a shutdown. The live count in `ctx` keeps its end waiting for this request.
-            let ending = current.runtime.inner.lifecycle.is_ending();
-            if !ending || Arc::ptr_eq(&current, &self.current.load()) {
+            if !current.runtime.inner.lifecycle.is_ending() {
+                return ctx;
+            }
+            // At a shutdown no newer runtime has replaced this one, so the request runs on it
+            if Arc::ptr_eq(&current, &self.current.load()) {
                 return ctx;
             }
         }

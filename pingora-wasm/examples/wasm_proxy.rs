@@ -14,20 +14,24 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use log::{error, info};
+use pingora_core::connectors::http::Connector;
 use pingora_core::protocols::Digest;
 use pingora_core::server::configuration::Opt;
-use pingora_core::server::Server;
+use pingora_core::server::{Server, ShutdownWatch};
+use pingora_core::services::background::{background_service, BackgroundService};
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{Error, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use pingora_wasm::{
     write_plugin_response, PrometheusMetricSink, RequestOutcome, StaticCalloutUpstreams, WasmChain,
-    WasmConf, WasmCtx, WasmPluginConf, WasmRuntime, WasmServices,
+    WasmChainHandle, WasmConf, WasmCtx, WasmPluginConf, WasmPlugins, WasmRuntime, WasmServices,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::signal::unix::{signal, SignalKind};
 
 const DEFAULT_PLUGIN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -40,7 +44,7 @@ const CONF_FLAG: &str = "--conf";
 const DEFAULT_CHAIN: &str = "default";
 
 pub struct PluginProxy {
-    chain: WasmChain,
+    chain: WasmChainHandle,
 }
 
 #[async_trait]
@@ -144,8 +148,61 @@ impl ProxyHttp for PluginProxy {
     }
 }
 
+/// The services that every runtime of the proxy shares, so that a reload keeps the pooled
+/// callout connections and the published metrics.
+#[derive(Clone)]
+struct SharedServices {
+    connector: Arc<Connector>,
+    metric_sink: Arc<PrometheusMetricSink>,
+}
+
+impl SharedServices {
+    fn add_to(&self, services: &mut WasmServices) {
+        services.callout_connector = Some(self.connector.clone());
+        services.metric_sink = self.metric_sink.clone();
+    }
+}
+
+type BuildPlugins = Box<dyn Fn() -> Result<(WasmRuntime, WasmChain), String> + Send + Sync>;
+
+/// Reloads the plugins when the process receives SIGHUP.
+struct ReloadOnHangup {
+    plugins: Arc<WasmPlugins>,
+    build: BuildPlugins,
+}
+
+#[async_trait]
+impl BackgroundService for ReloadOnHangup {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        let mut hangups = match signal(SignalKind::hangup()) {
+            Ok(hangups) => hangups,
+            Err(e) => return error!("cannot listen for SIGHUP, plugins will not reload: {e}"),
+        };
+        loop {
+            tokio::select! {
+                _ = hangups.recv() => {}
+                _ = shutdown.changed() => return,
+            }
+            let reloaded = (self.build)().and_then(|(runtime, chain)| {
+                let chains = [(DEFAULT_CHAIN, chain)];
+                self.plugins
+                    .replace(runtime, chains)
+                    .map_err(|e| e.to_string())
+            });
+            match reloaded {
+                Ok(()) => info!("wasm plugins reloaded"),
+                Err(e) => error!("wasm plugins not reloaded, the old plugins stay in use: {e}"),
+            }
+        }
+    }
+}
+
 /// Build the runtime and a chain of the plugins listed on the command line.
-fn runtime_and_chain_from_args(args: &[String], slots: usize) -> (WasmRuntime, WasmChain) {
+fn runtime_and_chain_from_args(
+    args: &[String],
+    slots: usize,
+    shared: &SharedServices,
+) -> Result<(WasmRuntime, WasmChain), String> {
     // Body phases cost a plugin call per chunk, so only enable them for plugins that need the body
     let mut body = false;
     let mut plugins = Vec::new();
@@ -179,27 +236,29 @@ fn runtime_and_chain_from_args(args: &[String], slots: usize) -> (WasmRuntime, W
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let mut services = WasmServices::default();
     services.callout_upstreams = Arc::new(upstreams);
-    services.metric_sink = prometheus_sink();
-    let runtime = WasmRuntime::new_with_services(plugins, services).unwrap();
-    let chain = runtime.chain(&names).unwrap();
-    (runtime, chain)
+    shared.add_to(&mut services);
+    let runtime = WasmRuntime::new_with_services(plugins, services).map_err(|e| e.to_string())?;
+    let chain = runtime.chain(&names).map_err(|e| e.to_string())?;
+    Ok((runtime, chain))
 }
 
 /// Build the runtime and the `default` chain from a YAML file.
-fn runtime_and_chain_from_conf(path: &str) -> (WasmRuntime, WasmChain) {
-    let yaml = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| exit_with(format!("cannot read {path}: {e}")));
-    let conf: WasmConf =
-        serde_yaml::from_str(&yaml).unwrap_or_else(|e| exit_with(format!("invalid {path}: {e}")));
+fn runtime_and_chain_from_conf(
+    path: &str,
+    shared: &SharedServices,
+) -> Result<(WasmRuntime, WasmChain), String> {
+    let yaml = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let conf: WasmConf = serde_yaml::from_str(&yaml).map_err(|e| format!("invalid {path}: {e}"))?;
     let mut services = conf.services();
-    services.metric_sink = prometheus_sink();
-    let runtime = WasmRuntime::new_with_services(conf.plugins.clone(), services)
-        .unwrap_or_else(|e| exit_with(format!("invalid {path}: {e}")));
+    shared.add_to(&mut services);
+    let invalid = |e: Box<Error>| format!("invalid {path}: {e}");
+    let runtime =
+        WasmRuntime::new_with_services(conf.plugins.clone(), services).map_err(invalid)?;
     let chain = conf
         .chain_plugins(DEFAULT_CHAIN)
         .and_then(|names| runtime.chain(&names))
-        .unwrap_or_else(|e| exit_with(format!("invalid {path}: {e}")));
-    (runtime, chain)
+        .map_err(invalid)?;
+    Ok((runtime, chain))
 }
 
 fn exit_with(message: String) -> ! {
@@ -233,6 +292,10 @@ fn prometheus_sink() -> Arc<PrometheusMetricSink> {
 // that with RUST_LOG=info,proxy_wasm_host=error
 //
 // Plugin metrics are served at 127.0.0.1:6192/metrics
+//
+// To reload the plugins from the same files, send the process SIGHUP. Requests in progress
+// finish on the old plugins
+// kill -HUP <pid>
 fn main() {
     env_logger::init();
 
@@ -256,15 +319,23 @@ fn main() {
     my_server.bootstrap();
 
     let slots = my_server.configuration.threads;
-    let (_runtime, chain) = match conf_path {
-        Some(path) => runtime_and_chain_from_conf(&path),
-        None => {
-            if args.is_empty() {
-                args.push(DEFAULT_PLUGIN.into());
-            }
-            runtime_and_chain_from_args(&args, slots)
-        }
+    if args.is_empty() {
+        args.push(DEFAULT_PLUGIN.into());
+    }
+    let shared = SharedServices {
+        connector: Arc::new(Connector::new(None)),
+        metric_sink: prometheus_sink(),
     };
+    let build: BuildPlugins = match conf_path {
+        Some(path) => Box::new(move || runtime_and_chain_from_conf(&path, &shared)),
+        None => Box::new(move || runtime_and_chain_from_args(&args, slots, &shared)),
+    };
+    let (runtime, chain) = build().unwrap_or_else(|e| exit_with(e));
+    let plugins = WasmPlugins::new(runtime, [(DEFAULT_CHAIN, chain)]).unwrap();
+    let plugins_service = background_service("wasm plugins", plugins);
+    let plugins = plugins_service.task();
+    let chain = plugins.chain(DEFAULT_CHAIN).unwrap();
+    let reload_service = background_service("wasm reload", ReloadOnHangup { plugins, build });
 
     let mut my_proxy =
         pingora_proxy::http_proxy_service(&my_server.configuration, PluginProxy { chain });
@@ -275,5 +346,7 @@ fn main() {
 
     my_server.add_service(my_proxy);
     my_server.add_service(metrics_service);
+    my_server.add_service(plugins_service);
+    my_server.add_service(reload_service);
     my_server.run_forever();
 }
