@@ -50,6 +50,7 @@ mod callout;
 mod chain;
 mod configuration;
 mod observability;
+mod plugins;
 mod properties;
 mod root_callbacks;
 mod runtime;
@@ -65,6 +66,7 @@ pub use observability::{
     CalloutFailure, PluginFailure, PluginFailureOutcome, PluginFailureReport, PrometheusMetricSink,
     WasmMetric, WasmMetricKind, WasmMetricRecorder, WasmMetricSink,
 };
+pub use plugins::{WasmChainHandle, WasmPlugins};
 /// Re-export of the `prometheus` crate that [PrometheusMetricSink] is built against.
 ///
 /// Create your registry through this re-export to make sure its version matches.

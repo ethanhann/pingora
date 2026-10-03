@@ -27,6 +27,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// The plugins, chains, and plugin services of a proxy, as read from a configuration file.
 ///
@@ -88,6 +89,9 @@ pub struct WasmConf {
     /// [CalloutUpstreams](crate::CalloutUpstreams) and set it on the result of
     /// [services](Self::services).
     pub static_callout_upstreams: HashMap<String, CalloutUpstreamConf>,
+    /// The value for [WasmServices::shutdown_wait_limit] in whole seconds. Default `None`, in
+    /// which case [WasmServices] keeps its own default.
+    pub shutdown_wait_limit_seconds: Option<u64>,
 }
 
 /// The peer of one callout upstream in [WasmConf::static_callout_upstreams].
@@ -121,7 +125,8 @@ impl CalloutUpstreamConf {
 impl WasmConf {
     /// Return the [WasmServices] this configuration describes.
     ///
-    /// The result has [max_callouts_in_flight](Self::max_callouts_in_flight) if it is set, the
+    /// The result has [max_callouts_in_flight](Self::max_callouts_in_flight) and
+    /// [shutdown_wait_limit_seconds](Self::shutdown_wait_limit_seconds) if they are set, the
     /// [fixed_properties](Self::fixed_properties), and, unless
     /// [static_callout_upstreams](Self::static_callout_upstreams) is empty, a
     /// [StaticCalloutUpstreams] with one peer per upstream.
@@ -129,6 +134,9 @@ impl WasmConf {
         let mut services = WasmServices::default();
         if let Some(limit) = self.max_callouts_in_flight {
             services.max_callouts_in_flight = limit;
+        }
+        if let Some(seconds) = self.shutdown_wait_limit_seconds {
+            services.shutdown_wait_limit = Duration::from_secs(seconds);
         }
         services.fixed_properties = self.fixed_properties.clone();
         if self.static_callout_upstreams.is_empty() {
@@ -169,6 +177,7 @@ mod tests {
     const CONF: &str = r#"
 threads: 2
 max_callouts_in_flight: 16
+shutdown_wait_limit_seconds: 2
 plugins:
   - name: auth
     path: auth.wasm
@@ -203,6 +212,7 @@ static_callout_upstreams:
         assert_eq!(names, ["auth", "stats"]);
         assert_eq!(conf.chain_plugins("default").unwrap(), ["auth", "stats"]);
         assert_eq!(services.max_callouts_in_flight, 16);
+        assert_eq!(services.shutdown_wait_limit, Duration::from_secs(2));
         let node_name = services.fixed_properties.get(&["node", "metadata", "NAME"]);
         assert_eq!(node_name, Some(&b"edge-1"[..]));
         let upstreams = &services.callout_upstreams;
@@ -234,6 +244,7 @@ static_callout_upstreams:
             services.max_callouts_in_flight,
             defaults.max_callouts_in_flight
         );
+        assert_eq!(services.shutdown_wait_limit, defaults.shutdown_wait_limit);
         assert_eq!(services.fixed_properties, defaults.fixed_properties);
         assert!(!services.callout_upstreams.has_upstream("a", "authz"));
     }

@@ -15,10 +15,11 @@
 //! Root callback events
 
 use crate::callout::AcceptedCallout;
-use crate::root_callbacks::RootCallbackPluginState;
+use crate::root_callbacks::{EndProgress, RootCallbackPluginState};
 use proxy_wasm_host::abi::v0_2_1::{CalloutId, Changes, ContextId, GuestId, QueueId};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::watch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SlotIndex {
@@ -60,6 +61,9 @@ pub(crate) enum RootCallbackEvent {
         context: ContextId,
         needs_on_log: bool,
     },
+    /// The runtime is ending and has no request left. The thread ends the plugins and reports
+    /// its progress here.
+    End(watch::Sender<EndProgress>),
 }
 
 pub(crate) type RootCallbackSender = UnboundedSender<RootCallbackEvent>;

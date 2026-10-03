@@ -29,13 +29,13 @@ use crate::callout::PluginCalloutConf;
 use crate::observability::WasmMetricSink;
 use crate::root_callbacks::RootCallbackPluginState;
 use crate::runtime::FailPolicy;
-use events::RootCallbackSender;
+use events::{GuestAddress, RootCallbackSender};
 use guest_start::StartedGuest;
 use log::info;
 use parking_lot::{Mutex, MutexGuard};
 use pingora_error::Result;
 use proxy_wasm_host::abi::v0_2_1::{Callback, GuestError, GuestId, GuestSpec, PluginConfig};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use warning_rate_limit::WarningRateLimit;
@@ -110,6 +110,7 @@ pub(crate) struct GuestPool {
     replaced_guest_warnings: WarningRateLimit,
     pub(crate) skipped_plugin_warnings: WarningRateLimit,
     next: AtomicUsize,
+    rebuilds_stopped: AtomicBool,
     slots: Vec<Slot>,
 }
 
@@ -130,6 +131,7 @@ impl GuestPool {
             replaced_guest_warnings: WarningRateLimit::default(),
             skipped_plugin_warnings: WarningRateLimit::default(),
             next: AtomicUsize::new(0),
+            rebuilds_stopped: AtomicBool::new(false),
             slots: (0..conf.slot_count).map(|_| Slot::default()).collect(),
         };
         for index in 0..pool.slots.len() {
@@ -229,6 +231,18 @@ impl GuestPool {
         drop(guard);
         self.rebuild(index, Some(err));
         true
+    }
+
+    /// Leave a slot that loses its guest empty from now on.
+    pub(crate) fn stop_rebuilds(&self) {
+        self.rebuilds_stopped.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn guest_addresses(&self) -> Vec<GuestAddress> {
+        let slots = self.slots.iter();
+        slots
+            .filter_map(|slot| slot.guest.lock().as_ref().map(Loaded::address))
+            .collect()
     }
 
     pub(crate) fn opened(&self, index: usize) {

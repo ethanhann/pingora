@@ -23,12 +23,14 @@
 //! without locks.
 
 mod callback_loop;
+mod ending;
 mod queue_registrations;
 mod root_callouts;
 mod root_stream;
 mod tick_schedule;
 mod work;
 
+pub(crate) use ending::EndProgress;
 pub(crate) use root_stream::{RootCallbackPluginState, RootStream};
 
 use crate::runtime::pool::events::{RootCallbackEvent, RootCallbackSender};
@@ -41,6 +43,7 @@ use std::sync::{mpsc, Arc, Weak};
 use std::thread;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::sync::watch;
 
 // Thread names are limited to 15 bytes on Linux
 const THREAD_NAME: &str = "wasm-root-calls";
@@ -66,6 +69,18 @@ impl RootCallbackThread {
 
     pub(crate) fn sender(&self) -> RootCallbackSender {
         self.sender.clone()
+    }
+
+    /// Tell the thread to end the plugins, and return a receiver of its progress.
+    pub(crate) fn send_end(&self, waiting_for: Vec<Arc<str>>) -> watch::Receiver<EndProgress> {
+        let progress = EndProgress {
+            finished: false,
+            waiting_for,
+        };
+        let (sender, receiver) = watch::channel(progress);
+        // A thread that has already stopped drops the sender, which the receiver sees as the end
+        let _ = self.sender.send(RootCallbackEvent::End(sender));
+        receiver
     }
 
     pub(crate) fn start(&self, runtime: Weak<RuntimeInner>) -> Result<()> {
@@ -131,8 +146,12 @@ fn run_root_callback_loop(
         };
         let entered = tokio_runtime.enter();
         callback_loop.run_due_work(&runtime);
+        let ended = callback_loop.advance_end(&runtime);
         drop(entered);
         drop(runtime);
+        if ended {
+            return;
+        }
     }
 }
 

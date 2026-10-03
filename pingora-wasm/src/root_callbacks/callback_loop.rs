@@ -14,6 +14,7 @@
 
 //! Root callback loop state
 
+use super::ending::Ending;
 use super::queue_registrations::QueueRegistrations;
 use super::root_callouts::{FinishedCallout, RootCallbackCallouts};
 use super::tick_schedule::TickSchedule;
@@ -37,6 +38,8 @@ pub(super) struct RootCallbackLoop {
     callouts_to_start: Vec<(GuestAddress, ContextId, AcceptedCallout)>,
     ready_work: VecDeque<Work>,
     retries: Vec<(Instant, Work)>,
+    /// Set once the runtime is ending. Ticks and queue wakes stop from then on.
+    pub(super) ending: Option<Ending>,
 }
 
 impl RootCallbackLoop {
@@ -74,7 +77,23 @@ impl RootCallbackLoop {
     }
 
     fn accept_event(&mut self, event: RootCallbackEvent) {
+        let is_tick_or_queue = matches!(
+            event,
+            RootCallbackEvent::TicksOrQueuesChanged { .. } | RootCallbackEvent::QueueItem(_)
+        );
+        if is_tick_or_queue && self.ending.is_some() {
+            return;
+        }
         match event {
+            RootCallbackEvent::End(progress) => {
+                self.ticks = TickSchedule::default();
+                self.queues = QueueRegistrations::default();
+                let is_tick_or_queue =
+                    |work: &Work| matches!(work, Work::Tick(_) | Work::QueueItem(_));
+                self.ready_work.retain(|work| !is_tick_or_queue(work));
+                self.retries.retain(|(_, work)| !is_tick_or_queue(work));
+                self.ending.get_or_insert_with(|| Ending::new(progress));
+            }
             RootCallbackEvent::TicksOrQueuesChanged {
                 address,
                 root,
@@ -133,6 +152,10 @@ impl RootCallbackLoop {
                 needs_on_log,
             }),
         }
+    }
+
+    pub(super) fn retries_are_empty(&self) -> bool {
+        self.retries.is_empty()
     }
 
     pub(super) fn retry_later(&mut self, work: Work) {

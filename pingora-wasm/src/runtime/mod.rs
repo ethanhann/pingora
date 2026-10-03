@@ -46,6 +46,7 @@ use proxy_wasm_host::{Engine, EngineConfig};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 use ticker::{with_ticker, Ticker};
 
 /// The compiled plugins of a proxy and the guests that run them.
@@ -82,6 +83,7 @@ pub(crate) struct RuntimeInner {
     pub(crate) fixed_properties: Arc<WasmProperties>,
     pub(crate) metric_sink: Arc<dyn WasmMetricSink>,
     names: HashMap<String, usize>,
+    shutdown_wait_limit: Duration,
 }
 
 impl WasmRuntime {
@@ -152,6 +154,12 @@ impl WasmRuntime {
             services.max_callouts_in_flight,
         )?;
         let names = checked_plugin_indexes(&plugins)?;
+        let shutdown_wait_limit = services.shutdown_wait_limit;
+        if shutdown_wait_limit.is_zero() {
+            return Err(invalid_conf(
+                "invalid shutdown_wait_limit 0s in wasm services, must be greater than zero",
+            ));
+        }
         let engine = EngineConfig::new()
             .with_external_ticks(true)
             .build()
@@ -193,6 +201,7 @@ impl WasmRuntime {
                 fixed_properties,
                 metric_sink,
                 names,
+                shutdown_wait_limit,
             }),
         })
     }

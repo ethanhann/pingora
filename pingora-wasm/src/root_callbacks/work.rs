@@ -34,6 +34,8 @@ pub(super) enum Work {
         context: ContextId,
         needs_on_log: bool,
     },
+    EndRoot(GuestAddress),
+    DeleteRoot(GuestAddress),
 }
 
 pub(super) enum WorkOutcome {
@@ -75,6 +77,8 @@ impl RootCallbackLoop {
                 context,
                 needs_on_log,
             } => self.end_held_context(runtime, *address, *context, *needs_on_log),
+            Work::EndRoot(address) => self.end_root(runtime, *address),
+            Work::DeleteRoot(address) => self.delete_root(runtime, *address),
         }
     }
 
@@ -163,6 +167,25 @@ impl RootCallbackLoop {
             });
         }
         WorkOutcome::Done
+    }
+
+    fn end_root(&mut self, runtime: &RuntimeInner, address: GuestAddress) -> WorkOutcome {
+        let context = GuestCallContext::RootOfGuest;
+        let done = self.call_guest(runtime, address, context, "proxy_on_done", {
+            |scope, root| scope.on_done(root)
+        });
+        if let (GuestCallOutcome::Failed, Some(ending)) = (&done, &mut self.ending) {
+            ending.failed_roots.push(address);
+        }
+        done.work_outcome()
+    }
+
+    fn delete_root(&mut self, runtime: &RuntimeInner, address: GuestAddress) -> WorkOutcome {
+        let context = GuestCallContext::RootOfGuest;
+        let deleted = self.call_guest(runtime, address, context, "proxy_on_delete", {
+            |scope, root| scope.on_delete(root)
+        });
+        deleted.work_outcome()
     }
 
     fn call_guest<R>(

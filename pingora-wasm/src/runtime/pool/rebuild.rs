@@ -37,6 +37,9 @@ impl GuestPool {
     /// `failure` is the error that emptied the slot when the rebuild immediately follows it, and
     /// is only used for logging.
     pub(super) fn rebuild(&self, index: usize, failure: Option<&GuestError>) {
+        if self.rebuilds_stopped.load(Ordering::Relaxed) {
+            return;
+        }
         let slot = &self.slots[index];
         let name = &self.name;
         match self.start_guest(index) {

@@ -14,7 +14,7 @@
 
 //! Loaded guest
 
-use super::events::{RootCallbackEvent, RootCallbackLink};
+use super::events::{GuestAddress, RootCallbackEvent, RootCallbackLink};
 use crate::callout::{AcceptedCallout, GuestCalloutService};
 use crate::root_callbacks::RootStream;
 use proxy_wasm_host::abi::v0_2_1::{CallScope, ContextId, ContextState, Guest};
@@ -60,6 +60,10 @@ impl Loaded {
             held_contexts: Vec::new(),
             held_context_count,
         }
+    }
+
+    pub(crate) fn address(&self) -> GuestAddress {
+        self.root_callback_link.address
     }
 
     /// Report the effects of the last guest call to the root callback thread.

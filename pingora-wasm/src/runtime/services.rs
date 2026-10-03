@@ -29,10 +29,12 @@ use proxy_wasm_host::abi::v0_2_1::{Callback, LogSink};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 
 const MAX_CALLOUTS_IN_FLIGHT: usize = 1024;
+const SHUTDOWN_WAIT_LIMIT: Duration = Duration::from_secs(5);
 
 /// The services your proxy provides to the plugins of a [WasmRuntime](crate::WasmRuntime).
 ///
@@ -78,6 +80,17 @@ pub struct WasmServices {
     /// succeeds, but the plugin reads the fixed value back.
     /// [WasmCtx::guest_property](crate::WasmCtx::guest_property) returns what the plugin wrote.
     pub fixed_properties: WasmProperties,
+    /// How long the end of a runtime waits for its plugins to finish. Default 5 seconds.
+    ///
+    /// A runtime ends when the server shuts down gracefully or when a reload replaces it. Once
+    /// its requests have finished, each plugin gets `proxy_on_done` on its root context. A
+    /// plugin that returns `false`, e.g. to send what it collected, has this long to call
+    /// `proxy_done`, and so do the contexts it kept after their requests ended.
+    ///
+    /// Pingora stops the server when its grace period ends, so set `grace_period_seconds` longer
+    /// than your requests need plus this limit. A fast shutdown gives no time. The limit must be
+    /// greater than zero.
+    pub shutdown_wait_limit: Duration,
 }
 
 impl Default for WasmServices {
@@ -89,6 +102,7 @@ impl Default for WasmServices {
             max_callouts_in_flight: MAX_CALLOUTS_IN_FLIGHT,
             metric_sink: Arc::new(NoMetricSink),
             fixed_properties: WasmProperties::new(),
+            shutdown_wait_limit: SHUTDOWN_WAIT_LIMIT,
         }
     }
 }
@@ -97,6 +111,7 @@ impl fmt::Debug for WasmServices {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WasmServices")
             .field("max_callouts_in_flight", &self.max_callouts_in_flight)
+            .field("shutdown_wait_limit", &self.shutdown_wait_limit)
             .finish_non_exhaustive()
     }
 }
