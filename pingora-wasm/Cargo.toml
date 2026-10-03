@@ -23,7 +23,8 @@ pingora-proxy = { version = "0.9.0", path = "../pingora-proxy", default-features
 pingora-http = { version = "0.9.0", path = "../pingora-http" }
 pingora-error = { version = "0.9.0", path = "../pingora-error" }
 pingora-timeout = { version = "0.9.0", path = "../pingora-timeout" }
-proxy-wasm-host = "0.1"
+proxy-wasm-host = "0.2"
+arc-swap = "1"
 async-trait = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
