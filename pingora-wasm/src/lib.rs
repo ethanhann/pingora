@@ -33,6 +33,12 @@
 //! [WasmPluginConf::response_trailers] for that plugin. Pingora does not read request trailers,
 //! so plugins do not receive them.
 //!
+//! [WasmPlugins] exists to tie your plugins to the life of the server. It runs as a Pingora
+//! background service, so the plugins start after the server forks and end at a graceful
+//! shutdown, and a reload replaces the runtime while requests in progress finish on the old one.
+//! Create each [WasmCtx] through a [WasmChainHandle] from [WasmPlugins::chain]. A handle always
+//! uses the current runtime, so a request that starts after a reload uses the new plugins.
+//!
 //! A proxy can also:
 //!
 //! - Write the response that a plugin sends itself, for example a 403. See [RequestOutcome].
