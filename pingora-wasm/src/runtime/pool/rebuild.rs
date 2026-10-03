@@ -17,19 +17,27 @@
 use super::{install_started_guest, GuestPool};
 use log::{error, warn};
 use proxy_wasm_host::abi::v0_2_1::GuestError;
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-const REBUILD_BACKOFF: Duration = Duration::from_secs(1);
+// `Instant + Duration` panics on overflow
+const LONGEST_REBUILD_WAIT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 impl GuestPool {
     pub(super) fn rebuild_due(&self, index: usize) -> bool {
         let slot = &self.slots[index];
-        let due = slot
-            .failed_at
-            .lock()
-            .is_none_or(|at| at.elapsed() >= REBUILD_BACKOFF);
+        let due = Instant::now() >= *slot.next_build.lock();
         due && slot.guest.try_lock().is_some_and(|guard| guard.is_none())
+    }
+
+    /// Return when a slot built now may be built again, after 1 to 1.5 rebuild intervals.
+    pub(super) fn next_build_time(&self) -> Instant {
+        let fraction = RandomState::new().build_hasher().finish() % 1000;
+        let jitter = self.rebuild_interval.mul_f64(fraction as f64 / 2000.0);
+        let wait = self.rebuild_interval.saturating_add(jitter);
+        Instant::now() + wait.min(LONGEST_REBUILD_WAIT)
     }
 
     /// Start a new guest in an empty slot.
@@ -42,6 +50,7 @@ impl GuestPool {
         }
         let slot = &self.slots[index];
         let name = &self.name;
+        *slot.next_build.lock() = self.next_build_time();
         match self.start_guest(index) {
             Ok(started) => {
                 let mut guard = slot.guest.lock();
@@ -49,7 +58,6 @@ impl GuestPool {
                     slot.open.store(0, Ordering::Relaxed);
                     slot.held.store(0, Ordering::Relaxed);
                     install_started_guest(&mut guard, started);
-                    *slot.failed_at.lock() = None;
                     drop(guard);
                     self.metric_sink.guest_replaced(name);
                     let warnings = &self.replaced_guest_warnings;
@@ -68,7 +76,6 @@ impl GuestPool {
                 }
             }
             Err(e) => {
-                *slot.failed_at.lock() = Some(Instant::now());
                 match failure {
                     Some(failure) => error!(
                         "wasm plugin {name}: guest in slot {index} lost after failure: {failure}, rebuild failed: {e}"

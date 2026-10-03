@@ -44,6 +44,7 @@ struct PluginConfInFile {
     callout_timeout_limit_seconds: Option<u64>,
     callout_wait_limit_seconds: Option<u64>,
     callout_response_limit: Option<usize>,
+    rebuild_interval_seconds: Option<u64>,
     fail_policy: Option<FailPolicy>,
     #[serde(default)]
     limits: LimitsInFile,
@@ -141,7 +142,7 @@ impl From<PluginConfInFile> for WasmPluginConf {
             conf.log_level = log_level.into();
         }
         if let Some(slots) = file.slots {
-            conf.slots = slots;
+            conf.slots = Some(slots);
         }
         if let Some(request_body) = file.request_body {
             conf.request_body = request_body;
@@ -166,6 +167,9 @@ impl From<PluginConfInFile> for WasmPluginConf {
         }
         if let Some(limit) = file.callout_response_limit {
             conf.callout_response_limit = limit;
+        }
+        if let Some(seconds) = file.rebuild_interval_seconds {
+            conf.rebuild_interval = Duration::from_secs(seconds);
         }
         if let Some(fail_policy) = file.fail_policy {
             conf.fail_policy = fail_policy;
@@ -215,6 +219,7 @@ response_body_limit: 20
 callout_timeout_limit_seconds: 3
 callout_wait_limit_seconds: 5
 callout_response_limit: 30
+rebuild_interval_seconds: 7
 fail_policy: open
 "#,
         );
@@ -223,13 +228,14 @@ fail_policy: open
         assert_eq!(read.vm_id, "shared");
         assert_eq!(read.configuration, br#"{"mode": "strict"}"#);
         assert_eq!(read.vm_configuration, b"vm");
-        assert_eq!(read.slots, 4);
+        assert_eq!(read.slots, Some(4));
         assert!(read.request_body && read.response_body && read.response_trailers);
         assert_eq!(read.request_body_limit, 10);
         assert_eq!(read.response_body_limit, 20);
         assert_eq!(read.callout_timeout_limit, Duration::from_secs(3));
         assert_eq!(read.callout_wait_limit, Duration::from_secs(5));
         assert_eq!(read.callout_response_limit, 30);
+        assert_eq!(read.rebuild_interval, Duration::from_secs(7));
         assert_eq!(read.fail_policy, FailPolicy::Open);
     }
 

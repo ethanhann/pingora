@@ -35,6 +35,7 @@ use tokio::sync::Semaphore;
 
 const MAX_CALLOUTS_IN_FLIGHT: usize = 1024;
 const SHUTDOWN_WAIT_LIMIT: Duration = Duration::from_secs(5);
+const THREADS: usize = 1;
 
 /// The services your proxy provides to the plugins of a [WasmRuntime](crate::WasmRuntime).
 ///
@@ -60,7 +61,8 @@ pub struct WasmServices {
     ///
     /// Callouts a plugin sends outside of a request, e.g. from `proxy_on_tick`, do not use this
     /// connector. They are sent through a separate connector with the default options. If a peer
-    /// needs a client certificate or its own CA, set them on the [HttpPeer](pingora_core::upstreams::peer::HttpPeer) that
+    /// needs a client certificate or its own CA, set them on the
+    /// [HttpPeer](pingora_core::upstreams::peer::HttpPeer) that
     /// [CalloutUpstreams::callout_peer] returns, which both kinds of callouts use.
     pub callout_connector: Option<Arc<Connector>>,
     /// The maximum number of callouts the runtime will have in flight at once. Default 1024.
@@ -84,15 +86,21 @@ pub struct WasmServices {
     pub fixed_properties: WasmProperties,
     /// How long the end of a runtime waits for its plugins to finish. Default 5 seconds.
     ///
-    /// A runtime ends when the server shuts down gracefully or when a reload replaces it. Once
-    /// its requests have finished, each plugin gets `proxy_on_done` on its root context. A
-    /// plugin that returns `false`, e.g. to send what it collected, has this long to call
-    /// `proxy_done`, and so do the contexts it kept after their requests ended.
+    /// A runtime ends at a graceful shutdown and when
+    /// [WasmPlugins::replace](crate::WasmPlugins::replace) replaces it. Once its requests have
+    /// finished, each plugin gets `proxy_on_done` on its root context. A plugin that returns
+    /// `false`, or that still holds contexts from finished requests, has this long to call
+    /// `proxy_done`.
     ///
-    /// Pingora stops the server when its grace period ends, so set `grace_period_seconds` longer
-    /// than your requests need plus this limit. A fast shutdown gives no time. The limit must be
-    /// greater than zero.
+    /// Set Pingora's `grace_period_seconds` longer than your requests need plus this limit. At a
+    /// fast shutdown, plugins do not get `proxy_on_done`. Must be greater than zero.
     pub shutdown_wait_limit: Duration,
+    /// The thread count of the services that run the plugins, e.g. `server.configuration.threads`.
+    /// Default 1, as Pingora's `threads`.
+    ///
+    /// A plugin that does not set [slots](crate::WasmPluginConf::slots) runs one guest for each
+    /// thread. Must be at least 1.
+    pub threads: usize,
 }
 
 impl Default for WasmServices {
@@ -105,6 +113,7 @@ impl Default for WasmServices {
             metric_sink: Arc::new(NoMetricSink),
             fixed_properties: WasmProperties::new(),
             shutdown_wait_limit: SHUTDOWN_WAIT_LIMIT,
+            threads: THREADS,
         }
     }
 }
@@ -114,6 +123,7 @@ impl fmt::Debug for WasmServices {
         f.debug_struct("WasmServices")
             .field("max_callouts_in_flight", &self.max_callouts_in_flight)
             .field("shutdown_wait_limit", &self.shutdown_wait_limit)
+            .field("threads", &self.threads)
             .finish_non_exhaustive()
     }
 }

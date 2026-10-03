@@ -107,7 +107,7 @@ fn count_lines(line: &str) -> usize {
 }
 
 #[tokio::test]
-async fn plugins_tick_before_first_request_and_shutdown_after_reload_ends_new_runtime() {
+async fn plugins_tick_before_requests_and_end_at_reload_and_shutdown() {
     let old = guests::root_lifecycle_logger("reload-old", "tick", "root done");
     let server = LifecycleServer::start(6421, logging_runtime(old), "reload-old").await;
     let old_ticked = eventually(|| count_lines("reload-old: tick") > 0).await;
@@ -133,8 +133,8 @@ async fn plugins_tick_before_first_request_and_shutdown_after_reload_ends_new_ru
     assert_eq!(count_lines("reload-old: root done"), 1);
 }
 
-/// Send requests one after another until `stop` is set, and return the reload generation at
-/// the start of each request with its status, or 0 for a request that failed.
+/// Send requests one after another until `stop` is set. Return each request's status with the
+/// reload generation it started in, with status 0 for a request that failed.
 async fn send_until_stopped(
     port: u16,
     origin: u16,
@@ -156,7 +156,7 @@ async fn send_until_stopped(
 }
 
 #[tokio::test]
-async fn runtime_swapped_under_callout_traffic_fails_no_request() {
+async fn replace_under_callout_traffic_fails_no_request() {
     let callout_origins = CalloutOriginPerPlugin::start(&[("swap-auth", Some("0"))]);
     let connector = Arc::new(Connector::new(None));
     let metric_sink = Arc::new(PrometheusMetricSink::new(Registry::new()).unwrap());
@@ -166,7 +166,7 @@ async fn runtime_swapped_under_callout_traffic_fails_no_request() {
         services.callout_connector = Some(connector.clone());
         services.metric_sink = metric_sink.clone();
         let mut auth = WasmPluginConf::new("swap-auth", fixture("sdk-http-auth-random"));
-        auth.slots = 2;
+        auth.slots = Some(2);
         let runtime = WasmRuntime::new_with_services(vec![auth], services).unwrap();
         let chain = runtime.chain(&["swap-auth"]).unwrap();
         (runtime, chain)

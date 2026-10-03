@@ -26,7 +26,6 @@ use pingora_proxy::{ProxyHttp, Session};
 use pingora_wasm::{write_plugin_response, RequestOutcome, WasmChain, WasmChainHandle, WasmCtx};
 use std::time::Duration;
 
-/// A chain to create each request's `WasmCtx` from.
 pub trait NewWasmCtx: Send + Sync + 'static {
     fn new_wasm_ctx(&self) -> WasmCtx;
 }

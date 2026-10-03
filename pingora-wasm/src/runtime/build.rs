@@ -70,6 +70,7 @@ pub(super) struct PoolInputs<'a> {
     pub(super) metric_sink: Arc<dyn WasmMetricSink>,
     pub(super) fixed_properties: Arc<WasmProperties>,
     pub(super) root_callback_thread: &'a RootCallbackThread,
+    pub(super) threads: usize,
 }
 
 pub(super) fn build_pool(
@@ -104,9 +105,10 @@ pub(super) fn build_pool(
         name: plugin.name.clone(),
         spec,
         plugin_config: plugin.plugin_config(),
-        slot_count: plugin.slots,
+        slot_count: plugin.slots.unwrap_or(inputs.threads),
         phases: plugin.phase_conf(),
         fail_policy: plugin.fail_policy,
+        rebuild_interval: plugin.rebuild_interval,
         callout_conf: plugin.callout_conf(inputs.upstreams.clone()),
         metric_sink: inputs.metric_sink.clone(),
         root_callback_plugin: Arc::new(root_callback_plugin),

@@ -42,7 +42,8 @@ pub(crate) fn fixture(name: &str) -> PathBuf {
 
 pub(crate) fn plugin(name: &str, path: PathBuf, slots: usize) -> WasmPluginConf {
     let mut conf = WasmPluginConf::new(name, path);
-    conf.slots = slots;
+    conf.slots = Some(slots);
+    conf.rebuild_interval = std::time::Duration::from_nanos(1);
     conf
 }
 

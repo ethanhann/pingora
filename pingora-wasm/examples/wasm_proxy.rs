@@ -45,6 +45,14 @@ const DEFAULT_CHAIN: &str = "default";
 
 pub struct PluginProxy {
     chain: WasmChainHandle,
+    upstream: String,
+}
+
+/// The settings of this example in the file given with --conf.
+#[derive(Default, serde::Deserialize)]
+struct ExampleConf {
+    /// The address of the upstream, e.g. `127.0.0.1:8080`. Default `httpbin.org:80`.
+    upstream: Option<String>,
 }
 
 #[async_trait]
@@ -71,7 +79,7 @@ impl ProxyHttp for PluginProxy {
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         ctx.upstream_attempt();
-        let peer = HttpPeer::new(("httpbin.org", 80), false, "httpbin.org".into());
+        let peer = HttpPeer::new(self.upstream.as_str(), false, String::new());
         Ok(Box::new(peer))
     }
 
@@ -95,7 +103,11 @@ impl ProxyHttp for PluginProxy {
         upstream_request: &mut RequestHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
-        upstream_request.insert_header("Host", "httpbin.org")
+        let host = self
+            .upstream
+            .rsplit_once(':')
+            .map_or(&*self.upstream, |(host, _)| host);
+        upstream_request.insert_header("Host", host)
     }
 
     async fn request_body_filter(
@@ -165,7 +177,6 @@ impl SharedServices {
 
 type BuildPlugins = Box<dyn Fn() -> Result<(WasmRuntime, WasmChain), String> + Send + Sync>;
 
-/// Reloads the plugins when the process receives SIGHUP.
 struct ReloadOnHangup {
     plugins: Arc<WasmPlugins>,
     build: BuildPlugins,
@@ -200,7 +211,7 @@ impl BackgroundService for ReloadOnHangup {
 /// Build the runtime and a chain of the plugins listed on the command line.
 fn runtime_and_chain_from_args(
     args: &[String],
-    slots: usize,
+    threads: usize,
     shared: &SharedServices,
 ) -> Result<(WasmRuntime, WasmChain), String> {
     // Body phases cost a plugin call per chunk, so only enable them for plugins that need the body
@@ -226,7 +237,6 @@ fn runtime_and_chain_from_args(
         let path = PathBuf::from(arg);
         let name = path.file_stem().unwrap().to_string_lossy();
         let mut plugin = WasmPluginConf::new(name, &path);
-        plugin.slots = slots;
         plugin.request_body = body;
         plugin.response_body = body;
         plugin.response_trailers = body;
@@ -236,6 +246,7 @@ fn runtime_and_chain_from_args(
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let mut services = WasmServices::default();
     services.callout_upstreams = Arc::new(upstreams);
+    services.threads = threads;
     shared.add_to(&mut services);
     let runtime = WasmRuntime::new_with_services(plugins, services).map_err(|e| e.to_string())?;
     let chain = runtime.chain(&names).map_err(|e| e.to_string())?;
@@ -318,7 +329,7 @@ fn main() {
     let mut my_server = Server::new(Some(opt)).unwrap();
     my_server.bootstrap();
 
-    let slots = my_server.configuration.threads;
+    let threads = my_server.configuration.threads;
     if args.is_empty() {
         args.push(DEFAULT_PLUGIN.into());
     }
@@ -326,9 +337,17 @@ fn main() {
         connector: Arc::new(Connector::new(None)),
         metric_sink: prometheus_sink(),
     };
+    let upstream = conf_path
+        .as_ref()
+        .map(|path| {
+            let yaml = std::fs::read_to_string(path).unwrap_or_default();
+            serde_yaml::from_str::<ExampleConf>(&yaml).unwrap_or_default()
+        })
+        .and_then(|conf| conf.upstream)
+        .unwrap_or_else(|| "httpbin.org:80".to_string());
     let build: BuildPlugins = match conf_path {
         Some(path) => Box::new(move || runtime_and_chain_from_conf(&path, &shared)),
-        None => Box::new(move || runtime_and_chain_from_args(&args, slots, &shared)),
+        None => Box::new(move || runtime_and_chain_from_args(&args, threads, &shared)),
     };
     let (runtime, chain) = build().unwrap_or_else(|e| exit_with(e));
     let plugins = WasmPlugins::new(runtime, [(DEFAULT_CHAIN, chain)]).unwrap();
@@ -337,8 +356,10 @@ fn main() {
     let chain = plugins.chain(DEFAULT_CHAIN).unwrap();
     let reload_service = background_service("wasm reload", ReloadOnHangup { plugins, build });
 
-    let mut my_proxy =
-        pingora_proxy::http_proxy_service(&my_server.configuration, PluginProxy { chain });
+    let mut my_proxy = pingora_proxy::http_proxy_service(
+        &my_server.configuration,
+        PluginProxy { chain, upstream },
+    );
     my_proxy.add_tcp("127.0.0.1:6190");
 
     let mut metrics_service = pingora_prometheus::prometheus_http_service();

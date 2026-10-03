@@ -34,12 +34,11 @@ use tokio::runtime::Handle;
 /// Add it to your server with `background_service`, and create each [WasmCtx] through a
 /// [WasmChainHandle] from [WasmPlugins::chain]. As a background service it starts the plugins
 /// after Pingora has forked, so that plugins get their ticks before the first request, and it
-/// ends the plugins at a graceful shutdown. See [WasmServices::shutdown_wait_limit](crate::WasmServices::shutdown_wait_limit).
+/// ends the plugins at a graceful shutdown. See
+/// [shutdown_wait_limit](crate::WasmServices::shutdown_wait_limit).
 ///
 /// To reload plugins, build a new runtime and pass it with its chains to
-/// [WasmPlugins::replace]. New requests use the new runtime at once, and requests that started
-/// on the old runtime finish on it before it ends. The new runtime starts with empty shared
-/// data and queues.
+/// [WasmPlugins::replace]. The new runtime starts with empty shared data and queues.
 ///
 /// ```no_run
 /// # use pingora_wasm::{WasmPluginConf, WasmPlugins, WasmRuntime};
@@ -66,7 +65,7 @@ struct CurrentPlugins {
     chains: Vec<WasmChain>,
 }
 
-/// A chain of [WasmPlugins] that follows each [replace](WasmPlugins::replace).
+/// A chain of [WasmPlugins] that always uses the current runtime.
 #[derive(Clone)]
 pub struct WasmChainHandle {
     current: Arc<ArcSwap<CurrentPlugins>>,
@@ -130,13 +129,14 @@ impl WasmPlugins {
 
     /// Replace the runtime and its chains, e.g. to reload plugins.
     ///
-    /// The chains must have the same names as the chains given to [WasmPlugins::new]. New
-    /// requests use the new runtime once this returns. The old runtime ends in a task of its
-    /// own after its requests have finished, as it would at a shutdown. Call this from inside a
-    /// tokio runtime, such as a Pingora service.
+    /// Pass one chain for each name given to [WasmPlugins::new], each built from `runtime`. New
+    /// requests use the new runtime once this returns. The old runtime ends in the background
+    /// after its requests have finished, as it would at a shutdown. Call this from inside a tokio
+    /// runtime, such as a Pingora service.
     ///
-    /// Returns [ERR_INVALID_CONF](crate::ERR_INVALID_CONF) if the names are not the same, or for
-    /// any reason [WasmPlugins::new] does. In that case the old runtime stays in use.
+    /// If this returns an error, the old runtime stays in use. Returns
+    /// [ERR_INVALID_CONF](crate::ERR_INVALID_CONF) if the names are not the same, or for any
+    /// reason [WasmPlugins::new] does.
     pub fn replace<N: Into<String>>(
         &self,
         runtime: WasmRuntime,
@@ -254,7 +254,6 @@ mod tests {
     };
     use crate::{WasmServices, ERR_INVALID_CONF};
 
-    /// A guest that logs `root done` when its root context gets `proxy_on_done`.
     fn logs_root_done() -> Wat {
         Wat {
             data_segments: r#"(data (i32.const 700) "root done")"#,

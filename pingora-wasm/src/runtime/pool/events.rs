@@ -61,8 +61,8 @@ pub(crate) enum RootCallbackEvent {
         context: ContextId,
         needs_on_log: bool,
     },
-    /// The runtime has no request left. The thread ends the plugins and sends its progress on
-    /// the channel.
+    /// The runtime has no requests left, so the root callback thread ends its plugins and reports
+    /// its progress on this channel.
     End(watch::Sender<EndProgress>),
 }
 
@@ -88,8 +88,8 @@ impl RootCallbackLink {
     }
 
     pub(crate) fn send(&self, event: RootCallbackEvent) {
-        // The receiver is only dropped when the runtime is dropped, and then the event is not
-        // needed
+        // The receiver is only dropped when the runtime is dropped or has ended, and then the event
+        // is not needed
         let _ = self.sender.send(event);
     }
 }

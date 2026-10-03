@@ -37,7 +37,7 @@ use pingora_error::Result;
 use proxy_wasm_host::abi::v0_2_1::{Callback, GuestError, GuestId, GuestSpec, PluginConfig};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use warning_rate_limit::WarningRateLimit;
 
 #[derive(Debug, Clone, Copy)]
@@ -67,12 +67,22 @@ impl PluginPhases {
 
 pub(crate) type SlotGuard<'a> = MutexGuard<'a, Option<Loaded>>;
 
-#[derive(Default)]
 struct Slot {
     guest: Mutex<Option<Loaded>>,
     open: AtomicUsize,
     held: Arc<AtomicUsize>,
-    failed_at: Mutex<Option<Instant>>,
+    next_build: Mutex<Instant>,
+}
+
+impl Slot {
+    fn new() -> Self {
+        Slot {
+            guest: Mutex::new(None),
+            open: AtomicUsize::new(0),
+            held: Arc::new(AtomicUsize::new(0)),
+            next_build: Mutex::new(Instant::now()),
+        }
+    }
 }
 
 pub(crate) enum SlotLockAttempt<'a> {
@@ -90,6 +100,7 @@ pub(crate) struct GuestPoolConf {
     pub(crate) slot_count: usize,
     pub(crate) phases: PluginPhases,
     pub(crate) fail_policy: FailPolicy,
+    pub(crate) rebuild_interval: Duration,
     pub(crate) callout_conf: PluginCalloutConf,
     pub(crate) metric_sink: Arc<dyn WasmMetricSink>,
     pub(crate) root_callback_plugin: Arc<RootCallbackPluginState>,
@@ -101,6 +112,7 @@ pub(crate) struct GuestPool {
     pub(crate) phases: PluginPhases,
     pub(crate) fail_policy: FailPolicy,
     pub(crate) callout_conf: Arc<PluginCalloutConf>,
+    rebuild_interval: Duration,
     pool_index: usize,
     spec: GuestSpec,
     plugin: PluginConfig,
@@ -121,6 +133,7 @@ impl GuestPool {
             name: conf.name.into(),
             phases,
             fail_policy: conf.fail_policy,
+            rebuild_interval: conf.rebuild_interval,
             callout_conf: Arc::new(conf.callout_conf),
             pool_index: conf.pool_index,
             spec: conf.spec,
@@ -132,12 +145,13 @@ impl GuestPool {
             skipped_plugin_warnings: WarningRateLimit::default(),
             next: AtomicUsize::new(0),
             rebuilds_stopped: AtomicBool::new(false),
-            slots: (0..conf.slot_count).map(|_| Slot::default()).collect(),
+            slots: (0..conf.slot_count).map(|_| Slot::new()).collect(),
         };
         for index in 0..pool.slots.len() {
             let started = pool.start_guest(index)?;
             let mut guard = pool.slots[index].guest.lock();
             install_started_guest(&mut guard, started);
+            *pool.slots[index].next_build.lock() = pool.next_build_time();
         }
         // A phase is only worth running if the plugin exports its callback
         if let Some(loaded) = pool.slots[0].guest.lock().as_ref() {
@@ -169,7 +183,7 @@ impl GuestPool {
                 }
             }
         }
-        // Failing that, one slot that lost its guest is rebuilt if its backoff has elapsed
+        // Failing that, one slot that lost its guest is rebuilt if its rebuild interval has passed
         if let Some(index) = order().find(|index| self.rebuild_due(*index)) {
             self.rebuild(index, None);
             if let Some(guard) = self.slots[index].guest.try_lock() {
@@ -208,8 +222,8 @@ impl GuestPool {
 
     /// Replace the guest in a slot if `err` left it unusable.
     ///
-    /// Returns `true` if the guest was removed from its slot, even when building its
-    /// replacement failed.
+    /// Returns `true` if the guest was removed from its slot, even when its replacement failed
+    /// or waits for the rebuild interval.
     pub(crate) fn replace_if_unusable(
         &self,
         index: usize,
@@ -229,7 +243,9 @@ impl GuestPool {
         self.slots[index].open.store(0, Ordering::Relaxed);
         self.slots[index].held.store(0, Ordering::Relaxed);
         drop(guard);
-        self.rebuild(index, Some(err));
+        if self.rebuild_due(index) {
+            self.rebuild(index, Some(err));
+        }
         true
     }
 
@@ -302,13 +318,13 @@ mod tests {
 
         pub(crate) fn fail_slot(&self, index: usize) {
             self.slots[index].guest.lock().take();
-            *self.slots[index].failed_at.lock() = Some(Instant::now());
+            *self.slots[index].next_build.lock() = Instant::now() + Duration::from_secs(3600);
         }
     }
 
     use crate::test_support::{
-        body_plugin, crate_log_lines_with, fixture, plugin, record_crate_logs, RecordedFailures,
-        Wat, CONTINUE, HOLD,
+        body_plugin, crate_log_lines_with, fixture, plugin, record_crate_logs, session, wat_plugin,
+        RecordedFailures, Wat, CONTINUE, GET, HOLD, TRAP,
     };
     use crate::{WasmRuntime, WasmServices};
     use std::thread;
@@ -381,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn pick_waits_for_busy_slot_during_rebuild_backoff() {
+    fn pick_waits_for_busy_slot_while_empty_slot_waits_to_rebuild() {
         let runtime =
             WasmRuntime::new(vec![plugin("a", fixture("add-request-header"), 2)]).unwrap();
         let pool = &runtime.inner.pools[0];
@@ -397,6 +413,33 @@ mod tests {
 
         assert_eq!(picked, Some(1));
         assert!(pool.lock_slot(0).is_none());
+    }
+
+    #[tokio::test]
+    async fn lost_guest_waits_for_rebuild_interval() {
+        let cases = [(Duration::ZERO, false), (Duration::from_millis(400), true)];
+
+        for (wait, rebuilt) in cases {
+            let reports = Arc::new(RecordedFailures::default());
+            let mut conf = wat_plugin("trap-early", TRAP);
+            conf.rebuild_interval = Duration::from_millis(200);
+            let services = WasmServices {
+                metric_sink: reports.clone(),
+                ..WasmServices::default()
+            };
+            let runtime = WasmRuntime::new_with_services(vec![conf], services).unwrap();
+            let mut ctx = runtime.chain(&["a"]).unwrap().new_ctx();
+            let (mut session, _client) = session(GET).await;
+            let trapped = ctx.request_filter(&mut session).await;
+            tokio::time::sleep(wait).await;
+
+            let picked = runtime.inner.pools[0].pick().map(|(slot, _)| slot);
+
+            assert!(trapped.is_err(), "{wait:?}");
+            assert_eq!(picked.is_some(), rebuilt, "{wait:?}");
+            let replaced = reports.replaced_guests().len();
+            assert_eq!(replaced, usize::from(rebuilt), "{wait:?}");
+        }
     }
 
     #[test]

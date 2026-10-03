@@ -41,16 +41,19 @@ const MICROSECOND: u64 = 1_000;
 #[derive(Clone, Copy)]
 enum Guest {
     /// Use `cost` nanoseconds in each header callback.
-    Headers { cost: u64 },
+    Headers {
+        cost: u64,
+    },
     /// The same, with a tick every 10 ms that also uses `cost` nanoseconds.
-    HeadersAndTicks { cost: u64 },
+    HeadersAndTicks {
+        cost: u64,
+    },
     /// Send a callout from the request headers, and continue when its result arrives.
     Callout,
-    /// Trap in the request headers.
     Trap,
 }
 
-const IMPORTS: &str = r#"
+const SHARED_WAT: &str = r#"
   (import "env" "proxy_get_current_time_nanoseconds" (func $now (param i32) (result i32)))
   (import "env" "proxy_set_tick_period_milliseconds" (func $tick_period (param i32) (result i32)))
   (import "env" "proxy_http_call"
@@ -92,7 +95,6 @@ const IMPORTS: &str = r#"
   (func (export "proxy_on_delete") (param i32))
 "#;
 
-/// The guest's callbacks other than those in [IMPORTS].
 fn callbacks(guest: Guest) -> String {
     let busy = |cost: u64| format!("(call $busy (i64.const {cost}))");
     let (configure, request, response, tick, delivery) = match guest {
@@ -134,7 +136,7 @@ fn callbacks(guest: Guest) -> String {
 }
 
 fn guest_file(label: &str, guest: Guest) -> PathBuf {
-    let wat = format!("(module {IMPORTS} {})", callbacks(guest));
+    let wat = format!("(module {SHARED_WAT} {})", callbacks(guest));
     let path = std::env::temp_dir().join(format!(
         "pingora-wasm-bench-{label}-{}.wasm",
         std::process::id()
@@ -155,7 +157,7 @@ impl LogSink for RefusedCallouts {
     }
 }
 
-/// An origin for callouts that responds after `delay` on each keep-alive connection.
+/// An origin for callouts that responds after `delay_ms`.
 struct CalloutOrigin {
     port: u16,
     delay_ms: Arc<AtomicU64>,
@@ -194,7 +196,7 @@ impl CalloutOrigin {
 
 fn chain(label: &str, guest: Guest, slots: usize, services: WasmServices) -> WasmChain {
     let mut plugin = WasmPluginConf::new(label, guest_file(label, guest));
-    plugin.slots = slots;
+    plugin.slots = Some(slots);
     let runtime = WasmRuntime::new_with_services(vec![plugin], services).unwrap();
     runtime.chain(&[label]).unwrap()
 }

@@ -47,8 +47,8 @@ impl Lifecycle {
 
     /// Mark the runtime as ending, and return whether its threads were started.
     ///
-    /// A start that is in progress finishes first. Once this returns, no filter starts the
-    /// threads.
+    /// A start in progress finishes first. Once this returns, the threads can no longer
+    /// be started.
     pub(crate) fn begin_end(&self) -> bool {
         self.ending.store(true, Ordering::SeqCst);
         *self.threads_started.get_or_init(|| false)
@@ -81,7 +81,8 @@ impl Lifecycle {
 }
 
 impl RuntimeInner {
-    /// End the runtime: wait for its requests to finish, then end its plugins.
+    /// Wait for the runtime's requests to finish, then end its plugins, waiting at most
+    /// `shutdown_wait_limit` for them.
     ///
     /// A second call waits for the first one to return.
     pub(crate) async fn end(&self) {
@@ -279,7 +280,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn end_returns_at_limit_with_one_warning_when_root_never_calls_proxy_done() {
+    async fn end_warns_once_at_shutdown_wait_limit() {
         record_crate_logs();
         let sender = FixedSender::responds("ok");
         let limit = Duration::from_millis(100);
@@ -297,7 +298,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn end_returns_at_once_when_threads_never_started_or_runtime_already_ended() {
+    async fn end_returns_at_once_if_never_started_or_already_ended() {
         let cases = [
             ("never started", false, 0, Vec::<&str>::new()),
             ("already ended", true, 1, vec!["root done"]),

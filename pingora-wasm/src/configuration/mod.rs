@@ -60,8 +60,9 @@ pub struct WasmConf {
     /// - `configuration` and `vm_configuration` are strings. Set a configuration that is not
     ///   text in code.
     /// - `log_level` is one of `trace`, `debug`, `info`, `warn`, `error`, and `critical`.
-    /// - `callout_timeout_limit_seconds` and `callout_wait_limit_seconds` set the two callout
-    ///   time limits in whole seconds. Set a limit below one second in code.
+    /// - `callout_timeout_limit_seconds`, `callout_wait_limit_seconds`, and
+    ///   `rebuild_interval_seconds` set those times in whole seconds. Set a time below one
+    ///   second in code.
     /// - `fail_policy` is `closed` or `open`.
     /// - `limits` is a mapping with the keys `cpu_time_ms`, `memory_bytes`,
     ///   `max_decoded_pairs`, `max_decoded_map_bytes`, `max_shared_names`, `max_name_bytes`,
@@ -92,6 +93,9 @@ pub struct WasmConf {
     /// The value for [WasmServices::shutdown_wait_limit] in whole seconds. Default `None`, in
     /// which case [WasmServices] keeps its own default.
     pub shutdown_wait_limit_seconds: Option<u64>,
+    /// The value for [WasmServices::threads]. Default `None`, in which case [WasmServices] keeps
+    /// its own default.
+    pub threads: Option<usize>,
 }
 
 /// The peer of one callout upstream in [WasmConf::static_callout_upstreams].
@@ -125,8 +129,9 @@ impl CalloutUpstreamConf {
 impl WasmConf {
     /// Return the [WasmServices] this configuration describes.
     ///
-    /// The result has [max_callouts_in_flight](Self::max_callouts_in_flight) and
-    /// [shutdown_wait_limit_seconds](Self::shutdown_wait_limit_seconds) if they are set, the
+    /// The result has [max_callouts_in_flight](Self::max_callouts_in_flight),
+    /// [shutdown_wait_limit_seconds](Self::shutdown_wait_limit_seconds), and
+    /// [threads](Self::threads) if they are set, the
     /// [fixed_properties](Self::fixed_properties), and, unless
     /// [static_callout_upstreams](Self::static_callout_upstreams) is empty, a
     /// [StaticCalloutUpstreams] with one peer per upstream.
@@ -134,6 +139,9 @@ impl WasmConf {
         let mut services = WasmServices::default();
         if let Some(limit) = self.max_callouts_in_flight {
             services.max_callouts_in_flight = limit;
+        }
+        if let Some(threads) = self.threads {
+            services.threads = threads;
         }
         if let Some(seconds) = self.shutdown_wait_limit_seconds {
             services.shutdown_wait_limit = Duration::from_secs(seconds);
@@ -213,6 +221,7 @@ static_callout_upstreams:
         assert_eq!(conf.chain_plugins("default").unwrap(), ["auth", "stats"]);
         assert_eq!(services.max_callouts_in_flight, 16);
         assert_eq!(services.shutdown_wait_limit, Duration::from_secs(2));
+        assert_eq!(services.threads, 2);
         let node_name = services.fixed_properties.get(&["node", "metadata", "NAME"]);
         assert_eq!(node_name, Some(&b"edge-1"[..]));
         let upstreams = &services.callout_upstreams;
@@ -245,6 +254,7 @@ static_callout_upstreams:
             defaults.max_callouts_in_flight
         );
         assert_eq!(services.shutdown_wait_limit, defaults.shutdown_wait_limit);
+        assert_eq!(services.threads, defaults.threads);
         assert_eq!(services.fixed_properties, defaults.fixed_properties);
         assert!(!services.callout_upstreams.has_upstream("a", "authz"));
     }

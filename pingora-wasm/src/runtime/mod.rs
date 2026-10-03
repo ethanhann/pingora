@@ -55,13 +55,15 @@ use ticker::{with_ticker, Ticker};
 /// the same plugins and guests. The plugins of a runtime share one store for shared data,
 /// queues, and metrics, in which plugins with the same VM id see the same data.
 ///
-/// To reload plugins, build a new runtime and switch new requests over to it. Requests that
-/// started on the old runtime will finish on it.
+/// To reload plugins, build a new runtime and pass it to
+/// [WasmPlugins::replace](crate::WasmPlugins::replace). Requests that started on the old runtime
+/// finish on it.
 ///
 /// Some plugins do work on a timer in `proxy_on_tick`, and some wait for items on a shared
 /// queue. The runtime runs this work on a thread of its own, named `wasm-root-calls`, so it
-/// never runs on the threads of your Pingora services. The thread starts with the first request
-/// and stops when the runtime is dropped.
+/// never runs on the threads of your Pingora services. The thread starts when the
+/// [WasmPlugins](crate::WasmPlugins) service starts, or with the first request if you do not use
+/// one, and stops when the runtime ends or is dropped.
 ///
 /// Each slot of a plugin is a separate guest, so each slot gets its own ticks. A tick waits
 /// while a request callback runs in the same slot, and a request waits while a tick runs in its
@@ -160,6 +162,11 @@ impl WasmRuntime {
                 "invalid shutdown_wait_limit 0s in wasm services, must be greater than zero",
             ));
         }
+        if services.threads == 0 {
+            return Err(invalid_conf(
+                "invalid threads 0 in wasm services, must be at least 1",
+            ));
+        }
         let engine = EngineConfig::new()
             .with_external_ticks(true)
             .build()
@@ -181,6 +188,7 @@ impl WasmRuntime {
             metric_sink: metric_sink.clone(),
             fixed_properties: fixed_properties.clone(),
             root_callback_thread: &root_callback_thread,
+            threads: services.threads,
         };
         // Guests are started here, before the runtime's own ticker thread exists. The temporary
         // ticker keeps the CPU time limit in force for a guest that loops forever during startup.
@@ -271,8 +279,9 @@ impl fmt::Debug for WasmRuntime {
 impl RuntimeInner {
     pub(crate) fn start_threads(self: &Arc<Self>) -> Result<()> {
         // The threads cannot be started in `WasmRuntime::new`. When daemonizing, Pingora forks
-        // after the runtime has been built, and threads do not survive a fork. This is called on
-        // the request path instead, where only the first successful call does any work.
+        // after the runtime has been built, and threads do not survive a fork. They are started by
+        // the `WasmPlugins` service and on the request path instead, where only the first
+        // successful call does any work.
         self.lifecycle.start_threads_once(|| {
             self.root_callback_thread.start(Arc::downgrade(self))?;
             self.ticker.start(self)
@@ -294,14 +303,34 @@ mod tests {
     use proxy_wasm_host::Limits;
 
     #[test]
-    fn new_with_services_rejects_invalid_callout_limit() {
-        let cases = [0, usize::MAX];
+    fn new_with_services_rejects_invalid_services() {
+        let callouts = |limit| WasmServices {
+            max_callouts_in_flight: limit,
+            ..WasmServices::default()
+        };
+        let cases = [
+            (callouts(0), "invalid max_callouts_in_flight 0 in wasm services, must be 1 to"),
+            (
+                callouts(usize::MAX),
+                "invalid max_callouts_in_flight 18446744073709551615 in wasm services, must be 1 to",
+            ),
+            (
+                WasmServices {
+                    shutdown_wait_limit: Duration::ZERO,
+                    ..WasmServices::default()
+                },
+                "invalid shutdown_wait_limit 0s in wasm services, must be greater than zero",
+            ),
+            (
+                WasmServices {
+                    threads: 0,
+                    ..WasmServices::default()
+                },
+                "invalid threads 0 in wasm services, must be at least 1",
+            ),
+        ];
 
-        for limit in cases {
-            let services = WasmServices {
-                max_callouts_in_flight: limit,
-                ..WasmServices::default()
-            };
+        for (services, message) in cases {
             let plugins = vec![plugin("a", fixture("add-request-header"), 1)];
 
             let err = WasmRuntime::new_with_services(plugins, services)
@@ -309,9 +338,25 @@ mod tests {
                 .unwrap();
 
             assert_eq!(err.etype(), &ERR_INVALID_CONF);
-            let message =
-                format!("invalid max_callouts_in_flight {limit} in wasm services, must be 1 to");
-            assert!(err.to_string().contains(&message), "{err}");
+            assert!(err.to_string().contains(message), "{err}");
+        }
+    }
+
+    #[test]
+    fn slots_follow_services_threads_unless_set() {
+        let cases = [(None, 3), (Some(2), 2)];
+
+        for (slots, want) in cases {
+            let mut conf = plugin("a", fixture("add-request-header"), 1);
+            conf.slots = slots;
+            let services = WasmServices {
+                threads: 3,
+                ..WasmServices::default()
+            };
+
+            let runtime = WasmRuntime::new_with_services(vec![conf], services).unwrap();
+
+            assert_eq!(runtime.inner.pools[0].slot_count(), want, "{slots:?}");
         }
     }
 

@@ -33,7 +33,7 @@ const CALLOUT_TIMEOUT_LIMIT: Duration = Duration::from_millis(300);
 
 fn plugin(name: &str, path: PathBuf, slots: usize, configuration: &str) -> WasmPluginConf {
     let mut conf = WasmPluginConf::new(name, path);
-    conf.slots = slots;
+    conf.slots = Some(slots);
     conf.configuration = configuration.as_bytes().to_vec();
     conf
 }
@@ -92,6 +92,9 @@ struct RuntimePlan {
 
 impl RuntimePlan {
     fn build(mut self) -> WasmRuntime {
+        for plugin in &mut self.plugins {
+            plugin.rebuild_interval = Duration::from_nanos(1);
+        }
         add_metric_sink_and_node_name(&mut self.services);
         self.services.log_sink = Arc::new(super::GuestMessageSink);
         WasmRuntime::new_with_services(self.plugins, self.services).unwrap()

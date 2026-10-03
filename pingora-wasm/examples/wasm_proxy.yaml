@@ -10,11 +10,9 @@ threads: 2
 plugins:
   - name: add-request-header
     path: tests/fixtures/add-request-header.wasm
-    slots: 2
   - name: sdk-http-body
     path: tests/fixtures/sdk-http-body.wasm
     response_body: true
-    slots: 2
 
 chains:
   default: [add-request-header, sdk-http-body]

@@ -68,7 +68,7 @@ fn wat_guest(label: &str, callback: &str, body: &str, delivery: &str) -> PathBuf
 
 fn guest(name: &str, label: &str, callback: &str, body: &str) -> WasmPluginConf {
     let mut conf = WasmPluginConf::new(name, wat_guest(label, callback, body, NO_DELIVERY));
-    conf.slots = 2;
+    conf.slots = Some(2);
     conf.request_body = callback == REQUEST_BODY;
     conf
 }
@@ -103,7 +103,7 @@ pub fn teapot_for_a_response() -> WasmPluginConf {
 pub fn relay_callout_body_plugin(name: &str, timeout_limit: Option<Duration>) -> WasmPluginConf {
     let path = wat_guest(name, REQUEST_HEADERS, CALL_AND_PAUSE, RELAY_CALLOUT_BODY);
     let mut conf = WasmPluginConf::new(name, path);
-    conf.slots = 2;
+    conf.slots = Some(2);
     if let Some(limit) = timeout_limit {
         conf.callout_timeout_limit = limit;
     }
@@ -234,7 +234,7 @@ impl MemoryTexts {
 
 fn one_slot_plugin(name: &str, path: PathBuf) -> WasmPluginConf {
     let mut conf = WasmPluginConf::new(name, path);
-    conf.slots = 1;
+    conf.slots = Some(1);
     conf
 }
 
@@ -269,7 +269,7 @@ pub fn trap_on_request_headers(name: &str) -> WasmPluginConf {
 /// Build the conf for a plugin that holds the request body and traps on its last chunk.
 pub fn hold_request_body_then_trap(name: &str) -> WasmPluginConf {
     let mut conf = guest(name, name, REQUEST_BODY, HOLD_THEN_TRAP);
-    conf.slots = 1;
+    conf.slots = Some(1);
     conf
 }
 
@@ -416,7 +416,7 @@ pub fn context_holder_with_an_earlier_callout(name: &str, log_text: &str) -> Was
     )
 }
 
-/// Build the conf for a plugin that logs `tick_text` on every tick of 50 ms and `done_text`
+/// Build the conf for a plugin that logs `tick_text` on each tick, every 50 ms, and `done_text`
 /// when its root context gets `proxy_on_done`.
 pub fn root_lifecycle_logger(name: &str, tick_text: &str, done_text: &str) -> WasmPluginConf {
     let mut texts = MemoryTexts::new();

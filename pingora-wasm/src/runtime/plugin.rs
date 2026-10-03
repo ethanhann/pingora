@@ -29,6 +29,7 @@ const BODY_LIMIT: usize = 1024 * 1024;
 const CALLOUT_TIMEOUT_LIMIT: Duration = Duration::from_secs(10);
 const CALLOUT_WAIT_LIMIT: Duration = Duration::from_secs(30);
 const CALLOUT_RESPONSE_LIMIT: usize = 1024 * 1024;
+const REBUILD_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Configuration for one Proxy-Wasm plugin.
 ///
@@ -64,11 +65,9 @@ pub struct WasmPluginConf {
     ///
     /// Fuel limits are not supported, and a configuration that sets one is rejected.
     pub limits: Limits,
-    /// The number of guests to run. Default 1.
-    ///
-    /// A guest runs one callback at a time, so set this to the thread count of the service that
-    /// uses the plugin. Must be at least 1.
-    pub slots: usize,
+    /// The number of guests to run. Default `None`, which runs one guest for each thread in
+    /// [WasmServices::threads](crate::WasmServices::threads). Must be at least 1 when set.
+    pub slots: Option<usize>,
     /// Whether to run the plugin on request bodies. Default `false`.
     ///
     /// When enabled, `proxy_on_request_body` is called once for each chunk of a request body. A
@@ -127,6 +126,13 @@ pub struct WasmPluginConf {
     /// A callout with a larger response body fails, and the plugin receives a result with no
     /// headers and no body. Must be greater than zero.
     pub callout_response_limit: usize,
+    /// The shortest time between two builds of the guest in a slot. Default 1 second.
+    ///
+    /// When a guest becomes unusable, e.g. after a trap, a new one is built at once if the slot's
+    /// last build is at least this old. Otherwise the slot stays empty until then, and while no
+    /// slot has a guest, [fail_policy](Self::fail_policy) decides each request. The time is chosen
+    /// at random for each build, from this interval to 1.5 times it. Must be greater than zero.
+    pub rebuild_interval: Duration,
     /// What happens to a request when the plugin fails. Default [FailPolicy::Closed].
     ///
     /// [FailPolicy::Open] on a plugin that authorizes requests lets a request through each time
@@ -159,6 +165,7 @@ impl fmt::Debug for WasmPluginConf {
             .field("callout_timeout_limit", &self.callout_timeout_limit)
             .field("callout_wait_limit", &self.callout_wait_limit)
             .field("callout_response_limit", &self.callout_response_limit)
+            .field("rebuild_interval", &self.rebuild_interval)
             .field("fail_policy", &self.fail_policy)
             .finish()
     }
@@ -177,7 +184,7 @@ impl WasmPluginConf {
             configuration: Vec::new(),
             log_level: LogLevel::Info,
             limits: Limits::default(),
-            slots: 1,
+            slots: None,
             request_body: false,
             response_body: false,
             response_trailers: false,
@@ -186,6 +193,7 @@ impl WasmPluginConf {
             callout_timeout_limit: CALLOUT_TIMEOUT_LIMIT,
             callout_wait_limit: CALLOUT_WAIT_LIMIT,
             callout_response_limit: CALLOUT_RESPONSE_LIMIT,
+            rebuild_interval: REBUILD_INTERVAL,
             fail_policy: FailPolicy::Closed,
         }
     }
@@ -193,7 +201,7 @@ impl WasmPluginConf {
     pub(crate) fn check(&self) -> Result<()> {
         let name = &self.name;
         let (wait, timeout) = (self.callout_wait_limit, self.callout_timeout_limit);
-        let mistake = if self.slots == 0 {
+        let mistake = if self.slots == Some(0) {
             "slots must be at least 1"
         } else if self.limits.fuel().is_some() {
             "fuel limits are not supported"
@@ -209,6 +217,8 @@ impl WasmPluginConf {
             )));
         } else if self.callout_response_limit == 0 {
             "callout_response_limit must be greater than zero"
+        } else if self.rebuild_interval.is_zero() {
+            "rebuild_interval must be greater than zero"
         } else {
             return Ok(());
         };
@@ -270,7 +280,7 @@ mod tests {
         assert!(conf.vm_configuration.is_empty());
         assert!(conf.configuration.is_empty());
         assert_eq!(conf.log_level, LogLevel::Info);
-        assert_eq!(conf.slots, 1);
+        assert_eq!(conf.slots, None);
         assert_eq!(conf.limits.fuel(), None);
         assert!(!conf.request_body && !conf.response_body && !conf.response_trailers);
         assert_eq!(conf.request_body_limit, BODY_LIMIT);
@@ -284,7 +294,7 @@ mod tests {
     #[test]
     fn check_rejects_zero_slots_fuel_and_zero_limits() {
         let mut zero = WasmPluginConf::new("zero", "zero.wasm");
-        zero.slots = 0;
+        zero.slots = Some(0);
         let mut fuel = WasmPluginConf::new("fuel", "fuel.wasm");
         fuel.limits = Limits::default().with_fuel(1000);
         let mut request = WasmPluginConf::new("request", "request.wasm");
@@ -299,6 +309,8 @@ mod tests {
         wait.callout_wait_limit = Duration::from_secs(9);
         let mut equal = WasmPluginConf::new("equal", "equal.wasm");
         equal.callout_wait_limit = equal.callout_timeout_limit;
+        let mut rebuild = WasmPluginConf::new("rebuild", "rebuild.wasm");
+        rebuild.rebuild_interval = Duration::ZERO;
 
         let errors = [
             zero.check(),
@@ -309,6 +321,7 @@ mod tests {
             callout.check(),
             wait.check(),
             equal.check(),
+            rebuild.check(),
         ]
         .map(|r| r.unwrap_err());
 
@@ -325,6 +338,7 @@ mod tests {
         assert!(errors[6].contains(wait), "{}", errors[6]);
         let equal = "equal: callout_wait_limit 10s must be greater than callout_timeout_limit 10s";
         assert!(errors[7].contains(equal), "{}", errors[7]);
+        assert!(errors[8].contains("rebuild: rebuild_interval must be greater than zero"));
     }
 
     #[test]

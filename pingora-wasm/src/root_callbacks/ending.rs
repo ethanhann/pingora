@@ -24,7 +24,6 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::sync::watch;
 
-/// Progress of the end of a runtime's plugins.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EndProgress {
     pub(crate) finished: bool,

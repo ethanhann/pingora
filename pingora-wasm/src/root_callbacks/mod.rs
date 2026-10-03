@@ -15,8 +15,9 @@
 //! Root callback thread
 //!
 //! A dedicated thread runs the plugin callbacks that happen outside of a request. These are
-//! `proxy_on_tick`, `proxy_on_queue_ready`, callout responses no request is waiting for, and the
-//! teardown of contexts a guest kept after its request ended.
+//! `proxy_on_tick`, `proxy_on_queue_ready`, callout responses no request is waiting for, the
+//! teardown of contexts a guest kept after its request ended, and the end of the root contexts
+//! when the runtime ends.
 //!
 //! Threads that make guest calls report the resulting tick, queue, and callout changes as events
 //! on one channel. Only the root callback thread reads that channel, which lets it keep its state
