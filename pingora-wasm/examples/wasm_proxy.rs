@@ -297,7 +297,9 @@ fn prometheus_sink() -> Arc<PrometheusMetricSink> {
 // A failing plugin is also logged as a warning by the proxy_wasm_host crate. You can silence
 // that with RUST_LOG=info,proxy_wasm_host=error
 //
-// Plugin metrics are served at 127.0.0.1:6192/metrics
+// Plugin metrics are served at 127.0.0.1:6192/metrics. A metric will only appear in this
+// example if a callout fails. The plugins in the commands above define no explicit metrics,
+// unlike the wasm_plugin_services example that tracks its request count.
 //
 // To reload the plugins from the same files, send the process SIGHUP. Requests in progress
 // finish on the old plugins
