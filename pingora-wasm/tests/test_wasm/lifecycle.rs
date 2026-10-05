@@ -52,8 +52,7 @@ struct LifecycleServer {
 
 impl LifecycleServer {
     async fn start(port: u16, runtime: WasmRuntime, plugin: &str) -> Self {
-        let default = runtime.chain(&[plugin]).unwrap();
-        let plugins = WasmPlugins::new(runtime, [("default", default)]).unwrap();
+        let plugins = WasmPlugins::new(runtime, [("default", [plugin])]).unwrap();
         let plugins_service = background_service("wasm plugins", plugins);
         let plugins = plugins_service.task();
         let chain = plugins.chain("default").unwrap();
@@ -116,10 +115,9 @@ async fn plugins_tick_before_requests_and_end_at_reload_and_shutdown() {
         "tick",
         "root done",
     ));
-    let new_chain = new.chain(&["reload-new"]).unwrap();
     server
         .plugins
-        .replace(new, [("default", new_chain)])
+        .replace(new, [("default", ["reload-new"])])
         .unwrap();
     let old_ended_at_reload = eventually(|| count_lines("reload-old: root done") == 1).await;
     let new_ticked = eventually(|| count_lines("reload-new: tick") > 0).await;
@@ -134,13 +132,13 @@ async fn plugins_tick_before_requests_and_end_at_reload_and_shutdown() {
 }
 
 /// Send requests one after another until `stop` is set. Return each request's status with the
-/// reload generation it started in, with status 0 for a request that failed.
+/// reload generations it started and ended in, with status 0 for a request that failed.
 async fn send_until_stopped(
     port: u16,
     origin: u16,
     generation: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
-) -> Vec<(usize, u16)> {
+) -> Vec<(usize, usize, u16)> {
     let client = client();
     let mut results = Vec::new();
     while !stop.load(Ordering::SeqCst) {
@@ -150,7 +148,7 @@ async fn send_until_stopped(
             Ok(response) => response.status().as_u16(),
             Err(_) => 0,
         };
-        results.push((at, status));
+        results.push((at, generation.load(Ordering::SeqCst), status));
     }
     results
 }
@@ -167,11 +165,9 @@ async fn replace_under_callout_traffic_fails_no_request() {
         services.metric_sink = metric_sink.clone();
         let mut auth = WasmPluginConf::new("swap-auth", fixture("sdk-http-auth-random"));
         auth.slots = Some(2);
-        let runtime = WasmRuntime::new_with_services(vec![auth], services).unwrap();
-        let chain = runtime.chain(&["swap-auth"]).unwrap();
-        (runtime, chain)
+        WasmRuntime::new_with_services(vec![auth], services).unwrap()
     };
-    let server = LifecycleServer::start(6422, build().0, "swap-auth").await;
+    let server = LifecycleServer::start(6422, build(), "swap-auth").await;
     let (origin, _) = echo_origin().await;
     let generation = Arc::new(AtomicUsize::new(0));
     let stop = Arc::new(AtomicBool::new(false));
@@ -183,10 +179,9 @@ async fn replace_under_callout_traffic_fails_no_request() {
         })
         .collect();
     let reload = || {
-        let (runtime, chain) = build();
         server
             .plugins
-            .replace(runtime, [("default", chain)])
+            .replace(build(), [("default", ["swap-auth"])])
             .unwrap();
         generation.fetch_add(1, Ordering::SeqCst);
     };
@@ -205,11 +200,17 @@ async fn replace_under_callout_traffic_fails_no_request() {
     server.shut_down().await;
     let failed: Vec<_> = results
         .iter()
-        .filter(|(_, status)| *status != 200)
+        .filter(|(_, _, status)| *status != 200)
         .collect();
     assert!(failed.is_empty(), "{failed:?}");
     for at in 0..=3 {
-        let count = results.iter().filter(|(g, _)| *g == at).count();
+        let count = results
+            .iter()
+            .filter(|(started, _, _)| *started == at)
+            .count();
         assert!(count > 0, "no request started in generation {at}");
     }
+    let across_a_swap = results.iter().filter(|(started, ended, _)| started < ended);
+    assert!(across_a_swap.count() > 0);
+    assert!(!callout_origins.origin("swap-auth").requests().is_empty());
 }

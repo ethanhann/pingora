@@ -25,7 +25,7 @@ use pingora_core::{Error, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use pingora_wasm::{
-    write_plugin_response, PrometheusMetricSink, RequestOutcome, StaticCalloutUpstreams, WasmChain,
+    write_plugin_response, PrometheusMetricSink, RequestOutcome, StaticCalloutUpstreams,
     WasmChainHandle, WasmConf, WasmCtx, WasmPluginConf, WasmPlugins, WasmRuntime, WasmServices,
 };
 use std::path::{Path, PathBuf};
@@ -175,7 +175,7 @@ impl SharedServices {
     }
 }
 
-type BuildPlugins = Box<dyn Fn() -> Result<(WasmRuntime, WasmChain), String> + Send + Sync>;
+type BuildPlugins = Box<dyn Fn() -> Result<(WasmRuntime, Vec<String>), String> + Send + Sync>;
 
 struct ReloadOnHangup {
     plugins: Arc<WasmPlugins>,
@@ -194,8 +194,8 @@ impl BackgroundService for ReloadOnHangup {
                 _ = hangups.recv() => {}
                 _ = shutdown.changed() => return,
             }
-            let reloaded = (self.build)().and_then(|(runtime, chain)| {
-                let chains = [(DEFAULT_CHAIN, chain)];
+            let reloaded = (self.build)().and_then(|(runtime, names)| {
+                let chains = [(DEFAULT_CHAIN, names)];
                 self.plugins
                     .replace(runtime, chains)
                     .map_err(|e| e.to_string())
@@ -213,7 +213,7 @@ fn runtime_and_chain_from_args(
     args: &[String],
     threads: usize,
     shared: &SharedServices,
-) -> Result<(WasmRuntime, WasmChain), String> {
+) -> Result<(WasmRuntime, Vec<String>), String> {
     // Body phases cost a plugin call per chunk, so only enable them for plugins that need the body
     let mut body = false;
     let mut plugins = Vec::new();
@@ -243,21 +243,19 @@ fn runtime_and_chain_from_args(
         plugins.push(plugin);
     }
     let names: Vec<String> = plugins.iter().map(|p| p.name.clone()).collect();
-    let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let mut services = WasmServices::default();
     services.callout_upstreams = Arc::new(upstreams);
     services.threads = threads;
     shared.add_to(&mut services);
     let runtime = WasmRuntime::new_with_services(plugins, services).map_err(|e| e.to_string())?;
-    let chain = runtime.chain(&names).map_err(|e| e.to_string())?;
-    Ok((runtime, chain))
+    Ok((runtime, names))
 }
 
-/// Build the runtime and the `default` chain from a YAML file.
+/// Build the runtime and the plugin names of the `default` chain from a YAML file.
 fn runtime_and_chain_from_conf(
     path: &str,
     shared: &SharedServices,
-) -> Result<(WasmRuntime, WasmChain), String> {
+) -> Result<(WasmRuntime, Vec<String>), String> {
     let yaml = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let conf: WasmConf = serde_yaml::from_str(&yaml).map_err(|e| format!("invalid {path}: {e}"))?;
     let mut services = conf.services();
@@ -265,11 +263,8 @@ fn runtime_and_chain_from_conf(
     let invalid = |e: Box<Error>| format!("invalid {path}: {e}");
     let runtime =
         WasmRuntime::new_with_services(conf.plugins.clone(), services).map_err(invalid)?;
-    let chain = conf
-        .chain_plugins(DEFAULT_CHAIN)
-        .and_then(|names| runtime.chain(&names))
-        .map_err(invalid)?;
-    Ok((runtime, chain))
+    let names = conf.chain_plugins(DEFAULT_CHAIN).map_err(invalid)?;
+    Ok((runtime, names.into_iter().map(String::from).collect()))
 }
 
 fn exit_with(message: String) -> ! {
@@ -349,8 +344,9 @@ fn main() {
         Some(path) => Box::new(move || runtime_and_chain_from_conf(&path, &shared)),
         None => Box::new(move || runtime_and_chain_from_args(&args, threads, &shared)),
     };
-    let (runtime, chain) = build().unwrap_or_else(|e| exit_with(e));
-    let plugins = WasmPlugins::new(runtime, [(DEFAULT_CHAIN, chain)]).unwrap();
+    let (runtime, names) = build().unwrap_or_else(|e| exit_with(e));
+    let plugins = WasmPlugins::new(runtime, [(DEFAULT_CHAIN, names)])
+        .unwrap_or_else(|e| exit_with(e.to_string()));
     let plugins_service = background_service("wasm plugins", plugins);
     let plugins = plugins_service.task();
     let chain = plugins.chain(DEFAULT_CHAIN).unwrap();

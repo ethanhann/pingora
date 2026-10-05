@@ -22,12 +22,13 @@ use crate::runtime::RuntimeInner;
 use proxy_wasm_host::abi::v0_2_1::ContextState;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EndProgress {
     pub(crate) finished: bool,
-    /// The plugins with a root context that has not finished.
+    /// The plugins the end still waits for.
     pub(crate) waiting_for: Vec<Arc<str>>,
 }
 
@@ -38,22 +39,36 @@ enum EndStep {
     Delete,
 }
 
-pub(super) struct Ending {
+// Nothing wakes the thread when the last late request ends or a busy slot is unlocked, so the
+// end checks again after this delay
+const END_RECHECK_DELAY: Duration = Duration::from_millis(10);
+
+pub(super) struct EndState {
     progress: watch::Sender<EndProgress>,
     step: EndStep,
     roots: Vec<GuestAddress>,
     /// Roots whose `proxy_on_done` failed, which the end does not wait for.
-    pub(super) failed_roots: Vec<GuestAddress>,
+    failed_roots: Vec<GuestAddress>,
+    recheck_at: Option<Instant>,
 }
 
-impl Ending {
+impl EndState {
     pub(super) fn new(progress: watch::Sender<EndProgress>) -> Self {
-        Ending {
+        EndState {
             progress,
             step: EndStep::CallDone,
             roots: Vec::new(),
             failed_roots: Vec::new(),
+            recheck_at: None,
         }
+    }
+
+    pub(super) fn record_failed_root(&mut self, address: GuestAddress) {
+        self.failed_roots.push(address);
+    }
+
+    pub(super) fn recheck_at(&self) -> Option<Instant> {
+        self.recheck_at
     }
 }
 
@@ -75,14 +90,23 @@ impl RootCallbackLoop {
                 self.advance_end(runtime)
             }
             EndStep::WaitForDone => {
-                let roots = self.end_roots();
-                let waiting_for: BTreeSet<_> = roots
+                let roots = self.roots_to_wait_for();
+                let mut waiting_for: BTreeSet<_> = roots
                     .iter()
                     .filter(|address| !is_root_finished(runtime, address))
                     .map(|address| runtime.pools[address.slot.pool_index].name.clone())
                     .collect();
+                if runtime.lifecycle.has_live_ctx() {
+                    waiting_for.extend(runtime.pools.iter().map(|pool| pool.name.clone()));
+                }
+                if let Some(ending) = &mut self.ending {
+                    ending.recheck_at = None;
+                }
                 if !waiting_for.is_empty() {
                     self.report_end_progress(false, waiting_for.into_iter().collect());
+                    if let Some(ending) = &mut self.ending {
+                        ending.recheck_at = Some(Instant::now() + END_RECHECK_DELAY);
+                    }
                     return false;
                 }
                 self.run_on_each_root(runtime, &roots, Work::DeleteRoot);
@@ -113,7 +137,7 @@ impl RootCallbackLoop {
         }
     }
 
-    fn end_roots(&self) -> Vec<GuestAddress> {
+    fn roots_to_wait_for(&self) -> Vec<GuestAddress> {
         let Some(ending) = &self.ending else {
             return Vec::new();
         };

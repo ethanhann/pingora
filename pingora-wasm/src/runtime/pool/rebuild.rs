@@ -17,25 +17,28 @@
 use super::{install_started_guest, GuestPool};
 use log::{error, warn};
 use proxy_wasm_host::abi::v0_2_1::GuestError;
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-// `Instant + Duration` panics on overflow
+// Caps a wait so that `Instant + Duration` cannot overflow
 const LONGEST_REBUILD_WAIT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 impl GuestPool {
-    pub(super) fn rebuild_due(&self, index: usize) -> bool {
+    /// Return `true` if the slot is empty and its rebuild interval has passed, and if so, set the
+    /// earliest time of its next build, so that only one caller rebuilds it.
+    pub(super) fn claim_rebuild(&self, index: usize) -> bool {
         let slot = &self.slots[index];
-        let due = Instant::now() >= *slot.next_build.lock();
-        due && slot.guest.try_lock().is_some_and(|guard| guard.is_none())
+        let mut earliest_rebuild = slot.earliest_rebuild.lock();
+        let empty = slot.guest.try_lock().is_some_and(|guard| guard.is_none());
+        if !empty || Instant::now() < *earliest_rebuild {
+            return false;
+        }
+        *earliest_rebuild = self.next_build_time();
+        true
     }
 
-    /// Return when a slot built now may be built again, after 1 to 1.5 rebuild intervals.
     pub(super) fn next_build_time(&self) -> Instant {
-        let fraction = RandomState::new().build_hasher().finish() % 1000;
-        let jitter = self.rebuild_interval.mul_f64(fraction as f64 / 2000.0);
+        let jitter = self.rebuild_interval.mul_f64(rand::random_range(0.0..0.5));
         let wait = self.rebuild_interval.saturating_add(jitter);
         Instant::now() + wait.min(LONGEST_REBUILD_WAIT)
     }
@@ -50,7 +53,6 @@ impl GuestPool {
         }
         let slot = &self.slots[index];
         let name = &self.name;
-        *slot.next_build.lock() = self.next_build_time();
         match self.start_guest(index) {
             Ok(started) => {
                 let mut guard = slot.guest.lock();
@@ -58,6 +60,7 @@ impl GuestPool {
                     slot.open.store(0, Ordering::Relaxed);
                     slot.held.store(0, Ordering::Relaxed);
                     install_started_guest(&mut guard, started);
+                    self.empty_slots.fetch_sub(1, Ordering::Relaxed);
                     drop(guard);
                     self.metric_sink.guest_replaced(name);
                     let warnings = &self.replaced_guest_warnings;

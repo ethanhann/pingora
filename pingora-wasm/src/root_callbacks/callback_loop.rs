@@ -14,7 +14,7 @@
 
 //! Root callback loop state
 
-use super::ending::Ending;
+use super::ending::EndState;
 use super::queue_registrations::QueueRegistrations;
 use super::root_callouts::{FinishedCallout, RootCallbackCallouts};
 use super::tick_schedule::TickSchedule;
@@ -38,7 +38,7 @@ pub(super) struct RootCallbackLoop {
     callouts_to_start: Vec<(GuestAddress, ContextId, AcceptedCallout)>,
     ready_work: VecDeque<Work>,
     retries: Vec<(Instant, Work)>,
-    pub(super) ending: Option<Ending>,
+    pub(super) ending: Option<EndState>,
 }
 
 impl RootCallbackLoop {
@@ -68,11 +68,9 @@ impl RootCallbackLoop {
     }
 
     fn next_due(&self) -> Option<Instant> {
-        let retry = self.retries.iter().map(|(due, _)| *due).min();
-        match (retry, self.ticks.next_due()) {
-            (Some(retry), Some(tick)) => Some(retry.min(tick)),
-            (retry, tick) => retry.or(tick),
-        }
+        let retry = self.retries.iter().map(|(due, _)| *due);
+        let recheck = self.ending.as_ref().and_then(EndState::recheck_at);
+        retry.chain(self.ticks.next_due()).chain(recheck).min()
     }
 
     fn accept_event(&mut self, event: RootCallbackEvent) {
@@ -91,7 +89,7 @@ impl RootCallbackLoop {
                     |work: &Work| matches!(work, Work::Tick(_) | Work::QueueItem(_));
                 self.ready_work.retain(|work| !is_tick_or_queue(work));
                 self.retries.retain(|(_, work)| !is_tick_or_queue(work));
-                self.ending.get_or_insert_with(|| Ending::new(progress));
+                self.ending.get_or_insert_with(|| EndState::new(progress));
             }
             RootCallbackEvent::TicksOrQueuesChanged {
                 address,

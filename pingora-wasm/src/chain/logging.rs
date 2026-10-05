@@ -118,11 +118,8 @@ impl WasmCtx {
             }
             Err((callback, e)) => {
                 error!("wasm plugin {}: {callback} failed: {e}", locked.pool.name);
-                let (pool, slot) = (locked.pool, locked.slot);
-                // Replacing the guest already resets the slot's count of open contexts to zero
-                if !locked.replace_guest_if_unusable(&e) {
-                    pool.deleted(slot);
-                }
+                // The host cannot delete a context whose end failed, so the guest would keep it
+                locked.replace_guest(&e);
                 let (failure, outcome) = (PluginFailure::GuestError, PluginFailureOutcome::Failed);
                 self.report_failure(position, failure, outcome, Some(callback));
             }
@@ -189,19 +186,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logging_closes_context_when_done_returns_unexpected_value() {
+    async fn logging_replaces_guest_that_cannot_delete_its_context() {
         let done = Wat {
             done: "i32.const 7",
             ..Wat::default()
         };
         let (runtime, mut ctx) = one_plugin(plugin("a", wat_guest("bad-done", done), 1));
+        let guest_id = |runtime: &crate::WasmRuntime| {
+            let slot = runtime.inner.pools[0].lock_slot(0);
+            slot.as_ref().map(|loaded| loaded.guest.id())
+        };
+        let before = guest_id(&runtime);
         let (mut session, _client) = session(GET).await;
         ctx.request_filter(&mut session).await.unwrap();
 
         ctx.logging(&mut session).await;
 
         assert_eq!(runtime.open_contexts(), 0);
-        let slot = runtime.inner.pools[0].lock_slot(0);
-        assert!(slot.as_ref().unwrap().guest.is_serving());
+        let after = guest_id(&runtime);
+        assert!(after.is_some());
+        assert_ne!(after, before);
     }
 }

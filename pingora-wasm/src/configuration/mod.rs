@@ -93,8 +93,8 @@ pub struct WasmConf {
     /// The value for [WasmServices::shutdown_wait_limit] in whole seconds. Default `None`, in
     /// which case [WasmServices] keeps its own default.
     pub shutdown_wait_limit_seconds: Option<u64>,
-    /// The value for [WasmServices::threads]. Default `None`, in which case [WasmServices] keeps
-    /// its own default.
+    /// The value for [WasmServices::threads], which is Pingora's own `threads` key when one file
+    /// holds both. Default `None`, in which case [WasmServices] keeps its own default.
     pub threads: Option<usize>,
 }
 

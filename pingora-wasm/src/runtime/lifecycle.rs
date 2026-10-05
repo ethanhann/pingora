@@ -36,26 +36,29 @@ pub(crate) struct Lifecycle {
 impl Lifecycle {
     pub(crate) fn start_threads_once(&self, start: impl FnOnce() -> Result<()>) -> Result<()> {
         self.threads_started.get_or_try_init(|| -> Result<bool> {
-            if self.ending.load(Ordering::SeqCst) {
-                return Ok(false);
-            }
             start()?;
             Ok(true)
         })?;
         Ok(())
     }
 
-    /// Mark the runtime as ending, and return whether its threads were started.
-    ///
-    /// A start in progress finishes first. Once this returns, the threads can no longer
-    /// be started.
-    pub(crate) fn begin_end(&self) -> bool {
+    pub(crate) fn begin_end(&self) {
         self.ending.store(true, Ordering::SeqCst);
+    }
+
+    /// Return whether the threads were started, and make sure they can no longer be started.
+    ///
+    /// A start in progress finishes first.
+    pub(crate) fn close_threads(&self) -> bool {
         *self.threads_started.get_or_init(|| false)
     }
 
     pub(crate) fn is_ending(&self) -> bool {
         self.ending.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn has_live_ctx(&self) -> bool {
+        self.live_ctxs.load(Ordering::SeqCst) > 0
     }
 
     pub(crate) fn ctx_created(&self) {
@@ -93,10 +96,11 @@ impl RuntimeInner {
         for pool in &self.pools {
             pool.stop_rebuilds();
         }
-        if !self.lifecycle.begin_end() {
+        self.lifecycle.begin_end();
+        self.lifecycle.wait_for_no_live_ctx().await;
+        if !self.lifecycle.close_threads() {
             return;
         }
-        self.lifecycle.wait_for_no_live_ctx().await;
         let plugin_names = self.pools.iter().map(|pool| pool.name.clone()).collect();
         let mut progress = self.root_callback_thread.send_end(plugin_names);
         let finished = async {
@@ -108,7 +112,7 @@ impl RuntimeInner {
         }
         let limit = self.shutdown_wait_limit;
         let names = progress.borrow().waiting_for.join(", ");
-        warn!("wasm runtime ended after shutdown_wait_limit {limit:?} with plugins still running: {names}");
+        warn!("wasm runtime: shutdown_wait_limit {limit:?} passed with plugins still running: {names}");
     }
 }
 
@@ -120,6 +124,7 @@ mod tests {
         RecordedGuestLogs, Wat, GET,
     };
     use crate::WasmRuntime;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::sync::Notify;
@@ -203,7 +208,7 @@ mod tests {
         (runtime, logs)
     }
 
-    fn lines(logs: &RecordedGuestLogs) -> Vec<String> {
+    fn guest_lines(logs: &RecordedGuestLogs) -> Vec<String> {
         logs.0.lock().clone()
     }
 
@@ -219,7 +224,7 @@ mod tests {
         let inner = runtime.inner.clone();
         let end = tokio::spawn(async move { inner.end().await });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let lines_while_ctx_alive = lines(&logs);
+        let lines_while_ctx_alive = guest_lines(&logs);
         drop(ctx);
         assert!(eventually(|| sender.sent_count() == 1).await);
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -241,7 +246,69 @@ mod tests {
             "response",
             "root deleted",
         ];
-        assert_eq!(lines(&logs), want);
+        assert_eq!(guest_lines(&logs), want);
+    }
+
+    #[tokio::test]
+    async fn end_waits_for_request_that_starts_after_proxy_on_done() {
+        let gate = Arc::new(Notify::new());
+        let sender = FixedSender::responds_after("ok", gate.clone());
+        let limit = Duration::from_secs(5);
+        let (runtime, logs) = runtime_with("a", ROOT_SENDS_ON_DONE, sender.clone(), limit);
+        runtime.inner.start_threads().unwrap();
+        let chain = runtime.chain(&["a"]).unwrap();
+        let inner = runtime.inner.clone();
+        let end = tokio::spawn(async move { inner.end().await });
+        assert!(eventually(|| sender.sent_count() == 1).await);
+        let mut late = chain.new_ctx();
+        let (mut session, _client) = session(GET).await;
+        let late_request = late.request_filter(&mut session).await;
+        gate.notify_one();
+        assert!(eventually(|| guest_lines(&logs).iter().any(|line| line == "response")).await);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let ended_while_late_request_runs = end.is_finished();
+        drop(late);
+
+        let ended = timeout(Duration::from_secs(2), end).await;
+
+        assert!(late_request.is_ok());
+        assert!(!ended_while_late_request_runs);
+        assert!(ended.is_ok(), "the end waited for its limit");
+        let want = [
+            "root done",
+            "accepted",
+            "response",
+            "stream deleted",
+            "root deleted",
+        ];
+        assert_eq!(guest_lines(&logs), want);
+    }
+
+    #[tokio::test]
+    async fn end_of_unstarted_runtime_waits_for_live_ctx_whose_filter_starts_it() {
+        let sender = FixedSender::responds("ok");
+        let limit = Duration::from_secs(5);
+        let (runtime, logs) = runtime_with("a", ROOT_DONE_AT_ONCE, sender, limit);
+        let mut ctx = runtime.chain(&["a"]).unwrap().new_ctx();
+        let inner = runtime.inner.clone();
+        let end = tokio::spawn(async move { inner.end().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let ended_while_ctx_alive = end.is_finished();
+        let (mut session, _client) = session(GET).await;
+        ctx.request_filter(&mut session).await.unwrap();
+        let started = runtime
+            .inner
+            .root_callback_thread
+            .running
+            .load(Ordering::Relaxed);
+        drop(ctx);
+
+        let ended = timeout(Duration::from_secs(2), end).await;
+
+        assert!(ended.is_ok());
+        assert!(!ended_while_ctx_alive);
+        assert!(started);
+        assert_eq!(guest_lines(&logs), ["stream deleted", "root deleted"]);
     }
 
     #[tokio::test]
@@ -256,7 +323,7 @@ mod tests {
         drop(ctx);
         let inner = runtime.inner.clone();
         let end = tokio::spawn(async move { inner.end().await });
-        let has_root_done = || lines(&logs).iter().any(|line| line == "root done");
+        let has_root_done = || guest_lines(&logs).iter().any(|line| line == "root done");
         assert!(eventually(has_root_done).await);
         tokio::time::sleep(Duration::from_millis(50)).await;
         let ended_while_held = end.is_finished();
@@ -276,7 +343,7 @@ mod tests {
             "stream deleted",
             "root deleted",
         ];
-        assert_eq!(lines(&logs), want);
+        assert_eq!(guest_lines(&logs), want);
     }
 
     #[tokio::test]
@@ -292,9 +359,51 @@ mod tests {
 
         assert!(ended.is_ok());
         assert!(started.elapsed() >= limit);
-        let warning = "shutdown_wait_limit 100ms with plugins still running: never-done";
+        let warning = "shutdown_wait_limit 100ms passed with plugins still running: never-done";
         assert_eq!(crate_log_lines_with(warning).len(), 1);
-        assert_eq!(lines(&logs), ["root done"]);
+        assert_eq!(guest_lines(&logs), ["root done"]);
+    }
+
+    #[tokio::test]
+    async fn end_returns_before_limit_when_root_traps_in_proxy_on_done() {
+        record_crate_logs();
+        let traps = Wat {
+            done: "(if (i32.eq (local.get 0) (i32.load (i32.const 600))) (then unreachable))
+                i32.const 1",
+            ..ROOT_DONE_AT_ONCE
+        };
+        let sender = FixedSender::responds("ok");
+        let limit = Duration::from_secs(5);
+        let (runtime, logs) = runtime_with("traps-in-done", traps, sender, limit);
+        runtime.inner.start_threads().unwrap();
+
+        let ended = timeout(Duration::from_secs(2), runtime.inner.end()).await;
+
+        assert!(ended.is_ok());
+        assert!(crate_log_lines_with("still running: traps-in-done").is_empty());
+        assert!(runtime.inner.pools[0].lock_slot(0).is_none());
+        assert!(guest_lines(&logs).is_empty());
+    }
+
+    #[tokio::test]
+    async fn second_end_during_first_returns_when_first_returns() {
+        let sender = FixedSender::responds("ok");
+        let limit = Duration::from_secs(5);
+        let (runtime, _logs) = runtime_with("a", ROOT_DONE_AT_ONCE, sender, limit);
+        runtime.inner.start_threads().unwrap();
+        let ctx = runtime.chain(&["a"]).unwrap().new_ctx();
+        let (first, second) = (runtime.inner.clone(), runtime.inner.clone());
+        let first = tokio::spawn(async move { first.end().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let second = tokio::spawn(async move { second.end().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let second_ended_before_first = second.is_finished();
+
+        drop(ctx);
+
+        assert!(!second_ended_before_first);
+        assert!(timeout(Duration::from_secs(2), first).await.is_ok());
+        assert!(timeout(Duration::from_secs(2), second).await.is_ok());
     }
 
     #[tokio::test]
@@ -317,7 +426,7 @@ mod tests {
             let ended = timeout(Duration::from_millis(100), runtime.inner.end()).await;
 
             assert!(ended.is_ok(), "{name}");
-            assert_eq!(lines(&logs), want_lines, "{name}");
+            assert_eq!(guest_lines(&logs), want_lines, "{name}");
         }
     }
 }

@@ -71,7 +71,7 @@ struct Slot {
     guest: Mutex<Option<Loaded>>,
     open: AtomicUsize,
     held: Arc<AtomicUsize>,
-    next_build: Mutex<Instant>,
+    earliest_rebuild: Mutex<Instant>,
 }
 
 impl Slot {
@@ -80,7 +80,7 @@ impl Slot {
             guest: Mutex::new(None),
             open: AtomicUsize::new(0),
             held: Arc::new(AtomicUsize::new(0)),
-            next_build: Mutex::new(Instant::now()),
+            earliest_rebuild: Mutex::new(Instant::now()),
         }
     }
 }
@@ -123,6 +123,7 @@ pub(crate) struct GuestPool {
     pub(crate) skipped_plugin_warnings: WarningRateLimit,
     next: AtomicUsize,
     rebuilds_stopped: AtomicBool,
+    empty_slots: AtomicUsize,
     slots: Vec<Slot>,
 }
 
@@ -145,13 +146,14 @@ impl GuestPool {
             skipped_plugin_warnings: WarningRateLimit::default(),
             next: AtomicUsize::new(0),
             rebuilds_stopped: AtomicBool::new(false),
+            empty_slots: AtomicUsize::new(0),
             slots: (0..conf.slot_count).map(|_| Slot::new()).collect(),
         };
         for index in 0..pool.slots.len() {
             let started = pool.start_guest(index)?;
             let mut guard = pool.slots[index].guest.lock();
             install_started_guest(&mut guard, started);
-            *pool.slots[index].next_build.lock() = pool.next_build_time();
+            *pool.slots[index].earliest_rebuild.lock() = pool.next_build_time();
         }
         // A phase is only worth running if the plugin exports its callback
         if let Some(loaded) = pool.slots[0].guest.lock().as_ref() {
@@ -175,17 +177,13 @@ impl GuestPool {
         let count = self.slots.len();
         let first = self.next.fetch_add(1, Ordering::Relaxed) % count;
         let order = || (0..count).map(move |i| (first + i) % count);
-        // Slots are tried round-robin, and the first unlocked slot with a guest wins
-        for index in order() {
-            if let Some(guard) = self.slots[index].guest.try_lock() {
-                if guard.is_some() {
-                    return Some((index, guard));
-                }
+        if self.empty_slots.load(Ordering::Relaxed) > 0 {
+            if let Some(index) = order().find(|index| self.claim_rebuild(*index)) {
+                self.rebuild(index, None);
             }
         }
-        // Failing that, one slot that lost its guest is rebuilt if its rebuild interval has passed
-        if let Some(index) = order().find(|index| self.rebuild_due(*index)) {
-            self.rebuild(index, None);
+        // Slots are tried round-robin, and the first unlocked slot with a guest wins
+        for index in order() {
             if let Some(guard) = self.slots[index].guest.try_lock() {
                 if guard.is_some() {
                     return Some((index, guard));
@@ -227,7 +225,7 @@ impl GuestPool {
     pub(crate) fn replace_if_unusable(
         &self,
         index: usize,
-        mut guard: SlotGuard<'_>,
+        guard: SlotGuard<'_>,
         err: &GuestError,
     ) -> bool {
         let lost = match guard.as_ref() {
@@ -236,17 +234,24 @@ impl GuestPool {
             }
             None => false,
         };
-        if !lost {
-            return false;
+        if lost {
+            self.replace(index, guard, err);
         }
-        guard.take();
+        lost
+    }
+
+    /// Remove the guest from its slot after `err`, and rebuild it if the interval has passed.
+    pub(crate) fn replace(&self, index: usize, mut guard: SlotGuard<'_>, err: &GuestError) {
+        if guard.take().is_none() {
+            return;
+        }
+        self.empty_slots.fetch_add(1, Ordering::Relaxed);
         self.slots[index].open.store(0, Ordering::Relaxed);
         self.slots[index].held.store(0, Ordering::Relaxed);
         drop(guard);
-        if self.rebuild_due(index) {
+        if self.claim_rebuild(index) {
             self.rebuild(index, Some(err));
         }
-        true
     }
 
     pub(crate) fn stop_rebuilds(&self) {
@@ -267,7 +272,7 @@ impl GuestPool {
     pub(crate) fn deleted(&self, index: usize) {
         let _ = self.slots[index]
             .open
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
     }
 
     pub(crate) fn open_contexts(&self) -> usize {
@@ -313,12 +318,14 @@ mod tests {
         /// Replace the guest in a slot, as a trap would.
         pub(crate) fn replace_slot(&self, index: usize) {
             self.slots[index].guest.lock().take();
+            self.empty_slots.fetch_add(1, Ordering::Relaxed);
             self.rebuild(index, None);
         }
 
         pub(crate) fn fail_slot(&self, index: usize) {
             self.slots[index].guest.lock().take();
-            *self.slots[index].next_build.lock() = Instant::now() + Duration::from_secs(3600);
+            self.empty_slots.fetch_add(1, Ordering::Relaxed);
+            *self.slots[index].earliest_rebuild.lock() = Instant::now() + Duration::from_secs(3600);
         }
     }
 
@@ -440,6 +447,32 @@ mod tests {
             let replaced = reports.replaced_guests().len();
             assert_eq!(replaced, usize::from(rebuilt), "{wait:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn pick_rebuilds_empty_slot_once_interval_passed_while_another_is_free() {
+        let reports = Arc::new(RecordedFailures::default());
+        let mut conf = wat_plugin("trap-two-slots", TRAP);
+        conf.slots = Some(2);
+        conf.rebuild_interval = Duration::from_millis(100);
+        let services = WasmServices {
+            metric_sink: reports.clone(),
+            ..WasmServices::default()
+        };
+        let runtime = WasmRuntime::new_with_services(vec![conf], services).unwrap();
+        let pool = &runtime.inner.pools[0];
+        let mut ctx = runtime.chain(&["a"]).unwrap().new_ctx();
+        let (mut session, _client) = session(GET).await;
+        assert!(ctx.request_filter(&mut session).await.is_err());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        drop(pool.pick());
+
+        let slots_with_guest = (0..2)
+            .filter(|slot| pool.lock_slot(*slot).is_some())
+            .count();
+        assert_eq!(slots_with_guest, 2);
+        assert_eq!(reports.replaced_guests(), ["a"]);
     }
 
     #[test]

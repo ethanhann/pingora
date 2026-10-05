@@ -128,10 +128,10 @@ pub struct WasmPluginConf {
     pub callout_response_limit: usize,
     /// The shortest time between two builds of the guest in a slot. Default 1 second.
     ///
-    /// When a guest becomes unusable, e.g. after a trap, a new one is built at once if the slot's
-    /// last build is at least this old. Otherwise the slot stays empty until then, and while no
-    /// slot has a guest, [fail_policy](Self::fail_policy) decides each request. The time is chosen
-    /// at random for each build, from this interval to 1.5 times it. Must be greater than zero.
+    /// When a guest becomes unusable, e.g. after a trap, its slot is built again by the first
+    /// request after a random wait of 1 to 1.5 times this interval since the slot's last build.
+    /// While no slot has a guest, [fail_policy](Self::fail_policy) decides each request. Must be
+    /// greater than zero.
     pub rebuild_interval: Duration,
     /// What happens to a request when the plugin fails. Default [FailPolicy::Closed].
     ///

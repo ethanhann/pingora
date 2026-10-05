@@ -37,7 +37,7 @@ const MAX_CALLOUTS_IN_FLIGHT: usize = 1024;
 const SHUTDOWN_WAIT_LIMIT: Duration = Duration::from_secs(5);
 const THREADS: usize = 1;
 
-/// The services your proxy provides to the plugins of a [WasmRuntime](crate::WasmRuntime).
+/// The services and settings your proxy gives the plugins of a [WasmRuntime](crate::WasmRuntime).
 ///
 /// Start from [WasmServices::default] and set the fields you need.
 #[non_exhaustive]

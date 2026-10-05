@@ -21,13 +21,14 @@
 use async_trait::async_trait;
 use pingora_core::protocols::Digest;
 use pingora_core::server::Server;
+use pingora_core::services::background::background_service;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{Error, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use pingora_wasm::{
-    write_plugin_response, PrometheusMetricSink, RequestOutcome, StaticCalloutUpstreams, WasmChain,
-    WasmCtx, WasmPluginConf, WasmRuntime, WasmServices,
+    write_plugin_response, PrometheusMetricSink, RequestOutcome, StaticCalloutUpstreams,
+    WasmChainHandle, WasmCtx, WasmPluginConf, WasmPlugins, WasmRuntime, WasmServices,
 };
 use std::sync::Arc;
 
@@ -37,7 +38,7 @@ const PLUGIN_PATH: &str = concat!(
 );
 
 pub struct PluginProxy {
-    chain: WasmChain,
+    chain: WasmChainHandle,
 }
 
 /// Return the first path segment of a request, used here as its route name.
@@ -120,7 +121,7 @@ impl ProxyHttp for PluginProxy {
 
 // RUST_LOG=info cargo run -p pingora-wasm --example wasm_plugin_services
 //
-// Ticks begin with the first request. From then on the plugin logs a tick every second, and
+// Ticks begin when the server starts. From then on the plugin logs a tick every second, and
 // calls httpbin on the first tick and on every tenth tick after that.
 //
 // curl -i 127.0.0.1:6190/anything/hello
@@ -147,11 +148,13 @@ fn main() {
     services
         .fixed_properties
         .insert(&["node", "name"], "example-node");
-    // The default of one slot gives you one tick per second. Every slot ticks on its own, so
-    // one slot per thread would multiply the ticks.
-    let plugin = WasmPluginConf::new("plugin-services", PLUGIN_PATH);
+    // Every guest ticks on its own, so one guest gives one tick per second
+    let mut plugin = WasmPluginConf::new("plugin-services", PLUGIN_PATH);
+    plugin.slots = Some(1);
     let runtime = WasmRuntime::new_with_services(vec![plugin], services).unwrap();
-    let chain = runtime.chain(&["plugin-services"]).unwrap();
+    let plugins = WasmPlugins::new(runtime, [("default", ["plugin-services"])]).unwrap();
+    let plugins_service = background_service("wasm plugins", plugins);
+    let chain = plugins_service.task().chain("default").unwrap();
 
     let mut my_proxy =
         pingora_proxy::http_proxy_service(&my_server.configuration, PluginProxy { chain });
@@ -161,5 +164,6 @@ fn main() {
 
     my_server.add_service(my_proxy);
     my_server.add_service(metrics_service);
+    my_server.add_service(plugins_service);
     my_server.run_forever();
 }

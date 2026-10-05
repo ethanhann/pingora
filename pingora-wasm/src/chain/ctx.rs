@@ -50,7 +50,8 @@ pub(super) enum ResponseProgress {
 
 /// Per-request state for the plugins of one chain.
 ///
-/// Create it with [WasmChain::new_ctx] and keep it in your proxy's `CTX`. It holds a reference to
+/// Create it with [WasmChainHandle::new_ctx](crate::WasmChainHandle::new_ctx) or
+/// [WasmChain::new_ctx] and keep it in your proxy's `CTX`. It holds a reference to
 /// its chain and runtime, so a request finishes on the runtime it started on.
 ///
 /// If any of the filters returns an `Err`, return it from your own filter so that Pingora fails

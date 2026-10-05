@@ -109,7 +109,9 @@ impl WasmRuntime {
     ///
     /// Returns the same errors as [WasmRuntime::new]. Also returns
     /// [ERR_INVALID_CONF](crate::ERR_INVALID_CONF) if
-    /// [max_callouts_in_flight](WasmServices::max_callouts_in_flight) is out of range.
+    /// [max_callouts_in_flight](WasmServices::max_callouts_in_flight) is out of range, if
+    /// [shutdown_wait_limit](WasmServices::shutdown_wait_limit) is zero, or if
+    /// [threads](WasmServices::threads) is 0.
     pub fn new_with_services(plugins: Vec<WasmPluginConf>, services: WasmServices) -> Result<Self> {
         let connector = services
             .callout_connector

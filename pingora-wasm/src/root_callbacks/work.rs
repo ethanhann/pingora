@@ -175,7 +175,7 @@ impl RootCallbackLoop {
             |scope, root| scope.on_done(root)
         });
         if let (GuestCallOutcome::Failed, Some(ending)) = (&done, &mut self.ending) {
-            ending.failed_roots.push(address);
+            ending.record_failed_root(address);
         }
         done.work_outcome()
     }
