@@ -18,8 +18,8 @@
 
 use crate::utils::callout_origins::CalloutOriginPerPlugin;
 use crate::utils::proxy::TestProxy;
-use crate::utils::GuestMessageSink;
 use crate::utils::{client, echo_origin, eventually, fixture, guest_lines, guests, url};
+use crate::utils::{raise_open_file_limit, GuestMessageSink};
 use async_trait::async_trait;
 use pingora_core::connectors::http::Connector;
 use pingora_core::server::configuration::ServerConf;
@@ -52,6 +52,7 @@ struct LifecycleServer {
 
 impl LifecycleServer {
     async fn start(port: u16, runtime: WasmRuntime, plugin: &str) -> Self {
+        raise_open_file_limit();
         let plugins = WasmPlugins::new(runtime, [("default", [plugin])]).unwrap();
         let plugins_service = background_service("wasm plugins", plugins);
         let plugins = plugins_service.task();

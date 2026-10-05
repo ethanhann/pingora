@@ -93,10 +93,30 @@ pub fn runtime(port: u16) -> &'static WasmRuntime {
     &RUNTIMES.get().expect("test server should be running")[&port]
 }
 
+/// Raise the limit of open files of this process to 4096, or to the hard limit if lower.
+///
+/// The test server runs about 40 services in one process, which needs more than the soft limit
+/// of 256 that macOS gives a terminal.
+pub fn raise_open_file_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: both calls only read or write `limit`, which outlives them
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return;
+        }
+        limit.rlim_cur = limit.rlim_cur.max(limit.rlim_max.min(4096));
+        libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+    }
+}
+
 pub struct TestServer;
 
 impl TestServer {
     fn start() -> Self {
+        raise_open_file_limit();
         let services = services();
         RUNTIMES
             .set(
