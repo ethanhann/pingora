@@ -135,7 +135,8 @@ pub enum CalloutFailure {
     ResponseTooLarge,
     /// The task sending the callout panicked, or there was no tokio runtime to spawn it on.
     TaskFailed,
-    /// The peer responded to a gRPC callout with a body and an HTTP status other than 200.
+    /// The peer responded to a gRPC callout with an HTTP status other than 200 and no
+    /// `grpc-status`.
     NotGrpcResponse,
     /// A gRPC response had no `grpc-status` or ended inside a message, or a gRPC call ended with
     /// no message.

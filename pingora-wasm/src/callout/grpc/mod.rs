@@ -51,7 +51,6 @@ impl GrpcCalloutEvent {
         GrpcCalloutEvent::Close(GrpcStatus::new(code, message))
     }
 
-    /// Return whether delivering this event ends the callout.
     pub(crate) fn ends_callout(&self, is_stream: bool) -> bool {
         match self {
             GrpcCalloutEvent::Close(_) => true,
@@ -83,8 +82,8 @@ pub(crate) struct GrpcCalloutHandle {
     commands: UnboundedSender<GrpcCommand>,
     task: OnceLock<AbortHandle>,
     cancelled: AtomicBool,
-    /// Set when the plugin opens, sends on, or closes the stream, and taken when a filter
-    /// decides whether a wait covers the stream.
+    /// Set when the plugin opens, sends on, or closes the stream, and cleared when a wait checks
+    /// it or the plugin continues.
     plugin_activity: AtomicBool,
     /// Whether the task queues the messages and the metadata it receives. The plugin of a
     /// request receives them only while it is paused, so they are dropped while it is not.
@@ -149,8 +148,8 @@ impl GrpcCalloutHandle {
     }
 }
 
-/// The sending side of the events of a gRPC callout, which drops the messages and the metadata
-/// that its plugin does not receive.
+/// Event sender for a gRPC callout that drops messages and metadata while its plugin does not
+/// receive them.
 #[derive(Clone)]
 pub(crate) struct GrpcEventSender {
     events: UnboundedSender<GrpcCalloutEvent>,
@@ -173,7 +172,6 @@ impl GrpcEventSender {
     }
 }
 
-/// What an accepted gRPC callout adds to an HTTP one.
 pub(crate) struct AcceptedGrpc {
     pub(crate) stream: bool,
     pub(crate) commands: UnboundedReceiver<GrpcCommand>,

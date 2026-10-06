@@ -66,8 +66,8 @@ pub trait CalloutUpstreams: Send + Sync {
     ///
     /// This is called from inside the plugin's `proxy_http_call`, `proxy_grpc_call`, or
     /// `proxy_grpc_stream`, so it must not block. If it returns `false`, no callout is sent, and
-    /// the plugin gets `BAD_ARGUMENT` from `proxy_http_call` or `PARSE_FAILURE` from a gRPC
-    /// callout.
+    /// the plugin gets `BAD_ARGUMENT` from `proxy_http_call` or `PARSE_FAILURE` from
+    /// `proxy_grpc_call` and `proxy_grpc_stream`.
     fn has_upstream(&self, plugin_name: &str, upstream_name: &str) -> bool;
 
     /// Select the peer for one callout.
@@ -79,7 +79,7 @@ pub trait CalloutUpstreams: Send + Sync {
     ///
     /// `HttpPeer::new` resolves a hostname with a blocking call, so build your peers before the
     /// server starts or pass an IP address. A TLS peer needs one of this crate's TLS features,
-    /// such as `openssl` or `rustls`, to be enabled. Without one, the callout does not connect.
+    /// such as `openssl` or `rustls`, to be enabled. Without one, the callout fails.
     async fn callout_peer(&self, target: &CalloutTarget<'_>) -> Result<Box<HttpPeer>>;
 }
 
@@ -91,9 +91,8 @@ pub struct CalloutTarget<'a> {
     pub plugin_name: &'a str,
     /// The upstream name the plugin passed with the callout.
     ///
-    /// A plugin can pass a serialized `GrpcService` message of the xDS API to `proxy_grpc_call`
-    /// or `proxy_grpc_stream`. The name is then its `envoy_grpc.cluster_name` or
-    /// `google_grpc.target_uri`.
+    /// A plugin can also pass a serialized `GrpcService` protobuf message to `proxy_grpc_call` or
+    /// `proxy_grpc_stream`. The name is then the cluster name or the target URI in that message.
     pub upstream_name: &'a str,
     /// The request header of the callout. For an HTTP callout, its `host` header holds the
     /// `:authority` the plugin passed, which you can use as a load balancing key. For a gRPC

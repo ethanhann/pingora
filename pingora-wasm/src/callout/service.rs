@@ -46,7 +46,7 @@ pub(crate) struct GuestCalloutService {
     grpc_callouts: Mutex<HashMap<CalloutId, Arc<GrpcCalloutHandle>>>,
 }
 
-/// A gRPC callout as the guest asked for it. A stream has no timeout.
+/// A stream has no timeout.
 struct GrpcOpening<'a> {
     upstream: &'a [u8],
     service: &'a [u8],

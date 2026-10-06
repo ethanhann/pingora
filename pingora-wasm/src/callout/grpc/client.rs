@@ -92,7 +92,7 @@ impl Outbox {
             Ok(()) => Writer::Closed,
             // The server may have ended the call already, so its status is still read
             Err(e) => {
-                debug!("gRPC stream write failed, the response is still read: {e}");
+                debug!("gRPC stream write failed, continuing to read the response: {e}");
                 Writer::Closed
             }
         };

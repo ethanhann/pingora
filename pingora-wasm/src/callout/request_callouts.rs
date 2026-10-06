@@ -161,8 +161,8 @@ impl RequestCallouts {
     }
 
     /// Mark the callouts that a wait of the plugin at `position` lasts for, and return whether
-    /// there is one. A call always counts, and a stream counts once the plugin opened, sent on,
-    /// or closed it since the last mark.
+    /// there is one. An HTTP callout or a gRPC call always counts, and a stream counts only if the
+    /// plugin opened, sent on, or closed it since the last mark.
     pub(crate) fn cover_for_wait(&mut self, position: usize) -> bool {
         let mut covers_any = false;
         for pending in self.at(position) {

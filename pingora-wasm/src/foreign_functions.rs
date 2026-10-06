@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Functions of the proxy that plugins call by name
+//! Foreign functions
 
 use proxy_wasm_host::abi::v0_2_1::types::Status;
 use std::collections::HashMap;
@@ -114,7 +114,7 @@ impl<'a> WasmForeignCall<'a> {
 
 /// The error a foreign function returns to the plugin.
 ///
-/// These are the statuses that every Proxy-Wasm SDK accepts from `proxy_call_foreign_function`.
+/// These are the statuses that a plugin of the Rust SDK accepts from `proxy_call_foreign_function`.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WasmForeignFunctionError {

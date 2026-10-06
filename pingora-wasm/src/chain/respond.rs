@@ -131,11 +131,10 @@ impl WasmCtx {
 /// Write a plugin's response to the downstream.
 ///
 /// Pass it the header and body from [RequestOutcome::Respond](crate::RequestOutcome). The body
-/// is left out for a `HEAD` request. A plugin response to a gRPC request has HTTP status 200, has
-/// its status in the headers `grpc-status` and `grpc-message`, and ends with its header. If your
-/// proxy has its own way of writing responses, e.g. to add headers or record metrics, you can use
-/// that instead of this function. Returns the error from the session if writing the header or the
-/// body fails.
+/// is left out for a `HEAD` request. For a gRPC request, the response ends with its header, which
+/// has the gRPC status in `grpc-status` and `grpc-message`. If your proxy has its own way of
+/// writing responses, e.g. to add headers or record metrics, you can use that instead of this
+/// function. Returns the error from the session if writing the header or the body fails.
 pub async fn write_plugin_response<DS: DownstreamSession>(
     session: &mut Session<DS>,
     header: Box<ResponseHeader>,

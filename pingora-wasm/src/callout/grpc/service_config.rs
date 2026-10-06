@@ -12,10 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The upstream of a gRPC callout given as a serialized `GrpcService` message
-//!
-//! A plugin can pass a serialized `GrpcService` message of the xDS API in place of an upstream
-//! name. Its `envoy_grpc.cluster_name` or `google_grpc.target_uri` is used as the name.
+//! Upstream names in serialized `GrpcService` messages
 
 const ENVOY_GRPC: u64 = 1;
 const GOOGLE_GRPC: u64 = 2;
