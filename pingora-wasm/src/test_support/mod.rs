@@ -69,6 +69,11 @@ pub(crate) struct Wat {
     pub(crate) log: Option<&'static str>,
     pub(crate) tick: Option<&'static str>,
     pub(crate) queue_ready: Option<&'static str>,
+    pub(crate) new_connection: Option<&'static str>,
+    pub(crate) downstream_data: Option<&'static str>,
+    pub(crate) upstream_data: Option<&'static str>,
+    pub(crate) downstream_close: Option<&'static str>,
+    pub(crate) upstream_close: Option<&'static str>,
     pub(crate) delete: &'static str,
     /// Data segments the callbacks refer to, e.g. `(data (i32.const 700) "text")`.
     pub(crate) data_segments: &'static str,
@@ -119,6 +124,11 @@ impl Default for Wat {
             log: None,
             tick: None,
             queue_ready: None,
+            new_connection: None,
+            downstream_data: None,
+            upstream_data: None,
+            downstream_close: None,
+            upstream_close: None,
             delete: "",
             data_segments: "",
         }
@@ -168,6 +178,13 @@ fn export_with_no_result(name: &str, params: &str, body: Option<&str>) -> String
 fn export(name: &str, params: &str, body: Option<&str>) -> String {
     match body {
         Some(body) => format!(r#"(func (export "{name}") (param {params}) (result i32) {body})"#),
+        None => String::new(),
+    }
+}
+
+fn optional_export_with_no_result(name: &str, params: &str, body: Option<&str>) -> String {
+    match body {
+        Some(body) => export_with_no_result(name, params, Some(body)),
         None => String::new(),
     }
 }
@@ -226,6 +243,23 @@ pub(crate) fn wat_guest(label: &str, guest: Wat) -> PathBuf {
             Some(body) => export_with_no_result("proxy_on_queue_ready", "i32 i32", Some(body)),
             None => String::new(),
         },
+        export("proxy_on_new_connection", "i32", guest.new_connection),
+        export(
+            "proxy_on_downstream_data",
+            "i32 i32 i32",
+            guest.downstream_data,
+        ),
+        export("proxy_on_upstream_data", "i32 i32 i32", guest.upstream_data),
+        optional_export_with_no_result(
+            "proxy_on_downstream_connection_close",
+            "i32 i32",
+            guest.downstream_close,
+        ),
+        optional_export_with_no_result(
+            "proxy_on_upstream_connection_close",
+            "i32 i32",
+            guest.upstream_close,
+        ),
         export_with_no_result("proxy_on_delete", "i32", Some(guest.delete)),
     ]
     .join("\n");

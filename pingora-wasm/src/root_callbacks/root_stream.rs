@@ -14,12 +14,17 @@
 
 //! Stream state for callbacks outside of a request
 
+use crate::properties::built_in::{write_built_in_property, ReadableHeaders, RequestFacts};
 use crate::properties::{join_path, WasmProperties};
 use crate::WasmForeignFunctions;
 use log::warn;
+use parking_lot::Mutex;
 use proxy_wasm_host::abi::v0_2_1::types::{BufferType, MapType, Status, StreamType};
-use proxy_wasm_host::abi::v0_2_1::{Access, ForeignCall, Invocation, LocalResponse, StreamState};
+use proxy_wasm_host::abi::v0_2_1::{
+    Access, ContextId, ForeignCall, GuestId, Invocation, LocalResponse, StreamState,
+};
 use proxy_wasm_host::{Buffer, HeaderMap, VecHeaderMap};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -29,6 +34,9 @@ pub(crate) struct RootCallbackPluginState {
     pub(crate) fixed_properties: Arc<WasmProperties>,
     foreign_functions: Arc<WasmForeignFunctions>,
     request_change_warning_logged: AtomicBool,
+    /// Facts of the open TCP connections, for a root callback whose effective context is one
+    /// of their contexts.
+    tcp_connections: Mutex<HashMap<(GuestId, ContextId), Arc<RequestFacts>>>,
 }
 
 impl RootCallbackPluginState {
@@ -42,7 +50,26 @@ impl RootCallbackPluginState {
             fixed_properties,
             foreign_functions,
             request_change_warning_logged: AtomicBool::new(false),
+            tcp_connections: Mutex::default(),
         }
+    }
+
+    pub(crate) fn add_tcp_connection(
+        &self,
+        guest: GuestId,
+        context: ContextId,
+        facts: Arc<RequestFacts>,
+    ) {
+        self.tcp_connections.lock().insert((guest, context), facts);
+    }
+
+    pub(crate) fn remove_tcp_connection(&self, guest: GuestId, context: ContextId) {
+        self.tcp_connections.lock().remove(&(guest, context));
+    }
+
+    fn tcp_connection(&self, call: Invocation) -> Option<Arc<RequestFacts>> {
+        let connections = self.tcp_connections.lock();
+        connections.get(&(call.guest, call.context)).cloned()
     }
 
     fn warn_of_request_change_once(&self, function_name: &str) {
@@ -107,6 +134,12 @@ impl StreamState for RootStream {
         Ok(())
     }
 
+    fn close_stream(&mut self, _call: Invocation, _stream: StreamType) -> Result<(), Status> {
+        self.plugin
+            .warn_of_request_change_once("proxy_close_stream");
+        Ok(())
+    }
+
     fn send_local_response(
         &mut self,
         _call: Invocation,
@@ -119,11 +152,20 @@ impl StreamState for RootStream {
 
     fn property(
         &mut self,
-        _call: Invocation,
+        call: Invocation,
         path: &[&[u8]],
         out: &mut Vec<u8>,
     ) -> Result<(), Status> {
         join_path(path.iter().copied(), &mut self.joined_path);
+        if let Some(facts) = self.plugin.tcp_connection(call) {
+            let headers = ReadableHeaders {
+                request: None,
+                response: None,
+            };
+            if write_built_in_property(&self.joined_path, &facts, &headers, out) {
+                return Ok(());
+            }
+        }
         match self.plugin.fixed_properties.get_joined(&self.joined_path) {
             Some(value) => {
                 out.extend_from_slice(value);
@@ -238,6 +280,20 @@ mod tests {
         assert_eq!((first, second), (Ok(()), Ok(())));
         let warnings = crate_log_lines_with("wasm plugin continue-from-tick:");
         let want = "wasm plugin continue-from-tick: proxy_continue_stream called outside of a \
+                    request, no effect, further occurrences are not logged";
+        assert_eq!(warnings, [want]);
+    }
+
+    #[test]
+    fn close_stream_returns_ok_and_warns() {
+        record_crate_logs();
+        let mut stream = root_stream("close-from-tick", WasmProperties::new());
+
+        let closed = stream.close_stream(tick_invocation(), StreamType::Downstream);
+
+        assert_eq!(closed, Ok(()));
+        let warnings = crate_log_lines_with("wasm plugin close-from-tick:");
+        let want = "wasm plugin close-from-tick: proxy_close_stream called outside of a \
                     request, no effect, further occurrences are not logged";
         assert_eq!(warnings, [want]);
     }

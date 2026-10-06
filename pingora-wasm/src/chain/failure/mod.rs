@@ -100,6 +100,14 @@ impl FilterFailure {
         Self::new(PluginFailure::LateResponse, Some(callback), detail)
     }
 
+    /// Make this a `BodyChanged` failure, for a plugin that cannot be skipped because it changed
+    /// `changed` while more of it is to come.
+    pub(in crate::chain) fn with_changed_data(mut self, changed: &str) -> Self {
+        self.kind = PluginFailure::BodyChanged;
+        self.detail = format!("{}, not skipped, {changed} already changed", self.detail);
+        self
+    }
+
     pub(super) fn into_error(self, plugin_name: &str) -> Box<Error> {
         let context = format!("wasm plugin {plugin_name}: {}", self.detail);
         match self.cause {

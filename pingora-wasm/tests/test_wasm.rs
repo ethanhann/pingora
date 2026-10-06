@@ -26,6 +26,8 @@ mod lifecycle;
 mod plugin_services;
 #[path = "test_wasm/properties.rs"]
 mod properties;
+#[path = "test_wasm/tcp.rs"]
+mod tcp;
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;

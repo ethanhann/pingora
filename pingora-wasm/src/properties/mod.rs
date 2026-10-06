@@ -94,7 +94,9 @@ integer_property_value!(i32 => i64, i64 => i64, u16 => u64, u32 => u64, u64 => u
 /// - `request.duration` in nanoseconds and `response.size`, both in `logging`
 /// - `connection.mtls` and `connection.tls_version` for a TLS downstream
 /// - `upstream.address` and `upstream.port` after
-///   [WasmCtx::upstream_connected](crate::WasmCtx::upstream_connected)
+///   [WasmCtx::upstream_connected](crate::WasmCtx::upstream_connected), or after
+///   [WasmTcpProxy](crate::WasmTcpProxy) connects upstream
+/// - `connection_id` and `connection.id` on a connection of [WasmTcpProxy](crate::WasmTcpProxy)
 /// - `plugin_name`, `plugin_root_id`, and `plugin_vm_id`
 ///
 /// Pingora does not count header bytes and does not keep the server name of a TLS connection,

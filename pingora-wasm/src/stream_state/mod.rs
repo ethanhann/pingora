@@ -17,10 +17,12 @@
 mod body;
 mod headers;
 mod plugin_response;
+mod tcp;
 
 pub(crate) use body::BodyBuffer;
 pub(crate) use headers::{RequestHeaders, ResponseHeaders, ResponseTrailers};
 pub(crate) use plugin_response::PluginResponse;
+pub(crate) use tcp::TcpCallbackState;
 
 use crate::callout::grpc::is_grpc_content_type;
 use crate::properties::built_in::{write_built_in_property, ReadableHeaders, RequestFacts};
@@ -59,6 +61,8 @@ pub(crate) struct PingoraStream {
     fixed_properties: Arc<WasmProperties>,
     foreign_functions: Arc<WasmForeignFunctions>,
     joined_path: Vec<u8>,
+    /// Set for the contexts of a TCP connection.
+    pub(crate) tcp: Option<TcpCallbackState>,
 }
 
 impl PingoraStream {
@@ -83,14 +87,29 @@ impl PingoraStream {
     pub(crate) fn clear_continue_requests(&mut self) {
         self.asked_to_continue_request = false;
         self.asked_to_continue_response = false;
+        if let Some(tcp) = &mut self.tcp {
+            tcp.clear_requests();
+        }
     }
 
     pub(crate) fn continue_requested(&self, direction: StreamType) -> bool {
-        match direction {
-            StreamType::HttpRequest => self.asked_to_continue_request,
-            StreamType::HttpResponse => self.asked_to_continue_response,
-            _ => false,
+        match (direction, &self.tcp) {
+            (StreamType::HttpRequest, _) => self.asked_to_continue_request,
+            (StreamType::HttpResponse, _) => self.asked_to_continue_response,
+            (_, Some(tcp)) => tcp.continue_requested(direction),
+            (_, None) => false,
         }
+    }
+
+    fn tcp_data(&mut self, buffer: BufferType) -> Result<&mut dyn Buffer, Status> {
+        let tcp = self.tcp.as_mut().ok_or(Status::NotFound)?;
+        let data = match buffer {
+            BufferType::DownstreamData => tcp.downstream_data.as_mut(),
+            BufferType::UpstreamData => tcp.upstream_data.as_mut(),
+            _ => None,
+        };
+        data.map(|data| data as &mut dyn Buffer)
+            .ok_or(Status::NotFound)
     }
 
     fn is_grpc_request(&self) -> bool {
@@ -175,6 +194,9 @@ impl StreamState for PingoraStream {
         _access: Access,
         buffer: BufferType,
     ) -> Result<&mut dyn Buffer, Status> {
+        if self.tcp.is_some() {
+            return self.tcp_data(buffer);
+        }
         match (buffer, self.access_callback(call)) {
             (BufferType::HttpRequestBody, Some(Callback::RequestBody))
             | (BufferType::HttpResponseBody, Some(Callback::ResponseBody)) => {
@@ -276,6 +298,10 @@ impl StreamState for PingoraStream {
     }
 
     fn continue_stream(&mut self, _call: Invocation, stream: StreamType) -> Result<(), Status> {
+        if let Some(tcp) = &mut self.tcp {
+            tcp.request_continue(stream);
+            return Ok(());
+        }
         match stream {
             StreamType::HttpRequest => self.asked_to_continue_request = true,
             StreamType::HttpResponse => self.asked_to_continue_response = true,
@@ -283,6 +309,16 @@ impl StreamState for PingoraStream {
             StreamType::Upstream => return Err(Status::Unimplemented),
         }
         Ok(())
+    }
+
+    fn close_stream(&mut self, _call: Invocation, stream: StreamType) -> Result<(), Status> {
+        match &mut self.tcp {
+            Some(tcp) => {
+                tcp.request_close(stream);
+                Ok(())
+            }
+            None => Err(Status::Unimplemented),
+        }
     }
 }
 

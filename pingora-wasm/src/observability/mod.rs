@@ -55,8 +55,8 @@ pub trait WasmMetricSink: Send + Sync {
     /// Report a plugin failure.
     ///
     /// This is called when a plugin fails, under both fail policies. `report` has the outcome,
-    /// either a failed request or a skipped plugin. Only the first failure of a plugin on a
-    /// request is reported. By default it does nothing.
+    /// either a failed request or connection, or a skipped plugin. Only the first failure of a
+    /// plugin on a request or connection is reported. By default it does nothing.
     fn plugin_failed(&self, _report: &PluginFailureReport<'_>) {}
 
     /// Report that a guest of the plugin `plugin_name` was replaced after a failure.

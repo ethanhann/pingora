@@ -27,24 +27,25 @@ use std::fmt;
 pub enum PluginFailure {
     /// A callback trapped or returned an error.
     GuestError,
-    /// The plugin had no guest in any of its slots when the request started.
+    /// The plugin had no guest in any of its slots when the request or connection started.
     Unavailable,
-    /// The guest holding the request's context was gone from its slot when a filter was about to
-    /// run the plugin.
+    /// The guest holding the context of the request or connection was gone from its slot when
+    /// the plugin was about to run.
     ///
     /// A guest leaves its slot once a failure has made it unusable, e.g. a trap in another
     /// request.
     GuestLost,
-    /// The plugin paused on headers, on trailers, or on the last chunk of a body with no callout
-    /// to wait for.
+    /// The plugin paused on headers, on trailers, on the last chunk of a body, on
+    /// `proxy_on_new_connection`, or on TCP data once neither side can send more bytes, with no
+    /// callout to wait for.
     PausedWithoutCallout,
     /// A callout wait lasted longer than
     /// [callout_wait_limit](crate::WasmPluginConf::callout_wait_limit).
     WaitLimit,
-    /// The plugin failed while a body it had changed could still have bytes to come.
+    /// The plugin failed while a body or TCP data it had changed could still have bytes to come.
     ///
     /// Only reported for a plugin with [FailPolicy::Open](crate::FailPolicy::Open), where it is
-    /// the reason the request failed and the plugin was not skipped, so the outcome is always
+    /// the reason the request or connection failed and the plugin was not skipped, so the outcome is always
     /// [PluginFailureOutcome::Failed]. [FailPolicy](crate::FailPolicy) describes when a changed
     /// body has this effect. For a plugin with `Closed`, the report has the failure itself, e.g.
     /// [GuestError](Self::GuestError).
@@ -82,18 +83,19 @@ impl fmt::Display for PluginFailure {
     }
 }
 
-/// What a plugin failure did to its request.
+/// What a plugin failure did to its request or connection.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PluginFailureOutcome {
-    /// The request failed.
+    /// The request failed, or the TCP connection was closed.
     ///
     /// Also the outcome of a failure outside of a request, e.g. in `proxy_on_tick`, of a
-    /// failure in [WasmCtx::logging](crate::WasmCtx::logging), and of a failure in
-    /// [WasmCtx::response_trailer_filter](crate::WasmCtx::response_trailer_filter) that does not
-    /// skip the plugin.
+    /// failure in [WasmCtx::logging](crate::WasmCtx::logging) or in a TCP close callback, and of
+    /// a failure in [WasmCtx::response_trailer_filter](crate::WasmCtx::response_trailer_filter)
+    /// that does not skip the plugin.
     Failed,
-    /// The plugin was skipped for the rest of the request, which continued without it.
+    /// The plugin was skipped for the rest of the request or connection, which continued
+    /// without it.
     Skipped,
 }
 
@@ -125,7 +127,7 @@ pub struct PluginFailureReport<'a> {
     pub plugin_name: &'a str,
     /// The kind of failure.
     pub failure: PluginFailure,
-    /// What the failure did to the request.
+    /// What the failure did to the request or connection.
     pub outcome: PluginFailureOutcome,
     /// The ABI name of the callback the failure belongs to, e.g. `proxy_on_request_headers`.
     ///

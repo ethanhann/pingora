@@ -116,7 +116,7 @@ pub(crate) struct GuestPool {
     pool_index: usize,
     spec: GuestSpec,
     plugin: PluginConfig,
-    root_callback_plugin: Arc<RootCallbackPluginState>,
+    pub(crate) root_callback_plugin: Arc<RootCallbackPluginState>,
     root_callback_sender: RootCallbackSender,
     metric_sink: Arc<dyn WasmMetricSink>,
     replaced_guest_warnings: WarningRateLimit,

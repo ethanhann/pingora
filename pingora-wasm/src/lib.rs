@@ -46,6 +46,8 @@
 //!   [CalloutUpstreams].
 //! - Let plugins call Rust functions that your proxy registers, for example a check against your
 //!   own rate limiter. See [WasmForeignFunctions].
+//! - Run plugins on the bytes of a TCP connection, for example to count the traffic of a
+//!   database. See [WasmTcpProxy].
 //! - Run plugins that work on a timer or wait on a shared queue. See [WasmRuntime].
 //! - Publish the counters, gauges, and histograms that plugins define. See [WasmMetricSink].
 //! - Give plugins facts that only your proxy knows, such as the route it chose. See
@@ -70,7 +72,9 @@ mod test_support;
 
 pub use callout::{CalloutTarget, CalloutUpstreams, StaticCalloutUpstreams};
 pub use chain::write_plugin_response;
-pub use chain::{RequestOutcome, WasmChain, WasmCtx};
+pub use chain::{
+    RequestOutcome, WasmChain, WasmCtx, WasmTcpConnection, WasmTcpProxy, WasmTcpUpstream,
+};
 pub use configuration::{CalloutUpstreamConf, WasmConf};
 pub use foreign_functions::{WasmForeignCall, WasmForeignFunctionError, WasmForeignFunctions};
 pub use observability::{

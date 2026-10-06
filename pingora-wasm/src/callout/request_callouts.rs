@@ -238,20 +238,26 @@ impl RequestCallouts {
         &mut self,
         position: usize,
     ) -> Option<(CalloutId, CalloutDelivery)> {
+        let next = self.next_result_at(|at| at == position).await;
+        next.map(|(_, id, delivery)| (id, delivery))
+    }
+
+    /// Wait for the next result or event at any position that `waits` accepts, or return `None`
+    /// once none of them has a callout that the wait covers.
+    pub(crate) async fn next_result_at(
+        &mut self,
+        waits: impl Fn(usize) -> bool,
+    ) -> Option<(usize, CalloutId, CalloutDelivery)> {
         self.pending.retain(|p| match &p.result {
             PendingResult::Grpc(grpc) => !grpc.handle.is_cancelled(),
             _ => true,
         });
-        if !self
-            .pending
-            .iter()
-            .any(|p| p.position == position && p.covered)
-        {
+        if !self.pending.iter().any(|p| waits(p.position) && p.covered) {
             return None;
         }
         let (index, delivery, ends) = poll_fn(|cx| {
             for (index, pending) in self.pending.iter_mut().enumerate() {
-                if pending.position != position {
+                if !waits(pending.position) {
                     continue;
                 }
                 let ready = match &mut pending.result {
@@ -275,11 +281,11 @@ impl RequestCallouts {
             Poll::Pending
         })
         .await;
-        let id = self.pending[index].id;
+        let (position, id) = (self.pending[index].position, self.pending[index].id);
         if ends {
             self.pending.remove(index);
         }
-        Some((id, delivery))
+        Some((position, id, delivery))
     }
 }
 

@@ -107,7 +107,9 @@ pub struct WasmPluginConf {
     ///
     /// A callout wait begins when the plugin pauses a filter to wait for a callout, and ends
     /// when the plugin continues or sends a response. It covers every callout the plugin sends
-    /// in the meantime, and the limit applies to each wait separately.
+    /// in the meantime, and the limit applies to each wait separately. On a TCP connection, a wait
+    /// lasts while the plugin keeps `proxy_on_new_connection` or a direction paused with a callout
+    /// to wait for.
     ///
     /// When a wait reaches the limit, the filter stops waiting and treats this as a plugin
     /// failure, so [fail_policy](Self::fail_policy) decides whether the request fails or
@@ -131,17 +133,18 @@ pub struct WasmPluginConf {
     /// The shortest time between two builds of the guest in a slot. Default 1 second.
     ///
     /// When a guest becomes unusable, e.g. after a trap, its slot is built again by the first
-    /// request after a random wait of 1 to 1.5 times this interval since the slot's last build.
-    /// While no slot has a guest, [fail_policy](Self::fail_policy) decides each request. Must be
-    /// greater than zero.
+    /// request or TCP connection after a random wait of 1 to 1.5 times this interval since the
+    /// slot's last build. While no slot has a guest, [fail_policy](Self::fail_policy) decides
+    /// each request and connection. Must be greater than zero.
     pub rebuild_interval: Duration,
-    /// What happens to a request when the plugin fails. Default [FailPolicy::Closed].
+    /// What happens to a request or a TCP connection when the plugin fails. Default
+    /// [FailPolicy::Closed].
     ///
-    /// [FailPolicy::Open] on a plugin that authorizes requests lets a request through each time
-    /// the plugin crashes, hangs, or is slow.
+    /// [FailPolicy::Open] on a plugin that authorizes requests or connections lets them through
+    /// each time the plugin crashes, hangs, or is slow.
     /// [WasmCtx::skipped_plugins](crate::WasmCtx::skipped_plugins) returns the plugins skipped
     /// on a request, so your proxy can enforce a rule of its own, e.g. deny the request, add a
-    /// header, or tag its access log.
+    /// header, or tag its access log. A [WasmTcpProxy](crate::WasmTcpProxy) has no such list.
     pub fail_policy: FailPolicy,
 }
 

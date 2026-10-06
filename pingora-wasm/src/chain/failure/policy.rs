@@ -83,7 +83,7 @@ impl WasmCtx {
     pub(in crate::chain) fn skip_plugin_or_fail_request(
         &mut self,
         position: usize,
-        mut failure: FilterFailure,
+        failure: FilterFailure,
     ) -> Result<()> {
         let pool = self.pool_at(position);
         if pool.fail_policy != FailPolicy::Open {
@@ -91,11 +91,7 @@ impl WasmCtx {
         }
         if let Some(direction) = self.changed_body_with_bytes_to_come(position) {
             let (body, _) = direction.body_and_limit_names();
-            failure.kind = PluginFailure::BodyChanged;
-            failure.detail = format!(
-                "{}, not skipped, {body} body or its length already changed",
-                failure.detail
-            );
+            let failure = failure.with_changed_data(&format!("{body} body or its length"));
             return Err(self.failed_request_error(position, failure));
         }
         self.report_failure(
@@ -127,7 +123,7 @@ impl WasmCtx {
         match pool.skipped_plugin_warnings.count_event(Instant::now()) {
             Some(1) => warn!("wasm plugin {plugin}: {detail}, continuing without the plugin"),
             Some(skips) => warn!(
-                "wasm plugin {plugin}: {detail}, continuing without the plugin, {skips} requests skipped it since the last warning"
+                "wasm plugin {plugin}: {detail}, continuing without the plugin, {skips} requests or connections skipped it since the last warning"
             ),
             None => debug!("wasm plugin {plugin}: {detail}, continuing without the plugin"),
         }

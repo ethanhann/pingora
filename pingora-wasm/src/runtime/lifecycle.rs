@@ -28,6 +28,7 @@ pub(crate) struct Lifecycle {
     /// Whether the threads were started, set once by the first start or by the end.
     threads_started: OnceCell<bool>,
     ending: AtomicBool,
+    end_begun: Notify,
     live_ctxs: AtomicUsize,
     last_ctx_dropped: Notify,
     ended: AsyncOnceCell<()>,
@@ -44,6 +45,15 @@ impl Lifecycle {
 
     pub(crate) fn begin_end(&self) {
         self.ending.store(true, Ordering::SeqCst);
+        self.end_begun.notify_waiters();
+    }
+
+    pub(crate) async fn wait_for_end_to_begin(&self) {
+        let mut begun = pin!(self.end_begun.notified());
+        begun.as_mut().enable();
+        if !self.is_ending() {
+            begun.await;
+        }
     }
 
     /// Return whether the threads were started, and make sure they can no longer be started.
@@ -218,6 +228,11 @@ mod tests {
         log: None,
         tick: None,
         queue_ready: None,
+        new_connection: None,
+        downstream_data: None,
+        upstream_data: None,
+        downstream_close: None,
+        upstream_close: None,
         delete: LOG_DELETED,
         data_segments: DATA,
     };

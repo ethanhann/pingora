@@ -12,6 +12,7 @@
   (import "env" "proxy_http_call"
     (func $http_call (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
   (import "env" "proxy_continue_stream" (func $continue_stream (param i32) (result i32)))
+  (import "env" "proxy_close_stream" (func $close_stream (param i32) (result i32)))
   (import "env" "proxy_get_buffer_bytes"
     (func $get_buffer (param i32 i32 i32 i32 i32) (result i32)))
   (import "env" "proxy_add_header_map_value"

@@ -154,7 +154,7 @@ impl WasmPlugins {
     ///
     /// Pass the plugin names of each chain given to [WasmPlugins::new], in the same form. New
     /// requests use the new runtime once this returns. The service ends the old runtime after its
-    /// requests have finished, as it would at a shutdown.
+    /// requests have finished and its TCP connections have drained, as it would at a shutdown.
     ///
     /// If this returns an error, the old runtime stays in use. Returns
     /// [ERR_INVALID_CONF](crate::ERR_INVALID_CONF) if the chain names are not the same, if

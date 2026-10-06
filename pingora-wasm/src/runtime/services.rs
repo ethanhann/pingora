@@ -93,9 +93,10 @@ pub struct WasmServices {
     ///
     /// A runtime ends at a graceful shutdown and when
     /// [WasmPlugins::replace](crate::WasmPlugins::replace) replaces it. Once its requests have
-    /// finished, each plugin gets `proxy_on_done` on its root context. A plugin that returns
-    /// `false`, or that still holds contexts from finished requests, has this long to call
-    /// `proxy_done`.
+    /// finished, and its TCP connections have closed after the drain time of
+    /// [WasmTcpProxy::set_drain_timeout](crate::WasmTcpProxy::set_drain_timeout), each plugin
+    /// gets `proxy_on_done` on its root context. A plugin that returns `false`, or that still
+    /// holds contexts from finished requests or connections, has this long to call `proxy_done`.
     ///
     /// Set Pingora's `grace_period_seconds` longer than your requests need plus this limit. At a
     /// fast shutdown, plugins do not get `proxy_on_done`. Must be greater than zero.

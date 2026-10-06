@@ -24,7 +24,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 /// Per-request values for the built-in properties that the headers do not have, recorded as
 /// the filters run.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct RequestFacts {
     pub(crate) client_address: Option<SocketAddr>,
     pub(crate) server_address: Option<SocketAddr>,
@@ -34,6 +34,7 @@ pub(crate) struct RequestFacts {
     pub(crate) upstream_address: Option<SocketAddr>,
     pub(crate) response_code: Option<u16>,
     pub(crate) logging: Option<LoggingFacts>,
+    pub(crate) connection_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -42,7 +43,7 @@ pub(crate) struct RequestStart {
     pub(crate) monotonic_time: Instant,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct TlsFacts {
     has_peer_certificate: bool,
     version: String,
@@ -57,7 +58,7 @@ impl TlsFacts {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct LoggingFacts {
     /// Time elapsed since `request_filter` started, or `None` if it never ran.
     pub(crate) duration: Option<Duration>,
@@ -136,6 +137,10 @@ pub(crate) fn write_built_in_property(
             }
             None => false,
         },
+        b"connection_id" | b"connection\0id" => write_int(
+            facts.connection_id.and_then(|id| i64::try_from(id).ok()),
+            out,
+        ),
         b"connection\0tls_version" => {
             write_bytes(facts.tls.as_ref().map(|t| t.version.as_bytes()), out)
         }

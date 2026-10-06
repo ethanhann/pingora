@@ -47,6 +47,12 @@ pub(super) enum CalloutWaitOutcome {
     PluginSkipped,
 }
 
+/// Return when a callout wait with `limit` that starts now fails.
+pub(in crate::chain) fn callout_wait_deadline(limit: Duration) -> Instant {
+    // `Instant + Duration` panics on overflow
+    Instant::now() + limit.min(LONGEST_WAIT_LIMIT)
+}
+
 impl WasmCtx {
     pub(super) fn refuse_after_cancelled_wait(&mut self) -> Result<()> {
         // A dropped filter future leaves its plugin paused in that filter, so the later header,
@@ -70,8 +76,7 @@ impl WasmCtx {
         // `refuse_after_cancelled_wait` checks
         self.callouts.waiting_position = Some(position);
         let limit = self.pool_at(position).callout_conf.wait_limit;
-        // `Instant + Duration` panics on overflow
-        let deadline = Instant::now() + limit.min(LONGEST_WAIT_LIMIT);
+        let deadline = callout_wait_deadline(limit);
         let delivered = self
             .deliver_results(session, position, &mut phase, deadline)
             .await;

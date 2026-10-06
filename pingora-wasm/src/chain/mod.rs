@@ -22,10 +22,12 @@ mod request;
 mod respond;
 mod response;
 mod slot;
+mod tcp;
 mod wait;
 
 pub use ctx::WasmCtx;
 pub use respond::write_plugin_response;
+pub use tcp::{WasmTcpConnection, WasmTcpProxy, WasmTcpUpstream};
 
 use ctx::ResponseProgress;
 

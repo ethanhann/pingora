@@ -30,7 +30,7 @@ bytes = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
 parking_lot = "0.12"
-tokio = { workspace = true, features = ["rt", "sync", "time", "net", "macros"] }
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "time", "net", "macros"] }
 tracing = { version = "0.1", features = ["log"] }
 futures = { workspace = true }
 h2 = { workspace = true }
