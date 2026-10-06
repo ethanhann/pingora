@@ -17,11 +17,13 @@
 use super::failure::FilterFailure;
 use super::response::{frame_if_length_removed, ResponseSource};
 use super::{ResponseProgress, WasmCtx};
+use crate::callout::grpc::is_grpc_content_type;
 use crate::stream_state::PluginResponse;
 use bytes::Bytes;
-use http::header::CONTENT_LENGTH;
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::Method;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
+use pingora_core::protocols::http::HttpTask;
 use pingora_error::{Error, ErrorType, Result};
 use pingora_http::ResponseHeader;
 use pingora_proxy::Session;
@@ -129,19 +131,32 @@ impl WasmCtx {
 /// Write a plugin's response to the downstream.
 ///
 /// Pass it the header and body from [RequestOutcome::Respond](crate::RequestOutcome). The body
-/// is left out for a `HEAD` request. If your proxy has its own way of writing responses, e.g. to
-/// add headers or record metrics, you can use that instead of this function. Returns the error
-/// from the session if writing the header or the body fails.
+/// is left out for a `HEAD` request. A plugin response to a gRPC request has HTTP status 200, has
+/// its status in the headers `grpc-status` and `grpc-message`, and ends with its header. If your
+/// proxy has its own way of writing responses, e.g. to add headers or record metrics, you can use
+/// that instead of this function. Returns the error from the session if writing the header or the
+/// body fails.
 pub async fn write_plugin_response<DS: DownstreamSession>(
     session: &mut Session<DS>,
     header: Box<ResponseHeader>,
     body: Bytes,
 ) -> Result<()> {
     if session.req_header().method == Method::HEAD || body.is_empty() {
+        if is_grpc_request(session) {
+            // Unlike `write_response_header`, a task ends an HTTP/2 stream with the header, which
+            // is where a gRPC client reads the status of a response with no message
+            let tasks = vec![HttpTask::Header(header, true)];
+            return session.write_response_tasks(tasks).await.map(|_| ());
+        }
         session.write_response_header(header, true).await?;
         // The header alone does not end an HTTP/2 stream, so finish the empty body explicitly
         return session.write_response_body(None, true).await;
     }
     session.write_response_header(header, false).await?;
     session.write_response_body(Some(body), true).await
+}
+
+fn is_grpc_request<DS: DownstreamSession>(session: &Session<DS>) -> bool {
+    let content_type = session.req_header().headers.get(CONTENT_TYPE);
+    content_type.is_some_and(|value| is_grpc_content_type(value.as_bytes()))
 }

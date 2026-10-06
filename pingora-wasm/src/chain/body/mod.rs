@@ -45,7 +45,7 @@ pub(super) enum BodyOutcome {
 
 enum BodyCallbacksOutcome {
     Finished(BodyOutcome),
-    /// The plugin at this step paused with a callout pending.
+    /// The plugin at this step paused with a callout to wait for.
     WaitsForCallout(usize),
 }
 

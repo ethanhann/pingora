@@ -15,9 +15,9 @@
 //! Loaded guest
 
 use super::events::{GuestAddress, RootCallbackEvent, RootCallbackLink};
-use crate::callout::{AcceptedCallout, GuestCalloutService};
+use crate::callout::{AcceptedCallout, GrpcPending, GuestCalloutService};
 use crate::root_callbacks::RootStream;
-use proxy_wasm_host::abi::v0_2_1::{CallScope, ContextId, ContextState, Guest};
+use proxy_wasm_host::abi::v0_2_1::{CallScope, CalloutId, ContextId, ContextState, Guest};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -97,22 +97,27 @@ impl Loaded {
 
     /// Record that the guest is keeping `context` after its request ended.
     ///
-    /// `callouts` are the ones the context sent while it was ending.
+    /// `callouts` are the ones the context sent while it was ending, and `streams` are its open
+    /// gRPC streams, which move with it to the root callback thread.
     pub(crate) fn hold_context(
         &mut self,
         context: ContextId,
         needs_on_log: bool,
         callouts: Vec<AcceptedCallout>,
+        streams: Vec<(CalloutId, GrpcPending)>,
     ) {
         // Any other callout the context still has open is failed, since the request that would
         // have received its result is gone
+        let kept = |id: CalloutId| {
+            callouts.iter().any(|callout| callout.id == id)
+                || streams.iter().any(|(stream, _)| *stream == id)
+        };
         let open_callouts_to_fail = self
             .guest
             .open_callouts()
             .into_iter()
-            .filter(|open| open.caller == context)
-            .map(|open| open.callout)
-            .filter(|id| callouts.iter().all(|callout| callout.id != *id))
+            .filter(|open| open.caller == context && !kept(open.callout))
+            .map(|open| (open.callout, open.kind))
             .collect::<Vec<_>>();
         self.held_contexts.push(HeldContext {
             context,
@@ -120,6 +125,14 @@ impl Loaded {
         });
         self.held_context_count.fetch_add(1, Ordering::Relaxed);
         self.send_callouts_to_root_callbacks(context, callouts);
+        if !streams.is_empty() {
+            self.root_callback_link
+                .send(RootCallbackEvent::StreamsToAdopt {
+                    address: self.root_callback_link.address,
+                    context,
+                    streams,
+                });
+        }
         if !open_callouts_to_fail.is_empty() {
             self.root_callback_link
                 .send(RootCallbackEvent::OpenCalloutsToFail {

@@ -15,21 +15,22 @@
 //! Waiting for callouts
 //!
 //! A plugin that pauses with a callout in flight keeps its filter waiting. Results are delivered
-//! to the plugin as they arrive, until it continues, sends a response, or has no callout left.
+//! to the plugin as they arrive, until it continues, sends a response, or has no callout left to
+//! wait for.
 
 mod delivery;
+mod start;
 
 pub(super) use delivery::PausedPhase;
 
 use super::failure::FilterFailure;
 use super::WasmCtx;
-use crate::callout::CalloutResult;
+use crate::callout::CalloutDelivery;
 use crate::stream_state::PluginResponse;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_error::{Error, ErrorType, Result};
 use pingora_proxy::Session;
 use pingora_timeout::timeout;
-use proxy_wasm_host::abi::v0_2_1::types::{Action, StreamType};
 use proxy_wasm_host::abi::v0_2_1::CalloutId;
 use std::future::{poll_fn, Future};
 use std::pin::pin;
@@ -55,27 +56,6 @@ impl WasmCtx {
                 Err(self.failed_request_error(position, FilterFailure::cancelled_wait()))
             }
             None => Ok(()),
-        }
-    }
-
-    pub(super) fn plugin_stays_paused(&mut self, action: Action, direction: StreamType) -> bool {
-        action == Action::Pause && !self.stream().continue_requested(direction)
-    }
-
-    pub(super) fn waits_for_callout(&self, position: usize) -> bool {
-        self.callouts.has_pending(position)
-    }
-
-    pub(super) fn start_callouts(&mut self, position: usize, paused: bool) {
-        let runtime = self.chain.runtime.clone();
-        for callout in self.callouts.take_accepted() {
-            let id = callout.id;
-            match runtime.callout_launcher.spawn(callout) {
-                Some(result) if paused => self.callouts.add_pending(position, id, result),
-                // The callout of a plugin that is not paused is still sent, and its result is
-                // discarded
-                _ => {}
-            }
         }
     }
 
@@ -125,16 +105,19 @@ impl WasmCtx {
             let Ok(next) = timeout(remaining, next).await else {
                 return Ok(None);
             };
-            let Some((id, result)) = next? else {
+            let Some((id, delivery)) = next? else {
                 return Ok(Some(CalloutWaitOutcome::StillPaused));
             };
-            if !self.deliver_callout_result(session, position, phase, id, &result)? {
+            if !self.deliver_callout_result(session, position, phase, id, &delivery)? {
                 return Ok(Some(CalloutWaitOutcome::PluginSkipped));
             }
             let sent = self.stream().plugin_response.take();
             let continued = self.stream().continue_requested(phase.direction());
             let paused = sent.is_none() && !continued;
             self.start_callouts(position, paused);
+            if paused {
+                self.callouts.cover_for_wait(position);
+            }
             if let Some(response) = sent {
                 return Ok(Some(CalloutWaitOutcome::Respond(Box::new(response))));
             }
@@ -151,7 +134,7 @@ impl WasmCtx {
         &mut self,
         session: &mut Session<DS>,
         position: usize,
-    ) -> Result<Option<(CalloutId, CalloutResult)>> {
+    ) -> Result<Option<(CalloutId, CalloutDelivery)>> {
         let plugin = self.pool_at(position).name.clone();
         let mut result = pin!(self.callouts.next_result(position));
         let Some(stream_close) = session.as_downstream_mut().watch_h2_stream_close() else {
@@ -179,70 +162,35 @@ impl WasmCtx {
 
 #[cfg(test)]
 mod tests {
+    use crate::callout::grpc::GrpcCommand;
+    use crate::callout::GrpcCalloutEvent;
     use crate::test_support::callouts::{
-        authz_services, callout_ctx, callout_ctx_with_services, FixedSender, CALL_AND_LOG_STATUS,
-        CALL_AND_PAUSE, CALL_AND_TRAP, CALL_TWICE_AND_PAUSE, CALL_WITHOUT_PAUSE,
-        CALL_WITH_NO_RESULT, CONTINUE_REQUEST, CONTINUE_REQUEST_AND_PAUSE,
-        CONTINUE_REQUEST_ON_SECOND_DELIVERY, CONTINUE_RESPONSE, CONTINUE_RESPONSE_AND_PAUSE,
-        LOG_RESULT, MARK_ASKED_AND_CONTINUE, RELAY_CALLOUT_BODY, STAY_PAUSED, TEAPOT_IF_ASKED,
+        asks_on_request_headers, authz_services, callout_ctx, callout_ctx_with_services, grpc_ctx,
+        FixedSender, CALL_AND_PAUSE, CALL_TWICE_AND_PAUSE, CALL_WITHOUT_PAUSE, CONTINUE_REQUEST,
+        CONTINUE_REQUEST_ON_SECOND_DELIVERY, CONTINUE_RESPONSE, MARK_ASKED_AND_CONTINUE,
+        OPEN_STREAM_AND_CONTINUE, RELAY_CALLOUT_BODY, STAY_PAUSED,
     };
     use crate::test_support::phases::{
         cancel_a_wait_in, plugin_with_callback_in, run_phase, run_request_headers, Phase,
         PhaseInputs,
     };
     use crate::test_support::{
-        body_chunk, body_plugin, eventually, read_downstream, session, RecordedGuestLogs, Wat,
-        CONTINUE, GET, HOLD, MARK_A_REQUEST, MARK_B_REQUEST, MARK_B_RESPONSE, PAUSE, POST,
-        REMOVE_LENGTH, SET_TRAILER, TEAPOT, TRAP,
+        body_chunk, body_plugin, eventually, session, RecordedGuestLogs, Wat, CONTINUE, GET, HOLD,
+        MARK_A_REQUEST, MARK_B_RESPONSE, POST, REMOVE_LENGTH, SET_TRAILER,
     };
-    use crate::{RequestOutcome, WasmPluginConf, WasmServices, ERR_PLUGIN_FAILED};
+    use crate::{RequestOutcome, ERR_PLUGIN_FAILED};
     use bytes::Bytes;
     use futures::poll;
-    use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
-    use pingora_error::ErrorType;
+    use http::header::CONTENT_LENGTH;
+
     use std::pin::pin;
+
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::Notify;
+    use tokio::time::timeout;
 
     const BOTH_DIRECTIONS: &str = "(call $continue (i32.const 0)) (call $continue (i32.const 1))";
-    const CALL_AND_RESPOND: &str =
-        "(drop (call $call_authz_and_pause)) (call $respond (i32.const 403))";
-
-    /// Return a plugin that makes a callout and pauses in `proxy_on_request_headers`, with
-    /// `delivery` as its `proxy_on_http_call_response`.
-    fn asks_on_request_headers(name: &str, delivery: &'static str) -> WasmPluginConf {
-        let wat = Wat {
-            request_headers: CALL_AND_PAUSE,
-            http_call_response: Some(delivery),
-            ..Wat::default()
-        };
-        body_plugin(name, wat)
-    }
-
-    #[tokio::test]
-    async fn next_plugin_sees_request_changed_during_delivery() {
-        let sender = FixedSender::responds("allowed");
-        let reads_the_header = Wat {
-            request_headers: TEAPOT_IF_ASKED,
-            ..Wat::default()
-        };
-        let plugins = vec![
-            asks_on_request_headers("a", MARK_ASKED_AND_CONTINUE),
-            body_plugin("b", reads_the_header),
-        ];
-        let (_runtime, mut ctx) = callout_ctx(plugins, sender.clone());
-        let (mut session, _client) = session(GET).await;
-
-        let outcome = ctx.request_filter(&mut session).await.unwrap();
-
-        let RequestOutcome::Respond(header, _) = outcome else {
-            panic!("{outcome:?}");
-        };
-        assert_eq!(header.status, 418);
-        assert_eq!(session.req_header().headers["x-asked"], "yes");
-        let sent = sender.sent.lock();
-        assert_eq!(sent[..], [("authz".to_string(), "/check".to_string())]);
-    }
 
     #[tokio::test]
     async fn request_body_runs_after_callout_wait_on_headers() {
@@ -262,28 +210,6 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(inputs.body, body_chunk("ax"));
-    }
-
-    #[tokio::test]
-    async fn plugin_responds_with_callout_body() {
-        let sender = FixedSender::responds("denied by authz");
-        let plugins = vec![
-            body_plugin("first", Wat::response_headers(REMOVE_LENGTH)),
-            asks_on_request_headers("last", RELAY_CALLOUT_BODY),
-        ];
-        let (_runtime, mut ctx) = callout_ctx(plugins, sender);
-        let (mut session, _client) = session(GET).await;
-
-        let outcome = ctx.request_filter(&mut session).await.unwrap();
-
-        let RequestOutcome::Respond(header, body) = outcome else {
-            panic!("{outcome:?}");
-        };
-        assert_eq!(header.status, 418);
-        assert_eq!(&body[..], b"denied by authz");
-        assert!(!header.headers.contains_key(CONTENT_LENGTH));
-        assert_eq!(header.headers[TRANSFER_ENCODING], "chunked");
-        assert!(ctx.plugin_responded());
     }
 
     #[tokio::test]
@@ -320,44 +246,6 @@ mod tests {
             matches!(outcome, Ok(RequestOutcome::Continue)),
             "{outcome:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn continue_inside_pausing_callback_resumes_request_headers() {
-        let wat = Wat {
-            request_headers: CONTINUE_REQUEST_AND_PAUSE,
-            ..Wat::default()
-        };
-        let sender = FixedSender::responds("unused");
-        let (_runtime, mut ctx) = callout_ctx(vec![body_plugin("a", wat)], sender);
-        let (mut session, _client) = session(GET).await;
-
-        let outcome = ctx.request_filter(&mut session).await;
-
-        assert!(matches!(outcome, Ok(RequestOutcome::Continue)));
-    }
-
-    #[tokio::test]
-    async fn continue_inside_pausing_callback_resumes_phase() {
-        let cases = [
-            (Phase::RequestBody, CONTINUE_REQUEST_AND_PAUSE),
-            (Phase::ResponseHeaders, CONTINUE_RESPONSE_AND_PAUSE),
-            (Phase::ResponseBody, CONTINUE_RESPONSE_AND_PAUSE),
-        ];
-
-        for (phase, callback) in cases {
-            let sender = FixedSender::responds("unused");
-            let plugins = vec![plugin_with_callback_in("a", phase, callback, STAY_PAUSED)];
-            let (_runtime, mut ctx) = callout_ctx(plugins, sender);
-            let (mut session, _client) = session(POST).await;
-            run_request_headers(&mut ctx, &mut session).await;
-            let mut inputs = PhaseInputs::new();
-
-            let result = run_phase(&mut ctx, &mut session, phase, &mut inputs).await;
-
-            assert!(result.is_ok(), "{phase:?}");
-            assert_eq!(inputs.body, body_chunk("x"), "{phase:?}");
-        }
     }
 
     #[tokio::test]
@@ -406,81 +294,6 @@ mod tests {
 
         assert!(waiting.is_pending());
         assert!(runtime.inner.pools[0].is_slot_free(0));
-    }
-
-    #[tokio::test]
-    async fn callout_is_sent_when_plugin_ahead_in_chain_stops_response() {
-        let cases = [TEAPOT, PAUSE, TRAP];
-
-        for stops in cases {
-            let sender = FixedSender::responds("stored");
-            let plugins = vec![
-                body_plugin("first", Wat::response_headers(stops)),
-                body_plugin("last", Wat::response_headers(CALL_WITHOUT_PAUSE)),
-            ];
-            let (_runtime, mut ctx) = callout_ctx(plugins, sender.clone());
-            let (mut session, _client) = session(GET).await;
-            run_request_headers(&mut ctx, &mut session).await;
-            let mut inputs = PhaseInputs::new();
-
-            let result =
-                run_phase(&mut ctx, &mut session, Phase::ResponseHeaders, &mut inputs).await;
-
-            assert!(result.is_err(), "{stops}");
-            assert!(eventually(|| sender.sent_count() == 1).await, "{stops}");
-        }
-    }
-
-    #[tokio::test]
-    async fn callout_is_sent_when_plugin_responds_in_same_callback() {
-        let wat = Wat {
-            request_headers: CALL_AND_RESPOND,
-            ..Wat::default()
-        };
-        let sender = FixedSender::responds("stored");
-        let (_runtime, mut ctx) = callout_ctx(vec![body_plugin("a", wat)], sender.clone());
-        let (mut session, _client) = session(GET).await;
-
-        let outcome = ctx.request_filter(&mut session).await.unwrap();
-
-        assert!(matches!(outcome, RequestOutcome::Respond(..)));
-        assert!(eventually(|| sender.sent_count() == 1).await);
-    }
-
-    #[tokio::test]
-    async fn callout_from_trapped_guest_call_is_not_sent() {
-        let wat = Wat {
-            request_headers: CALL_AND_TRAP,
-            ..Wat::default()
-        };
-        let sender = FixedSender::responds("allowed");
-        let (_runtime, mut ctx) = callout_ctx(vec![body_plugin("a", wat)], sender.clone());
-        let (mut session, _client) = session(GET).await;
-        let trapped = ctx.request_filter(&mut session).await;
-
-        ctx.logging(&mut session).await;
-
-        assert_eq!(trapped.unwrap_err().etype(), &ERR_PLUGIN_FAILED);
-        tokio::task::yield_now().await;
-        assert_eq!(sender.sent_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn held_body_moves_to_next_plugin_after_callout() {
-        let phase = Phase::RequestBody;
-        let plugins = vec![
-            plugin_with_callback_in("a", phase, CALL_AND_PAUSE, CONTINUE_REQUEST),
-            body_plugin("b", Wat::request_body(MARK_B_REQUEST)),
-        ];
-        let (_runtime, mut ctx) = callout_ctx(plugins, FixedSender::responds("allowed"));
-        let (mut session, _client) = session(POST).await;
-        run_request_headers(&mut ctx, &mut session).await;
-        let mut inputs = PhaseInputs::new();
-
-        let result = run_phase(&mut ctx, &mut session, phase, &mut inputs).await;
-
-        assert!(result.is_ok());
-        assert_eq!(inputs.body, body_chunk("bx"));
     }
 
     #[tokio::test]
@@ -549,31 +362,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugin_responds_to_request_body_from_delivery() {
-        let phase = Phase::RequestBody;
-        let plugins = vec![plugin_with_callback_in(
-            "a",
-            phase,
-            CALL_AND_PAUSE,
-            RELAY_CALLOUT_BODY,
-        )];
-        let (_runtime, mut ctx) = callout_ctx(plugins, FixedSender::responds("denied"));
-        let (mut session, mut client) = session(POST).await;
-        run_request_headers(&mut ctx, &mut session).await;
-        let mut inputs = PhaseInputs::new();
-
-        let err = run_phase(&mut ctx, &mut session, phase, &mut inputs)
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.etype(), &ErrorType::HTTPStatus(418));
-        assert!(ctx.plugin_responded());
-        let written = read_downstream(&mut client).await;
-        assert!(written.starts_with("HTTP/1.1 418"), "{written}");
-        assert!(written.ends_with("denied"), "{written}");
-    }
-
-    #[tokio::test]
     async fn remaining_plugins_run_after_callout_wait() {
         let cases = [
             (Phase::ResponseHeaders, Wat::response_headers(REMOVE_LENGTH)),
@@ -630,114 +418,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugin_replaces_upstream_response_from_delivery() {
-        let phase = Phase::ResponseHeaders;
-        let plugins = vec![plugin_with_callback_in(
-            "a",
-            phase,
-            CALL_AND_PAUSE,
-            RELAY_CALLOUT_BODY,
-        )];
-        let (_runtime, mut ctx) = callout_ctx(plugins, FixedSender::responds("replaced"));
-        let (mut session, mut client) = session(GET).await;
-        run_request_headers(&mut ctx, &mut session).await;
-        let mut inputs = PhaseInputs::new();
-
-        let err = run_phase(&mut ctx, &mut session, phase, &mut inputs)
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.etype(), &ErrorType::HTTPStatus(418));
-        let written = read_downstream(&mut client).await;
-        assert!(written.ends_with("replaced"), "{written}");
-    }
-
-    #[tokio::test]
-    async fn response_from_delivery_after_response_header_fails() {
-        let phase = Phase::ResponseBody;
-        let plugins = vec![plugin_with_callback_in(
-            "a",
-            phase,
-            CALL_AND_PAUSE,
-            RELAY_CALLOUT_BODY,
-        )];
-        let (_runtime, mut ctx) = callout_ctx(plugins, FixedSender::responds("late"));
-        let (mut session, _client) = session(GET).await;
-        run_request_headers(&mut ctx, &mut session).await;
-        let mut inputs = PhaseInputs::new();
-
-        let err = run_phase(&mut ctx, &mut session, phase, &mut inputs)
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
-        assert!(err.to_string().contains("after the response header"));
-    }
-
-    #[tokio::test]
-    async fn callout_in_flight_at_request_end_is_failed() {
-        let wat = Wat {
-            request_headers: CALL_WITHOUT_PAUSE,
-            http_call_response: Some(LOG_RESULT),
-            ..Wat::default()
-        };
-        let sender = FixedSender::responds_after("late", Arc::new(Notify::new()));
-        let logs = Arc::new(RecordedGuestLogs::default());
-        let services = WasmServices {
-            log_sink: logs.clone(),
-            ..authz_services()
-        };
-        let plugins = vec![body_plugin("a", wat)];
-        let (runtime, mut ctx) = callout_ctx_with_services(plugins, sender.clone(), services);
-        let (mut session, _client) = session(GET).await;
-        let outcome = ctx.request_filter(&mut session).await.unwrap();
-
-        ctx.logging(&mut session).await;
-
-        assert!(matches!(outcome, RequestOutcome::Continue));
-        assert!(eventually(|| sender.sent_count() == 1).await);
-        assert_eq!(logs.0.lock()[..], ["failed".to_string()]);
-        assert_eq!(runtime.open_contexts(), 0);
-        assert_eq!(runtime.callouts_in_flight(), 1);
-    }
-
-    #[tokio::test]
-    async fn callout_from_log_callback_is_sent() {
-        let wat = Wat {
-            log: Some(CALL_WITH_NO_RESULT),
-            ..Wat::default()
-        };
-        let sender = FixedSender::responds("stored");
-        let (_runtime, mut ctx) = callout_ctx(vec![body_plugin("a", wat)], sender.clone());
-        let (mut session, _client) = session(GET).await;
-        run_request_headers(&mut ctx, &mut session).await;
-
-        ctx.logging(&mut session).await;
-
-        assert!(eventually(|| sender.sent_count() == 1).await);
-    }
-
-    #[tokio::test]
-    async fn trap_in_delivery_fails_request_and_replaces_guest() {
-        let sender = FixedSender::responds("allowed");
-        let plugins = vec![asks_on_request_headers("a", TRAP)];
-        let (runtime, mut ctx) = callout_ctx(plugins, sender);
-        let (mut session, _client) = session(GET).await;
-
-        let err = ctx.request_filter(&mut session).await.unwrap_err();
-
-        assert_eq!(err.etype(), &ERR_PLUGIN_FAILED);
-        assert!(
-            err.to_string()
-                .contains("proxy_on_http_call_response failed"),
-            "{err}"
-        );
-        assert_eq!(session.req_header().raw_path(), b"/original");
-        let slot = runtime.inner.pools[0].lock_slot(0);
-        assert!(slot.as_ref().unwrap().guest.is_serving());
-    }
-
-    #[tokio::test]
     async fn panicking_callout_task_delivers_failure() {
         let plugins = vec![asks_on_request_headers("a", RELAY_CALLOUT_BODY)];
         let (_runtime, mut ctx) = callout_ctx(plugins, FixedSender::panics());
@@ -749,37 +429,6 @@ mod tests {
             panic!("{outcome:?}");
         };
         assert_eq!(header.status, 500);
-    }
-
-    #[tokio::test]
-    async fn callout_over_limit_is_failed_without_being_sent() {
-        let gate = Arc::new(Notify::new());
-        let sender = FixedSender::responds_after("allowed", gate.clone());
-        let wat = Wat {
-            request_headers: CALL_TWICE_AND_PAUSE,
-            http_call_response: Some(RELAY_CALLOUT_BODY),
-            ..Wat::default()
-        };
-        let services = WasmServices {
-            max_callouts_in_flight: 1,
-            ..authz_services()
-        };
-        let plugins = vec![body_plugin("a", wat)];
-        let (runtime, mut ctx) = callout_ctx_with_services(plugins, sender.clone(), services);
-        let (mut session, _client) = session(GET).await;
-
-        let outcome = ctx.request_filter(&mut session).await.unwrap();
-
-        let RequestOutcome::Respond(header, body) = outcome else {
-            panic!("{outcome:?}");
-        };
-        assert_eq!(header.status, 418);
-        assert!(body.ends_with(b"reset reason: overflow"), "{body:?}");
-        assert!(eventually(|| sender.sent_count() == 1).await);
-        assert_eq!(runtime.callouts_in_flight(), 1);
-        gate.notify_one();
-        assert!(eventually(|| runtime.callouts_in_flight() == 0).await);
-        assert_eq!(sender.sent_count(), 1);
     }
 
     #[tokio::test]
@@ -854,31 +503,94 @@ mod tests {
         assert_eq!(runtime.open_contexts(), 0);
     }
 
-    #[test]
-    fn dropping_ctx_outside_tokio_runtime_sends_no_callout() {
+    #[tokio::test]
+    async fn stream_event_reaches_plugin_only_while_paused() {
         let wat = Wat {
-            done: CALL_AND_LOG_STATUS,
+            request_headers: OPEN_STREAM_AND_CONTINUE,
+            response_headers: Some("(call $grpc_send_and_pause)"),
+            grpc_receive: Some(
+                "(call $log_grpc_message (local.get 2)) (call $continue (i32.const 1))",
+            ),
             ..Wat::default()
         };
-        let sender = FixedSender::responds("stored");
-        let logs = Arc::new(RecordedGuestLogs::default());
-        let services = WasmServices {
-            log_sink: logs.clone(),
-            ..authz_services()
+        let early = GrpcCalloutEvent::Message(Bytes::from_static(b"early"));
+        let sender = FixedSender::grpc(Vec::new(), vec![early], true);
+        let (_runtime, mut ctx, logs) = grpc_ctx(wat, sender.clone());
+        let (mut session, _client) = session(GET).await;
+        ctx.request_filter(&mut session).await.unwrap();
+        assert!(eventually(|| sender.sent_count() == 1).await);
+        let mut inputs = PhaseInputs::new();
+
+        let continued =
+            run_phase(&mut ctx, &mut session, Phase::ResponseHeaders, &mut inputs).await;
+
+        assert!(continued.is_ok());
+        assert_eq!(logs.0.lock()[..], ["ping".to_string()]);
+        let ping = GrpcCommand::Send {
+            message: Bytes::from_static(b"ping"),
+            end_of_stream: false,
         };
+        assert_eq!(sender.grpc_commands.lock()[..], [ping]);
+    }
+
+    #[tokio::test]
+    async fn idle_stream_does_not_keep_paused_plugin_waiting() {
+        let cases = [
+            ("pause with no callout", "i32.const 1", None),
+            (
+                "delivery that stays paused",
+                "(call $call_authz_and_pause)",
+                Some(""),
+            ),
+        ];
+        for (case, request_body, http_call_response) in cases {
+            let wat = Wat {
+                request_headers: OPEN_STREAM_AND_CONTINUE,
+                request_body: Some(request_body),
+                http_call_response,
+                ..Wat::default()
+            };
+            let (_runtime, mut ctx, _logs) = grpc_ctx(wat, FixedSender::responds("ok"));
+            let (mut session, _client) = session(POST).await;
+            run_request_headers(&mut ctx, &mut session).await;
+            let mut inputs = PhaseInputs::new();
+            let body = run_phase(&mut ctx, &mut session, Phase::RequestBody, &mut inputs);
+
+            let failed = timeout(Duration::from_secs(5), body).await;
+
+            let error = failed.expect(case).unwrap_err().to_string();
+            let want = "paused on the last body chunk with no callout to wait for";
+            assert!(error.contains(want), "{case}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn overflowing_stream_of_paused_plugin_gets_its_close() {
+        let wat = Wat {
+            request_headers: "(call $open_grpc_stream) (call $open_grpc_stream) (i32.const 1)",
+            grpc_close: Some(
+                "(drop (call $log (i32.const 2) (i32.const 340) (i32.const 6)))
+                (call $continue (i32.const 0))",
+            ),
+            ..Wat::default()
+        };
+        let sender = FixedSender::grpc_released_by(Arc::new(Notify::new()), Vec::new());
+        let logs = Arc::new(RecordedGuestLogs::default());
+        let mut services = authz_services();
+        services.log_sink = logs.clone();
+        services.max_callouts_in_flight = 1;
         let plugins = vec![body_plugin("a", wat)];
-        let (runtime, mut ctx) = callout_ctx_with_services(plugins, sender.clone(), services);
-        let tokio_runtime = tokio::runtime::Runtime::new().unwrap();
-        let started = tokio_runtime.block_on(async {
-            let (mut session, _client) = session(GET).await;
-            ctx.request_filter(&mut session).await
-        });
+        let (runtime, mut ctx) = callout_ctx_with_services(plugins, sender, services);
+        let (mut session, _client) = session(GET).await;
 
-        drop(ctx);
+        let outcome = timeout(Duration::from_secs(5), ctx.request_filter(&mut session)).await;
 
-        assert!(started.is_ok());
-        assert_eq!(logs.0.lock()[..], ["accepted".to_string()]);
-        assert_eq!(sender.sent_count(), 0);
-        assert_eq!(runtime.open_contexts(), 0);
+        assert!(
+            matches!(outcome, Ok(Ok(RequestOutcome::Continue))),
+            "{outcome:?}"
+        );
+        assert_eq!(logs.0.lock()[..], ["closed".to_string()]);
+        ctx.logging(&mut session).await;
+        assert!(eventually(|| runtime.callouts_in_flight() == 0).await);
     }
 }

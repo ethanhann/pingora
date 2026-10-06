@@ -26,7 +26,7 @@ use std::fmt;
 /// - has no guest in any of its slots when the request starts
 /// - loses the guest that held the request's context, e.g. to a trap in another request
 /// - pauses on request headers, response headers, response trailers, or the last chunk of a
-///   body with no callout pending
+///   body with no callout to wait for
 /// - waits for callouts longer than
 ///   [callout_wait_limit](crate::WasmPluginConf::callout_wait_limit)
 ///

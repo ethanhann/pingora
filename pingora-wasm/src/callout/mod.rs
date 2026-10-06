@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! HTTP callouts from plugins
+//! Callouts from plugins
 //!
-//! A plugin makes a callout with `proxy_http_call`. The call is checked and recorded by the
-//! guest's callout service, and a spawned task then sends the request to a peer of the chosen
-//! upstream. The result is delivered to `proxy_on_http_call_response` by the filter that ran the
-//! plugin, or by the root callback thread when the callout was made from a root context.
+//! A plugin makes a callout with `proxy_http_call`, `proxy_grpc_call`, or `proxy_grpc_stream`.
+//! The call is checked and recorded by the guest's callout service, and a spawned task then sends
+//! the request to a peer of the chosen upstream. The result is delivered to the plugin by the
+//! filter that ran it, or by the root callback thread when the callout was made from a root
+//! context.
 
 mod client;
+pub(crate) mod grpc;
 pub(crate) mod headers;
 mod request_callouts;
 mod result;
@@ -27,8 +29,9 @@ mod service;
 mod upstreams;
 
 pub(crate) use client::{CalloutSender, ConnectorSender};
-pub(crate) use request_callouts::{PendingResult, RequestCallouts};
-pub(crate) use result::CalloutResult;
+pub(crate) use grpc::{GrpcCalloutEvent, GrpcCalloutHandle};
+pub(crate) use request_callouts::{GrpcPending, PendingResult, RequestCallouts};
+pub(crate) use result::HttpCalloutResult;
 pub(crate) use service::GuestCalloutService;
 pub use upstreams::{CalloutTarget, CalloutUpstreams, StaticCalloutUpstreams};
 
@@ -36,7 +39,11 @@ use bytes::Bytes;
 use headers::RejectedCalloutHeader;
 use log::warn;
 use pingora_http::RequestHeader;
-use proxy_wasm_host::abi::v0_2_1::{Callback, CalloutId};
+use proxy_wasm_host::abi::v0_2_1::{
+    CallScope, Callback, CalloutId, ContextId, GuestError, StreamState,
+};
+use result::borrowed_header_pairs;
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -99,7 +106,7 @@ impl PluginCalloutConf {
     pub(crate) fn warn_of_overflow_once(&self) {
         if !self.overflow_warning_logged.swap(true, Ordering::Relaxed) {
             warn!(
-                "wasm plugin {}: max_callouts_in_flight reached, callout failed with a 503 response, further occurrences are not logged",
+                "wasm plugin {}: max_callouts_in_flight reached, callout failed, further occurrences are not logged",
                 self.plugin_name
             );
         }
@@ -118,7 +125,7 @@ impl PluginCalloutConf {
     }
 }
 
-/// A callout accepted from `proxy_http_call` whose task has not been started yet.
+/// A callout accepted from a plugin whose task has not been started yet.
 pub(crate) struct AcceptedCallout {
     pub(crate) id: CalloutId,
     pub(crate) plugin_conf: Arc<PluginCalloutConf>,
@@ -127,6 +134,52 @@ pub(crate) struct AcceptedCallout {
     pub(crate) body: Bytes,
     pub(crate) timeout: Duration,
     pub(crate) callback: Option<Callback>,
+    pub(crate) grpc: Option<grpc::AcceptedGrpc>,
+}
+
+/// The result of an HTTP callout, or one event of a gRPC callout, for delivery to the plugin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CalloutDelivery {
+    Http(HttpCalloutResult),
+    Grpc(GrpcCalloutEvent),
+}
+
+impl CalloutDelivery {
+    pub(crate) fn callback(&self) -> Callback {
+        match self {
+            CalloutDelivery::Http(_) => Callback::HttpCallResponse,
+            CalloutDelivery::Grpc(event) => event.callback(),
+        }
+    }
+
+    /// Deliver to `context`, unless the plugin has already ended the callout.
+    pub(crate) fn deliver<H: StreamState>(
+        &self,
+        scope: &mut CallScope<'_, H>,
+        context: ContextId,
+        id: CalloutId,
+    ) -> Result<(), GuestError> {
+        if scope.guest().open_callout(id).is_none() {
+            return Ok(());
+        }
+        match self {
+            CalloutDelivery::Http(result) => {
+                scope.on_http_call_response(context, id, result.as_http_call_response())
+            }
+            CalloutDelivery::Grpc(GrpcCalloutEvent::InitialMetadata(pairs)) => {
+                scope.on_grpc_receive_initial_metadata(context, id, borrowed_header_pairs(pairs))
+            }
+            CalloutDelivery::Grpc(GrpcCalloutEvent::Message(message)) => {
+                scope.on_grpc_receive(context, id, Cow::Borrowed(&message[..]))
+            }
+            CalloutDelivery::Grpc(GrpcCalloutEvent::TrailingMetadata(pairs)) => {
+                scope.on_grpc_receive_trailing_metadata(context, id, borrowed_header_pairs(pairs))
+            }
+            CalloutDelivery::Grpc(GrpcCalloutEvent::Close(status)) => {
+                scope.on_grpc_close(context, id, status.clone())
+            }
+        }
+    }
 }
 
 #[cfg(test)]

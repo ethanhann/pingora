@@ -14,25 +14,29 @@
 
 //! Callouts made outside of a request
 
-use crate::callout::{AcceptedCallout, CalloutResult, PendingResult};
+use crate::callout::{
+    AcceptedCallout, CalloutDelivery, GrpcCalloutHandle, GrpcPending, HttpCalloutResult,
+    PendingResult,
+};
 use crate::runtime::pool::events::GuestAddress;
 use crate::runtime::RuntimeInner;
-use futures::future::BoxFuture;
-use futures::stream::{FuturesUnordered, StreamExt};
-use futures::FutureExt;
+use futures::stream::{self, BoxStream, SelectAll, StreamExt};
 use proxy_wasm_host::abi::v0_2_1::{CalloutId, ContextId};
+use std::sync::Arc;
 
-pub(super) struct FinishedCallout {
+pub(super) struct ArrivedDelivery {
     pub(super) address: GuestAddress,
     pub(super) context: ContextId,
     pub(super) id: CalloutId,
-    pub(super) result: CalloutResult,
+    pub(super) delivery: CalloutDelivery,
 }
 
 /// In-flight callouts made from a root context or from a context kept after its request ended.
 #[derive(Default)]
 pub(super) struct RootCallbackCallouts {
-    results: FuturesUnordered<BoxFuture<'static, FinishedCallout>>,
+    deliveries: SelectAll<BoxStream<'static, ArrivedDelivery>>,
+    /// The open gRPC streams, which end with the context that opened them.
+    streams: Vec<(GuestAddress, ContextId, Arc<GrpcCalloutHandle>)>,
 }
 
 impl RootCallbackCallouts {
@@ -46,31 +50,70 @@ impl RootCallbackCallouts {
         let id = callout.id;
         // Without the thread's tokio runtime entered, the callout is dropped and no result is
         // delivered for it
-        let Some(pending) = runtime.callout_launcher.spawn_for_root_callback(callout) else {
-            return;
-        };
-        self.results.push(
-            async move {
-                let result = match pending {
-                    PendingResult::Known(result) => result,
-                    PendingResult::FromTask(task) => task.await.unwrap_or(CalloutResult::Failed),
-                };
-                FinishedCallout {
-                    address,
-                    context,
-                    id,
-                    result,
-                }
-            }
-            .boxed(),
-        );
+        if let Some(pending) = runtime.callout_launcher.spawn_for_root_callback(callout) {
+            self.add(address, context, id, pending);
+        }
     }
 
-    pub(super) async fn next_finished(&mut self) -> Option<FinishedCallout> {
+    pub(super) fn add(
+        &mut self,
+        address: GuestAddress,
+        context: ContextId,
+        id: CalloutId,
+        pending: PendingResult,
+    ) {
+        let arrived = move |delivery| ArrivedDelivery {
+            address,
+            context,
+            id,
+            delivery,
+        };
+        let deliveries = match pending {
+            PendingResult::Known(result) => {
+                stream::once(async move { CalloutDelivery::Http(result) }).boxed()
+            }
+            PendingResult::FromTask(task) => stream::once(async move {
+                CalloutDelivery::Http(task.await.unwrap_or(HttpCalloutResult::Failed))
+            })
+            .boxed(),
+            PendingResult::Grpc(grpc) => {
+                if grpc.is_stream() {
+                    self.streams.retain(|(.., handle)| !handle.is_ended());
+                    self.streams.push((address, context, grpc.handle()));
+                }
+                grpc_events(grpc)
+            }
+        };
+        self.deliveries.push(deliveries.map(arrived).boxed());
+    }
+
+    /// Cancel the open streams of `context`, or of every context of the guest when `context` is
+    /// `None`.
+    pub(super) fn cancel_streams_of(&mut self, address: GuestAddress, context: Option<ContextId>) {
+        self.streams.retain(|(a, c, handle)| {
+            let ended = *a == address && context.is_none_or(|context| *c == context);
+            if ended {
+                handle.cancel();
+            }
+            !ended && !handle.is_ended()
+        });
+    }
+
+    pub(super) async fn next_arrived(&mut self) -> Option<ArrivedDelivery> {
         // Never resolve while no callout is in flight, so that this can be a `select!` branch
-        if self.results.is_empty() {
+        if self.deliveries.is_empty() {
             return std::future::pending().await;
         }
-        self.results.next().await
+        self.deliveries.next().await
     }
+}
+
+fn grpc_events(grpc: GrpcPending) -> BoxStream<'static, CalloutDelivery> {
+    stream::unfold(Some(grpc), |grpc| async move {
+        let mut grpc = grpc?;
+        let event = grpc.next_event().await;
+        let next = (!event.ends_callout(grpc.is_stream())).then_some(grpc);
+        Some((CalloutDelivery::Grpc(event), next))
+    })
+    .boxed()
 }

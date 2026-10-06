@@ -112,7 +112,7 @@ pub enum WasmMetricKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CalloutFailure {
     /// The callout timed out before its response header was received, either as a whole or on a
-    /// single read or write.
+    /// single read or write. A gRPC call that reaches its timeout fails with this at any point.
     Timeout,
     /// [CalloutUpstreams](crate::CalloutUpstreams) did not return a peer for the upstream.
     NoPeer,
@@ -123,18 +123,23 @@ pub enum CalloutFailure {
     ConnectTimeout,
     /// Connecting to the peer failed for any other reason.
     ConnectFailed,
-    /// The peer's response was not valid HTTP.
+    /// The peer's response was not valid HTTP, or the peer of a gRPC callout did not use HTTP/2.
     ProtocolError,
     /// The connection was closed, or failed in some other way, before the response header was
     /// received.
     ConnectionClosed,
     /// The callout failed or timed out after the response header was received.
     FailedAfterHeader,
-    /// The response body exceeded
+    /// The response body, or one message of a gRPC response, exceeded
     /// [callout_response_limit](crate::WasmPluginConf::callout_response_limit).
     ResponseTooLarge,
     /// The task sending the callout panicked, or there was no tokio runtime to spawn it on.
     TaskFailed,
+    /// The peer responded to a gRPC callout with a body and an HTTP status other than 200.
+    NotGrpcResponse,
+    /// A gRPC response had no `grpc-status` or ended inside a message, or a gRPC call ended with
+    /// no message.
+    InvalidGrpcResponse,
 }
 
 impl std::fmt::Display for CalloutFailure {
@@ -159,6 +164,8 @@ impl CalloutFailure {
             CalloutFailure::FailedAfterHeader => "failed_after_header",
             CalloutFailure::ResponseTooLarge => "response_too_large",
             CalloutFailure::TaskFailed => "task_failed",
+            CalloutFailure::NotGrpcResponse => "not_grpc_response",
+            CalloutFailure::InvalidGrpcResponse => "invalid_grpc_response",
         }
     }
 }

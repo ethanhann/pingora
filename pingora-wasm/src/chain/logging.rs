@@ -103,6 +103,7 @@ impl WasmCtx {
                 // The callouts the context sent while ending are started, and their results are
                 // discarded
                 self.start_callouts(position, false);
+                self.callouts.end_streams(position);
             }
             Ok(false) => {
                 debug!(
@@ -113,10 +114,13 @@ impl WasmCtx {
                 if let Ok(loaded) = locked.loaded() {
                     // The guest keeps the context, and the root callback thread starts the
                     // callouts it sent
-                    loaded.hold_context(context, needs_on_log, self.callouts.take_accepted());
+                    let callouts = self.callouts.take_accepted();
+                    let streams = self.callouts.take_streams(position);
+                    loaded.hold_context(context, needs_on_log, callouts, streams);
                 }
             }
             Err((callback, e)) => {
+                self.callouts.end_streams(position);
                 error!("wasm plugin {}: {callback} failed: {e}", locked.pool.name);
                 // The host cannot delete a context whose end failed, so the guest would keep it
                 locked.replace_guest(&e);

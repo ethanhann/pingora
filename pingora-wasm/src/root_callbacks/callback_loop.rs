@@ -16,13 +16,16 @@
 
 use super::ending::EndState;
 use super::queue_registrations::QueueRegistrations;
-use super::root_callouts::{FinishedCallout, RootCallbackCallouts};
+use super::root_callouts::{ArrivedDelivery, RootCallbackCallouts};
 use super::tick_schedule::TickSchedule;
 use super::work::{Work, WorkOutcome};
-use crate::callout::{AcceptedCallout, CalloutResult};
+use crate::callout::grpc::status::CANCELLED;
+use crate::callout::{
+    AcceptedCallout, CalloutDelivery, GrpcCalloutEvent, HttpCalloutResult, PendingResult,
+};
 use crate::runtime::pool::events::{GuestAddress, RootCallbackEvent};
 use crate::runtime::RuntimeInner;
-use proxy_wasm_host::abi::v0_2_1::ContextId;
+use proxy_wasm_host::abi::v0_2_1::{CalloutKind, ContextId};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -53,8 +56,8 @@ impl RootCallbackLoop {
                 // The channel is closed, so the `WasmRuntime` was dropped
                 None => return false,
             },
-            Some(finished) = self.callouts.next_finished() => {
-                self.ready_work.push_back(Work::DeliverCalloutResult(finished));
+            Some(arrived) = self.callouts.next_arrived() => {
+                self.ready_work.push_back(Work::DeliverCallout(arrived));
             }
             _ = sleep_until_due(due), if due.is_some() => {}
         }
@@ -129,15 +132,34 @@ impl RootCallbackLoop {
                 context,
                 callouts,
             } => {
-                let failures = callouts.into_iter().map(|id| {
-                    Work::DeliverCalloutResult(FinishedCallout {
+                let failures = callouts.into_iter().map(|(id, kind)| {
+                    let delivery = match kind {
+                        CalloutKind::HttpCall => CalloutDelivery::Http(HttpCalloutResult::Failed),
+                        _ => CalloutDelivery::Grpc(GrpcCalloutEvent::close(
+                            CANCELLED,
+                            "request ended",
+                        )),
+                    };
+                    Work::DeliverCallout(ArrivedDelivery {
                         address,
                         context,
                         id,
-                        result: CalloutResult::Failed,
+                        delivery,
                     })
                 });
                 self.ready_work.extend(failures);
+            }
+            RootCallbackEvent::StreamsToAdopt {
+                address,
+                context,
+                streams,
+            } => {
+                for (id, stream) in streams {
+                    // Outside of a request every event reaches the plugin
+                    stream.handle().set_keeps_events(true);
+                    let pending = PendingResult::Grpc(stream);
+                    self.callouts.add(address, context, id, pending);
+                }
             }
             RootCallbackEvent::HeldContextDone {
                 address,
@@ -167,7 +189,8 @@ impl RootCallbackLoop {
         let now = Instant::now();
         let (due, waiting) = self.retries.drain(..).partition(|(at, _)| *at <= now);
         self.retries = waiting;
-        for (_, work) in due {
+        // Retried work runs before work that arrived after it
+        for (_, work) in due.into_iter().rev() {
             // A tick that was waiting for its slot is stale if the guest has set a new period
             // since, as the schedule already holds that slot's next tick
             if let Work::Tick(address) = &work {
@@ -175,15 +198,30 @@ impl RootCallbackLoop {
                     continue;
                 }
             }
-            self.ready_work.push_back(work);
+            self.ready_work.push_front(work);
         }
         let ticks = self.ticks.take_due(now);
         self.ready_work.extend(ticks.into_iter().map(Work::Tick));
         while let Some(work) = self.ready_work.pop_front() {
+            // The events of a gRPC stream must reach the plugin in order, so a delivery waits
+            // behind an earlier one to the same guest that found the slot busy
+            if self.waits_behind_retried_delivery(&work) {
+                self.retry_later(work);
+                continue;
+            }
             if let WorkOutcome::SlotBusy = self.run_work(runtime, &work) {
                 self.retry_later(work);
             }
         }
+    }
+
+    fn waits_behind_retried_delivery(&self, work: &Work) -> bool {
+        let Work::DeliverCallout(arrived) = work else {
+            return false;
+        };
+        self.retries.iter().any(|(_, retried)| {
+            matches!(retried, Work::DeliverCallout(earlier) if earlier.address == arrived.address)
+        })
     }
 }
 
@@ -196,8 +234,15 @@ async fn sleep_until_due(due: Option<Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::root_callbacks::root_callouts::ArrivedDelivery;
     use crate::runtime::pool::events::SlotIndex;
-    use proxy_wasm_host::abi::v0_2_1::{Changes, GuestId};
+    use crate::test_support::callouts::{authz_services, FixedSender};
+    use crate::test_support::{plugin, wat_guest, RecordedGuestLogs, Wat};
+    use crate::{WasmRuntime, WasmServices};
+    use bytes::Bytes;
+    use proxy_wasm_host::abi::v0_2_1::{CalloutId, Changes, GuestId};
+    use std::sync::Arc;
+    use tokio::sync::Notify;
 
     #[test]
     fn zero_period_drops_tick_waiting_for_slot() {
@@ -223,5 +268,72 @@ mod tests {
         });
 
         assert!(callback_loop.retries.is_empty());
+    }
+
+    type Delivery = Box<dyn Fn(&'static [u8]) -> Work>;
+
+    /// Return a runtime whose root opened a gRPC stream, its logs, and a builder of message
+    /// deliveries for that stream.
+    fn runtime_with_open_stream(label: &str) -> (WasmRuntime, Arc<RecordedGuestLogs>, Delivery) {
+        let wat = Wat {
+            configure: "(call $open_grpc_stream) (i32.const 1)",
+            grpc_receive: Some("(call $log_grpc_message (local.get 2))"),
+            ..Wat::default()
+        };
+        let logs = Arc::new(RecordedGuestLogs::default());
+        let services = WasmServices {
+            log_sink: logs.clone(),
+            ..authz_services()
+        };
+        let plugins = vec![plugin(label, wat_guest(label, wat), 1)];
+        let sender = FixedSender::grpc_released_by(Arc::new(Notify::new()), Vec::new());
+        let runtime = WasmRuntime::new_with_callout_sender(plugins, services, sender).unwrap();
+        let (address, root) = {
+            let guard = runtime.inner.pools[0].lock_slot(0);
+            let loaded = guard.as_ref().unwrap();
+            (loaded.address(), loaded.root)
+        };
+        let delivery = move |message: &'static [u8]| {
+            Work::DeliverCallout(ArrivedDelivery {
+                address,
+                context: root,
+                id: CalloutId::try_from(1).unwrap(),
+                delivery: CalloutDelivery::Grpc(GrpcCalloutEvent::Message(Bytes::from_static(
+                    message,
+                ))),
+            })
+        };
+        (runtime, logs, Box::new(delivery))
+    }
+
+    #[test]
+    fn delivery_waits_behind_retried_delivery_to_same_guest() {
+        let (runtime, logs, delivery) = runtime_with_open_stream("ordered");
+        let mut callback_loop = RootCallbackLoop::default();
+        let later = Instant::now() + Duration::from_secs(3600);
+        callback_loop.retries.push((later, delivery(b"first")));
+        callback_loop.ready_work.push_back(delivery(b"second"));
+
+        callback_loop.run_due_work(&runtime.inner);
+
+        assert!(logs.0.lock().is_empty());
+        assert_eq!(callback_loop.retries.len(), 2);
+    }
+
+    #[test]
+    fn due_retry_runs_before_later_delivery_to_same_guest() {
+        let (runtime, logs, delivery) = runtime_with_open_stream("due-retry");
+        let mut callback_loop = RootCallbackLoop::default();
+        callback_loop
+            .retries
+            .push((Instant::now(), delivery(b"first")));
+        callback_loop.ready_work.push_back(delivery(b"second"));
+
+        callback_loop.run_due_work(&runtime.inner);
+
+        assert_eq!(
+            logs.0.lock()[..],
+            ["first".to_string(), "second".to_string()]
+        );
     }
 }

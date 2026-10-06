@@ -27,7 +27,7 @@ use proxy_wasm_host::HeaderMap;
 use std::mem;
 
 fn trailer_pause_failure() -> FilterFailure {
-    let what = "paused on response trailers with no callout pending";
+    let what = "paused on response trailers with no callout to wait for";
     FilterFailure::paused(Callback::ResponseTrailers, what)
 }
 
@@ -219,7 +219,10 @@ mod tests {
     #[tokio::test]
     async fn trailer_pause_response_or_trap_fails() {
         let cases = [
-            (PAUSE, "paused on response trailers with no callout pending"),
+            (
+                PAUSE,
+                "paused on response trailers with no callout to wait for",
+            ),
             (TEAPOT, "response rejected, sent after the response header"),
             (TRAP, "proxy_on_response_trailers failed"),
         ];

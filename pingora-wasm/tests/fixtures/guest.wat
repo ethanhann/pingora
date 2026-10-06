@@ -38,6 +38,11 @@
     (func $register_queue (param i32 i32 i32) (result i32)))
   (import "env" "proxy_enqueue_shared_queue"
     (func $enqueue (param i32 i32 i32) (result i32)))
+  (import "env" "proxy_grpc_call"
+    (func $grpc_call (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "env" "proxy_grpc_stream"
+    (func $grpc_stream (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "env" "proxy_grpc_send" (func $grpc_send (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 16) "replaced")
   (data (i32.const 32) "teapot")
@@ -57,6 +62,12 @@
   (data (i32.const 296) "refused")
   (data (i32.const 304) "missing")
   (data (i32.const 312) "tick")
+  (data (i32.const 320) "svc")
+  (data (i32.const 324) "Check")
+  (data (i32.const 330) "ping")
+  ;; An empty serialized map, for gRPC metadata
+  (data (i32.const 336) "\00\00\00\00")
+  (data (i32.const 340) "closed")
   ;; Addresses from 700 up are for strings that tests add for their own callbacks.
 
   ;; Prepend one letter to the body. The buffer is 0 for the request and 1 for the response.
@@ -174,6 +185,30 @@
       (then (drop (call $add_header
         (local.get $map) (local.get $name) (local.get $name_size)
         (i32.load (i32.const 512)) (i32.load (i32.const 516)))))))
+
+  ;; Send a gRPC call with the message "ping" to the upstream "authz" and pause.
+  (func $grpc_call_and_pause (result i32)
+    (drop (call $grpc_call
+      (i32.const 112) (i32.const 5) (i32.const 320) (i32.const 3) (i32.const 324) (i32.const 5)
+      (i32.const 336) (i32.const 4) (i32.const 330) (i32.const 4) (i32.const 1000) (i32.const 520)))
+    i32.const 1)
+
+  ;; Open a gRPC stream to the upstream "authz" and keep its id at 524.
+  (func $open_grpc_stream
+    (drop (call $grpc_stream
+      (i32.const 112) (i32.const 5) (i32.const 320) (i32.const 3) (i32.const 324) (i32.const 5)
+      (i32.const 336) (i32.const 4) (i32.const 524))))
+
+  ;; Send "ping" on the stream whose id is at 524, and pause.
+  (func $grpc_send_and_pause (result i32)
+    (drop (call $grpc_send (i32.load (i32.const 524)) (i32.const 330) (i32.const 4) (i32.const 0)))
+    i32.const 1)
+
+  ;; Log the gRPC message of the given size.
+  (func $log_grpc_message (param $size i32)
+    (drop (call $get_buffer
+      (i32.const 5) (i32.const 0) (local.get $size) (i32.const 512) (i32.const 516)))
+    (drop (call $log (i32.const 2) (i32.load (i32.const 512)) (i32.load (i32.const 516)))))
 
   ;; Log "tick".
   (func $log_tick

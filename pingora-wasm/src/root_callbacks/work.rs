@@ -15,7 +15,7 @@
 //! Root callback work
 
 use super::callback_loop::RootCallbackLoop;
-use super::root_callouts::FinishedCallout;
+use super::root_callouts::ArrivedDelivery;
 use crate::observability::{PluginFailure, PluginFailureOutcome, PluginFailureReport};
 use crate::root_callbacks::RootStream;
 use crate::runtime::pool::events::GuestAddress;
@@ -28,7 +28,7 @@ use std::time::Instant;
 pub(super) enum Work {
     Tick(GuestAddress),
     QueueItem(QueueId),
-    DeliverCalloutResult(FinishedCallout),
+    DeliverCallout(ArrivedDelivery),
     EndHeldContext {
         address: GuestAddress,
         context: ContextId,
@@ -71,7 +71,7 @@ impl RootCallbackLoop {
         match work {
             Work::Tick(address) => self.run_tick(runtime, *address),
             Work::QueueItem(queue) => self.run_queue_item(runtime, *queue),
-            Work::DeliverCalloutResult(finished) => self.deliver_callout_result(runtime, finished),
+            Work::DeliverCallout(arrived) => self.deliver_callout(runtime, arrived),
             Work::EndHeldContext {
                 address,
                 context,
@@ -116,22 +116,15 @@ impl RootCallbackLoop {
         }
     }
 
-    fn deliver_callout_result(
+    fn deliver_callout(
         &mut self,
         runtime: &RuntimeInner,
-        finished: &FinishedCallout,
+        arrived: &ArrivedDelivery,
     ) -> WorkOutcome {
-        let context = GuestCallContext::Given(finished.context);
-        let callback_name = "proxy_on_http_call_response";
-        let delivery = self.call_guest(runtime, finished.address, context, callback_name, {
-            |scope, context| {
-                // The callout is no longer open once `proxy_on_delete` has ended its context
-                if scope.guest().open_callout(finished.id).is_none() {
-                    return Ok(());
-                }
-                let response = finished.result.as_http_call_response();
-                scope.on_http_call_response(context, finished.id, response)
-            }
+        let context = GuestCallContext::Given(arrived.context);
+        let callback_name = arrived.delivery.callback().export_name();
+        let delivery = self.call_guest(runtime, arrived.address, context, callback_name, {
+            |scope, context| arrived.delivery.deliver(scope, context, arrived.id)
         });
         delivery.work_outcome()
     }
@@ -165,7 +158,9 @@ impl RootCallbackLoop {
                 context,
                 needs_on_log: false,
             });
+            return WorkOutcome::Done;
         }
+        self.callouts.cancel_streams_of(address, Some(context));
         WorkOutcome::Done
     }
 
@@ -185,6 +180,9 @@ impl RootCallbackLoop {
         let deleted = self.call_guest(runtime, address, context, "proxy_on_delete", {
             |scope, root| scope.on_delete(root)
         });
+        if !matches!(deleted, GuestCallOutcome::SlotBusy) {
+            self.callouts.cancel_streams_of(address, None);
+        }
         deleted.work_outcome()
     }
 

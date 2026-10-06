@@ -22,11 +22,16 @@ pub(crate) use body::BodyBuffer;
 pub(crate) use headers::{RequestHeaders, ResponseHeaders, ResponseTrailers};
 pub(crate) use plugin_response::PluginResponse;
 
+use crate::callout::grpc::is_grpc_content_type;
 use crate::properties::built_in::{write_built_in_property, ReadableHeaders, RequestFacts};
 use crate::properties::{join_path, WasmProperties};
+use crate::WasmForeignFunctions;
+use http::header::CONTENT_TYPE;
 use log::{debug, warn};
 use proxy_wasm_host::abi::v0_2_1::types::{BufferType, MapType, Status, StreamType};
-use proxy_wasm_host::abi::v0_2_1::{Access, Callback, Invocation, LocalResponse, StreamState};
+use proxy_wasm_host::abi::v0_2_1::{
+    Access, Callback, ForeignCall, Invocation, LocalResponse, StreamState,
+};
 use proxy_wasm_host::{Buffer, HeaderMap, VecHeaderMap};
 use std::sync::Arc;
 
@@ -52,13 +57,18 @@ pub(crate) struct PingoraStream {
     pub(crate) proxy_properties: WasmProperties,
     pub(crate) guest_properties: WasmProperties,
     fixed_properties: Arc<WasmProperties>,
+    foreign_functions: Arc<WasmForeignFunctions>,
     joined_path: Vec<u8>,
 }
 
 impl PingoraStream {
-    pub(crate) fn new(fixed_properties: Arc<WasmProperties>) -> Self {
+    pub(crate) fn new(
+        fixed_properties: Arc<WasmProperties>,
+        foreign_functions: Arc<WasmForeignFunctions>,
+    ) -> Self {
         PingoraStream {
             fixed_properties,
+            foreign_functions,
             ..PingoraStream::default()
         }
     }
@@ -83,12 +93,26 @@ impl PingoraStream {
         }
     }
 
+    fn is_grpc_request(&self) -> bool {
+        let content_type = self
+            .request
+            .as_ref()
+            .and_then(|request| request.header.headers.get(CONTENT_TYPE));
+        content_type.is_some_and(|value| is_grpc_content_type(value.as_bytes()))
+    }
+
     /// Return the callback whose access rules apply to a host call.
     fn access_callback(&self, call: Invocation) -> Option<Callback> {
         match call.callback {
-            // In `proxy_on_http_call_response` the plugin gets the access of the callback it is
+            // A plugin that receives a callout result gets the access of the callback it is
             // paused in
-            Some(Callback::HttpCallResponse) => self.delivery_callback,
+            Some(
+                Callback::HttpCallResponse
+                | Callback::GrpcReceiveInitialMetadata
+                | Callback::GrpcReceive
+                | Callback::GrpcReceiveTrailingMetadata
+                | Callback::GrpcClose,
+            ) => self.delivery_callback,
             callback => callback,
         }
     }
@@ -177,7 +201,7 @@ impl StreamState for PingoraStream {
         ) {
             return Err(Status::Unimplemented);
         }
-        let plugin_response = PluginResponse::build(&response).ok_or(Status::BadArgument)?;
+        let mut plugin_response = PluginResponse::build(&response).ok_or(Status::BadArgument)?;
         let plugin = &self.plugin_name;
         if !response.status_code_details.is_empty() {
             debug!(
@@ -186,8 +210,12 @@ impl StreamState for PingoraStream {
                 String::from_utf8_lossy(&response.status_code_details)
             );
         }
-        if let Some(grpc_status) = response.grpc_status {
-            warn!("wasm plugin {plugin}: gRPC status {grpc_status} of its response dropped, not supported");
+        if self.is_grpc_request() {
+            plugin_response = plugin_response
+                .into_grpc(response.grpc_status)
+                .ok_or(Status::BadArgument)?;
+        } else if let Some(grpc_status) = response.grpc_status {
+            warn!("wasm plugin {plugin}: response gRPC status {grpc_status} dropped, request is not gRPC");
         }
         self.plugin_response = Some(plugin_response);
         Ok(())
@@ -235,6 +263,16 @@ impl StreamState for PingoraStream {
         self.guest_properties
             .insert_joined(&self.joined_path, value);
         Ok(())
+    }
+
+    fn call_foreign_function(
+        &mut self,
+        _call: Invocation,
+        request: ForeignCall<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Status> {
+        let functions = &self.foreign_functions;
+        functions.call(&self.plugin_name, &request.name, &request.arguments, out)
     }
 
     fn continue_stream(&mut self, _call: Invocation, stream: StreamType) -> Result<(), Status> {
@@ -502,6 +540,62 @@ mod tests {
         let recorded = s.plugin_response.unwrap();
         assert_eq!(recorded.header.status, 403);
         assert_eq!(&recorded.body[..], b"body");
+    }
+
+    #[test]
+    fn send_local_response_takes_grpc_form_for_grpc_request() {
+        let cases = [
+            (
+                "application/grpc",
+                Some(10),
+                "200",
+                Some("10"),
+                Some("body"),
+            ),
+            (
+                "application/grpc+proto",
+                None,
+                "200",
+                Some("7"),
+                Some("body"),
+            ),
+            ("application/json", Some(10), "403", None, None),
+        ];
+
+        for (content_type, grpc_status, want_status, want_grpc_status, want_message) in cases {
+            let mut s = stream(false);
+            let request = &mut s.request.as_mut().unwrap().header;
+            request.insert_header(CONTENT_TYPE, content_type).unwrap();
+            let mut response = local(403).with_headers(vec![(
+                Cow::Borrowed(&b"x-denied"[..]),
+                Cow::Borrowed(&b"yes"[..]),
+            )]);
+            response.grpc_status = grpc_status;
+
+            s.send_local_response(call(Callback::RequestHeaders), response)
+                .unwrap();
+
+            let recorded = s.plugin_response.unwrap();
+            let get = |name| {
+                recorded
+                    .header
+                    .headers
+                    .get(name)
+                    .map(|v| v.to_str().unwrap())
+            };
+            assert_eq!(
+                recorded.header.status.as_str(),
+                want_status,
+                "{content_type}"
+            );
+            assert_eq!(get("grpc-status"), want_grpc_status, "{content_type}");
+            assert_eq!(get("grpc-message"), want_message, "{content_type}");
+            assert_eq!(get("x-denied"), Some("yes"), "{content_type}");
+            let grpc = want_grpc_status.is_some();
+            let want_content_type = grpc.then_some("application/grpc");
+            assert_eq!(get("content-type"), want_content_type, "{content_type}");
+            assert_eq!(recorded.body.is_empty(), grpc, "{content_type}");
+        }
     }
 
     #[test]

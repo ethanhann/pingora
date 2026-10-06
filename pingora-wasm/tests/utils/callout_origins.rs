@@ -85,6 +85,10 @@ impl CalloutOrigin {
         let _ = stream.write_all(response.as_bytes()).await;
     }
 
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
     /// Return the path and `host` header of every request received so far.
     pub fn requests(&self) -> Vec<(String, String)> {
         self.requests.lock().unwrap().clone()

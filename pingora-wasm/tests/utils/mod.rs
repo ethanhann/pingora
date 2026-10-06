@@ -13,12 +13,13 @@
 // limitations under the License.
 
 pub mod callout_origins;
+pub mod grpc_origin;
 pub mod guests;
 pub mod proxy;
 pub mod raw;
 mod services;
 
-pub use services::{callout_origin, metrics_text};
+pub use services::{callout_origin, grpc_origin, metrics_text};
 
 use bytes::Bytes;
 use http::{Request, Response};
@@ -35,9 +36,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-
-pub const FIRST_PORT: u16 = 6380;
-pub const LAST_PORT: u16 = 6420;
 
 pub fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -118,6 +116,7 @@ impl TestServer {
     fn start() -> Self {
         raise_open_file_limit();
         let services = services();
+        let ports: Vec<u16> = services.iter().map(|(port, ..)| *port).collect();
         RUNTIMES
             .set(
                 services
@@ -144,7 +143,7 @@ impl TestServer {
             server.run_forever();
         });
         let deadline = Instant::now() + Duration::from_secs(10);
-        for port in FIRST_PORT..=LAST_PORT {
+        for port in ports {
             let addr = format!("127.0.0.1:{port}").parse().unwrap();
             while std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_err() {
                 assert!(Instant::now() < deadline, "test proxy failed to start");

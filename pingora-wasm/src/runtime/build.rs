@@ -23,7 +23,7 @@ use crate::observability::WasmMetricSink;
 use crate::properties::WasmProperties;
 use crate::root_callbacks::RootCallbackPluginState;
 use crate::root_callbacks::RootCallbackThread;
-use crate::{invalid_conf, ERR_INVALID_CONF};
+use crate::{invalid_conf, WasmForeignFunctions, ERR_INVALID_CONF};
 use pingora_error::{ErrorType, OrErr, Result};
 use proxy_wasm_host::abi::v0_2_1::{
     GuestSpec, Host, InMemoryStoreLimits, LogSink, QueueEnqueued, SharedServices,
@@ -69,6 +69,7 @@ pub(super) struct PoolInputs<'a> {
     pub(super) upstreams: Arc<dyn CalloutUpstreams>,
     pub(super) metric_sink: Arc<dyn WasmMetricSink>,
     pub(super) fixed_properties: Arc<WasmProperties>,
+    pub(super) foreign_functions: Arc<WasmForeignFunctions>,
     pub(super) root_callback_thread: &'a RootCallbackThread,
     pub(super) threads: usize,
 }
@@ -98,8 +99,11 @@ pub(super) fn build_pool(
             )
         },
     )?;
-    let root_callback_plugin =
-        RootCallbackPluginState::new(&plugin.name, inputs.fixed_properties.clone());
+    let root_callback_plugin = RootCallbackPluginState::new(
+        &plugin.name,
+        inputs.fixed_properties.clone(),
+        inputs.foreign_functions.clone(),
+    );
     GuestPool::new(GuestPoolConf {
         pool_index,
         name: plugin.name.clone(),

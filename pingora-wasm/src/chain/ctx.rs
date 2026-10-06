@@ -93,7 +93,11 @@ impl fmt::Debug for WasmCtx {
 impl WasmCtx {
     pub(crate) fn new(chain: WasmChain) -> Self {
         let records = vec![None; chain.plugins.len()];
-        let stream = PingoraStream::new(chain.runtime.fixed_properties.clone());
+        let runtime = &chain.runtime;
+        let stream = PingoraStream::new(
+            runtime.fixed_properties.clone(),
+            runtime.foreign_functions.clone(),
+        );
         chain.runtime.lifecycle.ctx_created();
         WasmCtx {
             response_progress: ResponseProgress::NotStarted,

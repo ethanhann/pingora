@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::callout::grpc::status;
+use crate::callout::grpc::APPLICATION_GRPC;
 use bytes::Bytes;
-use http::header::{HeaderValue, CONTENT_LENGTH, TRANSFER_ENCODING};
+use http::header::{HeaderValue, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
 use http::StatusCode;
 use pingora_http::ResponseHeader;
 use proxy_wasm_host::abi::v0_2_1::LocalResponse;
@@ -53,6 +55,32 @@ impl PluginResponse {
         Some(PluginResponse {
             header,
             body: Bytes::copy_from_slice(&response.body),
+        })
+    }
+}
+
+impl PluginResponse {
+    /// Return the response in the form a gRPC client reads, with HTTP status 200 and the gRPC
+    /// status and the body in `grpc-status` and `grpc-message`.
+    pub(crate) fn into_grpc(self, grpc_status: Option<u32>) -> Option<Self> {
+        let code =
+            grpc_status.unwrap_or_else(|| status::from_http_status(self.header.status.as_u16()));
+        let mut header =
+            ResponseHeader::build(StatusCode::OK, Some(self.header.headers.len() + 2)).ok()?;
+        for (name, value) in &self.header.headers {
+            if name != CONTENT_LENGTH && name != CONTENT_TYPE {
+                header.append_header(name.clone(), value.clone()).ok()?;
+            }
+        }
+        header.insert_header(CONTENT_TYPE, APPLICATION_GRPC).ok()?;
+        header.insert_header(status::GRPC_STATUS, code).ok()?;
+        if !self.body.is_empty() {
+            let message = status::percent_encode(&String::from_utf8_lossy(&self.body));
+            header.insert_header(status::GRPC_MESSAGE, message).ok()?;
+        }
+        Some(PluginResponse {
+            header,
+            body: Bytes::new(),
         })
     }
 }

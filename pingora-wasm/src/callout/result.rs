@@ -40,7 +40,7 @@ const RESET_REASON_TERMINATION: &str = "connection termination";
 pub(crate) type OwnedHeaderPairs = Vec<(Vec<u8>, Vec<u8>)>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CalloutResult {
+pub(crate) enum HttpCalloutResult {
     /// A response from the peer, or a synthetic one if no response header was received.
     Response {
         headers: OwnedHeaderPairs,
@@ -52,17 +52,17 @@ pub(crate) enum CalloutResult {
     Failed,
 }
 
-impl CalloutResult {
+impl HttpCalloutResult {
     pub(crate) fn as_http_call_response(&self) -> HttpCallResponse<'_> {
         match self {
-            CalloutResult::Response {
+            HttpCalloutResult::Response {
                 headers,
                 body,
                 trailers,
             } => HttpCallResponse::received(borrowed_header_pairs(headers))
                 .with_body(Cow::Borrowed(&body[..]))
                 .with_trailers(borrowed_header_pairs(trailers)),
-            CalloutResult::Failed => HttpCallResponse::failed(),
+            HttpCalloutResult::Failed => HttpCallResponse::failed(),
         }
     }
 
@@ -76,7 +76,7 @@ impl CalloutResult {
                 TEXT_PLAIN.to_vec(),
             ),
         ];
-        CalloutResult::Response {
+        HttpCalloutResult::Response {
             headers,
             body: Bytes::from(body),
             trailers: Vec::new(),
@@ -125,7 +125,7 @@ impl CalloutResult {
     }
 }
 
-fn borrowed_header_pairs(pairs: &[(Vec<u8>, Vec<u8>)]) -> HeaderPairs<'_> {
+pub(super) fn borrowed_header_pairs(pairs: &[(Vec<u8>, Vec<u8>)]) -> HeaderPairs<'_> {
     pairs
         .iter()
         .map(|(name, value)| (Cow::Borrowed(&name[..]), Cow::Borrowed(&value[..])))

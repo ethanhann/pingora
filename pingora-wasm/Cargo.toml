@@ -33,6 +33,7 @@ parking_lot = "0.12"
 tokio = { workspace = true, features = ["rt", "sync", "time", "net", "macros"] }
 tracing = { version = "0.1", features = ["log"] }
 futures = { workspace = true }
+h2 = { workspace = true }
 once_cell = { workspace = true }
 prometheus = "0.14"
 rand = "0.10"
@@ -43,7 +44,6 @@ pingora-load-balancing = { version = "0.9.0", path = "../pingora-load-balancing"
 pingora-test-utils = { version = "0.9.0", path = "../pingora-test-utils" }
 pingora-prometheus = { version = "0.9.0", path = "../pingora-prometheus" }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
-h2 = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["http2"] }
 wat = "1"
 libc = "0.2"

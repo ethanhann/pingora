@@ -36,7 +36,7 @@ pub enum PluginFailure {
     /// request.
     GuestLost,
     /// The plugin paused on headers, on trailers, or on the last chunk of a body with no callout
-    /// pending.
+    /// to wait for.
     PausedWithoutCallout,
     /// A callout wait lasted longer than
     /// [callout_wait_limit](crate::WasmPluginConf::callout_wait_limit).

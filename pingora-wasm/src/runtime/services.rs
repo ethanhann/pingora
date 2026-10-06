@@ -14,13 +14,16 @@
 
 //! Proxy services for plugins
 
+use crate::callout::grpc::status::{INTERNAL, UNAVAILABLE};
+use crate::callout::grpc::{AcceptedGrpc, GrpcEventSender};
 use crate::callout::{
-    AcceptedCallout, CalloutResult, CalloutSender, CalloutUpstreams, PendingResult,
-    StaticCalloutUpstreams,
+    AcceptedCallout, CalloutSender, CalloutUpstreams, GrpcCalloutEvent, GrpcPending,
+    HttpCalloutResult, PendingResult, StaticCalloutUpstreams,
 };
 use crate::invalid_conf;
 use crate::observability::{CalloutFailure, LogCrateSink, NoMetricSink, WasmMetricSink};
 use crate::properties::WasmProperties;
+use crate::WasmForeignFunctions;
 use futures::FutureExt;
 use log::warn;
 use pingora_core::connectors::http::Connector;
@@ -49,9 +52,8 @@ pub struct WasmServices {
     pub log_sink: Arc<dyn LogSink>,
     /// The upstreams plugins may send callouts to.
     ///
-    /// The default has no upstreams, so `proxy_http_call` returns `BAD_ARGUMENT` for every
-    /// callout. Pass a [StaticCalloutUpstreams] for a fixed list of peers, or your own
-    /// implementation of [CalloutUpstreams].
+    /// The default has no upstreams, so every callout is refused. Pass a [StaticCalloutUpstreams]
+    /// for a fixed list of peers, or your own implementation of [CalloutUpstreams].
     pub callout_upstreams: Arc<dyn CalloutUpstreams>,
     /// The connector used to send callouts, which also pools their connections. Default `None`.
     ///
@@ -67,7 +69,8 @@ pub struct WasmServices {
     pub callout_connector: Option<Arc<Connector>>,
     /// The maximum number of callouts the runtime will have in flight at once. Default 1024.
     ///
-    /// A callout over this limit is not sent, and its plugin receives a 503 response instead.
+    /// A callout over this limit is not sent, and its plugin receives a 503 response instead, or
+    /// the gRPC status `UNAVAILABLE` for a gRPC callout.
     /// The limit must be at least 1 and no greater than `tokio::sync::Semaphore::MAX_PERMITS`.
     pub max_callouts_in_flight: usize,
     /// The sink for metrics defined by plugins and for reports of failed callouts, plugin
@@ -84,6 +87,8 @@ pub struct WasmServices {
     /// succeeds, but the plugin reads the fixed value back.
     /// [WasmCtx::guest_property](crate::WasmCtx::guest_property) returns what the plugin wrote.
     pub fixed_properties: WasmProperties,
+    /// The functions of your proxy that plugins can call by name. Default empty.
+    pub foreign_functions: WasmForeignFunctions,
     /// How long the end of a runtime waits for its plugins to finish. Default 5 seconds.
     ///
     /// A runtime ends at a graceful shutdown and when
@@ -112,6 +117,7 @@ impl Default for WasmServices {
             max_callouts_in_flight: MAX_CALLOUTS_IN_FLIGHT,
             metric_sink: Arc::new(NoMetricSink),
             fixed_properties: WasmProperties::new(),
+            foreign_functions: WasmForeignFunctions::new(),
             shutdown_wait_limit: SHUTDOWN_WAIT_LIMIT,
             threads: THREADS,
         }
@@ -122,6 +128,7 @@ impl fmt::Debug for WasmServices {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WasmServices")
             .field("max_callouts_in_flight", &self.max_callouts_in_flight)
+            .field("foreign_functions", &self.foreign_functions)
             .field("shutdown_wait_limit", &self.shutdown_wait_limit)
             .field("threads", &self.threads)
             .finish_non_exhaustive()
@@ -178,14 +185,17 @@ impl CalloutLauncher {
     fn spawn_with(
         &self,
         sender: &Arc<dyn CalloutSender>,
-        callout: AcceptedCallout,
+        mut callout: AcceptedCallout,
     ) -> Option<PendingResult> {
+        if let Some(grpc) = callout.grpc.take() {
+            return self.spawn_grpc(sender, callout, grpc);
+        }
         let plugin_name = callout.plugin_conf.plugin_name.clone();
         let Ok(permit) = self.in_flight_permits.clone().try_acquire_owned() else {
             callout.plugin_conf.warn_of_overflow_once();
             self.metric_sink
                 .callout_failed(&plugin_name, CalloutFailure::Overflow);
-            return Some(PendingResult::Known(CalloutResult::overflow_response()));
+            return Some(PendingResult::Known(HttpCalloutResult::overflow_response()));
         };
         let Ok(tokio_runtime) = Handle::try_current() else {
             let callback = callout
@@ -199,13 +209,58 @@ impl CalloutLauncher {
         let sender = sender.clone();
         let metric_sink = self.metric_sink.clone();
         let task = tokio_runtime.spawn(async move {
-            let sent = AssertUnwindSafe(sender.send(callout)).catch_unwind().await;
+            let sent = AssertUnwindSafe(sender.send_http(callout))
+                .catch_unwind()
+                .await;
             drop(permit);
             sent.unwrap_or_else(|_| {
                 metric_sink.callout_failed(&plugin_name, CalloutFailure::TaskFailed);
-                CalloutResult::Failed
+                HttpCalloutResult::Failed
             })
         });
         Some(PendingResult::FromTask(task))
+    }
+
+    fn spawn_grpc(
+        &self,
+        sender: &Arc<dyn CalloutSender>,
+        callout: AcceptedCallout,
+        grpc: AcceptedGrpc,
+    ) -> Option<PendingResult> {
+        if grpc.handle.is_cancelled() {
+            return None;
+        }
+        let plugin_name = callout.plugin_conf.plugin_name.clone();
+        let (events, received) = GrpcEventSender::new(grpc.handle.clone());
+        let pending = GrpcPending::new(received, grpc.handle.clone(), grpc.stream);
+        let Ok(permit) = self.in_flight_permits.clone().try_acquire_owned() else {
+            callout.plugin_conf.warn_of_overflow_once();
+            self.metric_sink
+                .callout_failed(&plugin_name, CalloutFailure::Overflow);
+            events.send(GrpcCalloutEvent::close(UNAVAILABLE, "overflow"));
+            return Some(PendingResult::Grpc(pending));
+        };
+        let Ok(tokio_runtime) = Handle::try_current() else {
+            let callback = callout
+                .callback
+                .map_or("an unknown callback", Callback::export_name);
+            warn!("wasm plugin {plugin_name}: gRPC callout from {callback} dropped, no tokio runtime is running");
+            self.metric_sink
+                .callout_failed(&plugin_name, CalloutFailure::TaskFailed);
+            return None;
+        };
+        let sender = sender.clone();
+        let metric_sink = self.metric_sink.clone();
+        let task = tokio_runtime.spawn(async move {
+            let sent = sender.send_grpc(callout, grpc.commands, grpc.stream, events.clone());
+            let sent = AssertUnwindSafe(sent).catch_unwind().await;
+            drop(permit);
+            if sent.is_err() {
+                metric_sink.callout_failed(&plugin_name, CalloutFailure::TaskFailed);
+                events.send(GrpcCalloutEvent::close(INTERNAL, "callout task failed"));
+            }
+        });
+        grpc.handle.set_task(task.abort_handle());
+        Some(PendingResult::Grpc(pending))
     }
 }

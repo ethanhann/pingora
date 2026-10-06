@@ -42,7 +42,10 @@
 //! A proxy can also:
 //!
 //! - Write the response that a plugin sends itself, for example a 403. See [RequestOutcome].
-//! - Let plugins call other services, for example a policy service. See [CalloutUpstreams].
+//! - Let plugins call other services over HTTP or gRPC, for example a policy service. See
+//!   [CalloutUpstreams].
+//! - Let plugins call Rust functions that your proxy registers, for example a check against your
+//!   own rate limiter. See [WasmForeignFunctions].
 //! - Run plugins that work on a timer or wait on a shared queue. See [WasmRuntime].
 //! - Publish the counters, gauges, and histograms that plugins define. See [WasmMetricSink].
 //! - Give plugins facts that only your proxy knows, such as the route it chose. See
@@ -55,6 +58,7 @@
 mod callout;
 mod chain;
 mod configuration;
+mod foreign_functions;
 mod observability;
 mod plugins;
 mod properties;
@@ -68,6 +72,7 @@ pub use callout::{CalloutTarget, CalloutUpstreams, StaticCalloutUpstreams};
 pub use chain::write_plugin_response;
 pub use chain::{RequestOutcome, WasmChain, WasmCtx};
 pub use configuration::{CalloutUpstreamConf, WasmConf};
+pub use foreign_functions::{WasmForeignCall, WasmForeignFunctionError, WasmForeignFunctions};
 pub use observability::{
     CalloutFailure, PluginFailure, PluginFailureOutcome, PluginFailureReport, PrometheusMetricSink,
     WasmMetric, WasmMetricKind, WasmMetricRecorder, WasmMetricSink,

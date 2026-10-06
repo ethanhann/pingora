@@ -14,16 +14,21 @@
 
 //! Per-guest callout service
 
+use super::grpc::{self, AcceptedGrpc, GrpcCalloutHandle, GrpcCommand};
 use super::headers::callout_request_header;
 use super::{AcceptedCallout, PluginCalloutConf};
 use bytes::Bytes;
 use log::{debug, warn};
 use parking_lot::Mutex;
+use proxy_wasm_host::abi::v0_2_1::types::Status;
 use proxy_wasm_host::abi::v0_2_1::{
-    CalloutId, Callouts, ContextId, HttpCall, HttpCallRefusal, Invocation,
+    CalloutId, Callouts, ContextId, GrpcCall, GrpcOpenRefusal, GrpcStream, HeaderPairs, HttpCall,
+    HttpCallRefusal, Invocation,
 };
+use std::collections::HashMap;
 use std::mem;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Default)]
 struct GuestCallState {
@@ -38,6 +43,41 @@ struct GuestCallState {
 pub(crate) struct GuestCalloutService {
     conf: Arc<PluginCalloutConf>,
     call_in_progress: Mutex<GuestCallState>,
+    grpc_callouts: Mutex<HashMap<CalloutId, Arc<GrpcCalloutHandle>>>,
+}
+
+/// A gRPC callout as the guest asked for it. A stream has no timeout.
+struct GrpcOpening<'a> {
+    upstream: &'a [u8],
+    service: &'a [u8],
+    method: &'a [u8],
+    metadata: &'a HeaderPairs<'a>,
+    body: Bytes,
+    timeout: Option<Duration>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    UnknownUpstream,
+    Failed,
+}
+
+impl From<Refusal> for HttpCallRefusal {
+    fn from(refusal: Refusal) -> Self {
+        match refusal {
+            Refusal::UnknownUpstream => HttpCallRefusal::UnknownUpstream,
+            Refusal::Failed => HttpCallRefusal::Failed,
+        }
+    }
+}
+
+impl From<Refusal> for GrpcOpenRefusal {
+    fn from(refusal: Refusal) -> Self {
+        match refusal {
+            Refusal::UnknownUpstream => GrpcOpenRefusal::UnknownUpstream,
+            Refusal::Failed => GrpcOpenRefusal::Failed,
+        }
+    }
 }
 
 impl GuestCalloutService {
@@ -45,6 +85,7 @@ impl GuestCalloutService {
         GuestCalloutService {
             conf,
             call_in_progress: Mutex::new(GuestCallState::default()),
+            grpc_callouts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -62,6 +103,89 @@ impl GuestCalloutService {
         let state_at_the_end = mem::take(&mut *self.call_in_progress.lock());
         (result, state_at_the_end.accepted)
     }
+
+    fn accept_upstream<'a>(
+        &self,
+        call: Invocation,
+        upstream: &'a [u8],
+    ) -> Result<&'a str, Refusal> {
+        let plugin = &self.conf.plugin_name;
+        match self.call_in_progress.lock().calling_context {
+            Some(context) if context == call.context => {}
+            // A stream callback that switches to its root context cannot make a callout. The
+            // result would be delivered to the root context on the root callback thread while
+            // the request continued without it.
+            Some(_) => {
+                warn!("wasm plugin {plugin}: callout rejected, not sent from the context of the current callback");
+                return Err(Refusal::Failed);
+            }
+            None => {
+                warn!("wasm plugin {plugin}: callout rejected, sent outside of a plugin callback");
+                return Err(Refusal::Failed);
+            }
+        }
+        let accepted = std::str::from_utf8(upstream)
+            .ok()
+            .filter(|upstream| self.conf.upstreams.has_upstream(plugin, upstream));
+        accepted.ok_or_else(|| {
+            let upstream = String::from_utf8_lossy(upstream);
+            warn!("wasm plugin {plugin}: callout rejected, upstream {upstream} is not in callout_upstreams");
+            Refusal::UnknownUpstream
+        })
+    }
+
+    fn accept_grpc(
+        &self,
+        call: Invocation,
+        callout: CalloutId,
+        opening: GrpcOpening<'_>,
+    ) -> Result<(), GrpcOpenRefusal> {
+        let upstream = self.accept_upstream(call, grpc::upstream_name(opening.upstream))?;
+        let header = grpc::request_header(
+            upstream,
+            opening.service,
+            opening.method,
+            opening.metadata,
+            opening.timeout,
+        )
+        .map_err(|rejected| {
+            self.conf.warn_of_rejected_header_once(&rejected);
+            GrpcOpenRefusal::UnknownUpstream
+        })?;
+        let (handle, commands) = GrpcCalloutHandle::new();
+        {
+            let mut grpc_callouts = self.grpc_callouts.lock();
+            grpc_callouts.retain(|_, handle| !handle.is_ended());
+            grpc_callouts.insert(callout, handle.clone());
+        }
+        self.call_in_progress.lock().accepted.push(AcceptedCallout {
+            id: callout,
+            plugin_conf: self.conf.clone(),
+            upstream: upstream.to_string(),
+            request: Box::new(header),
+            body: opening.body,
+            timeout: opening.timeout.unwrap_or_default(),
+            callback: call.callback,
+            grpc: Some(AcceptedGrpc {
+                stream: opening.timeout.is_none(),
+                commands,
+                handle,
+            }),
+        });
+        Ok(())
+    }
+
+    fn grpc_callout(&self, callout: CalloutId) -> Option<Arc<GrpcCalloutHandle>> {
+        self.grpc_callouts.lock().get(&callout).cloned()
+    }
+}
+
+impl Drop for GuestCalloutService {
+    fn drop(&mut self) {
+        for handle in self.grpc_callouts.get_mut().values() {
+            handle.cancel();
+        }
+    }
 }
 
 impl Callouts for GuestCalloutService {
@@ -72,29 +196,7 @@ impl Callouts for GuestCalloutService {
         request: HttpCall<'_>,
     ) -> Result<(), HttpCallRefusal> {
         let plugin = &self.conf.plugin_name;
-        let mut call_in_progress = self.call_in_progress.lock();
-        match call_in_progress.calling_context {
-            Some(context) if context == call.context => {}
-            // A stream callback that switches to its root context cannot make a callout. The
-            // result would be delivered to the root context on the root callback thread while
-            // the request continued without it.
-            Some(_) => {
-                warn!("wasm plugin {plugin}: callout rejected, not sent from the context of the current callback");
-                return Err(HttpCallRefusal::Failed);
-            }
-            None => {
-                warn!("wasm plugin {plugin}: callout rejected, sent outside of a plugin callback");
-                return Err(HttpCallRefusal::Failed);
-            }
-        }
-        let upstream = std::str::from_utf8(&request.upstream)
-            .ok()
-            .filter(|upstream| self.conf.upstreams.has_upstream(plugin, upstream));
-        let Some(upstream) = upstream else {
-            let upstream = String::from_utf8_lossy(&request.upstream);
-            warn!("wasm plugin {plugin}: callout rejected, upstream {upstream} is not in callout_upstreams");
-            return Err(HttpCallRefusal::UnknownUpstream);
-        };
+        let upstream = self.accept_upstream(call, &request.upstream)?;
         let header = callout_request_header(plugin, &request.headers, request.body.len());
         let header = match header {
             Ok(header) => header,
@@ -106,7 +208,7 @@ impl Callouts for GuestCalloutService {
         if !request.trailers.is_empty() {
             debug!("wasm plugin {plugin}: callout trailers dropped, not supported");
         }
-        call_in_progress.accepted.push(AcceptedCallout {
+        self.call_in_progress.lock().accepted.push(AcceptedCallout {
             id: callout,
             plugin_conf: self.conf.clone(),
             upstream: upstream.to_string(),
@@ -114,8 +216,77 @@ impl Callouts for GuestCalloutService {
             body: Bytes::copy_from_slice(&request.body),
             timeout: self.conf.effective_timeout(request.timeout),
             callback: call.callback,
+            grpc: None,
         });
         Ok(())
+    }
+
+    fn grpc_call(
+        &self,
+        call: Invocation,
+        callout: CalloutId,
+        request: GrpcCall<'_>,
+    ) -> Result<(), GrpcOpenRefusal> {
+        let opening = GrpcOpening {
+            upstream: &request.upstream,
+            service: &request.service,
+            method: &request.method,
+            metadata: &request.initial_metadata,
+            body: grpc::frame::frame(&request.message),
+            timeout: Some(self.conf.effective_timeout(request.timeout)),
+        };
+        self.accept_grpc(call, callout, opening)
+    }
+
+    fn grpc_stream(
+        &self,
+        call: Invocation,
+        callout: CalloutId,
+        request: GrpcStream<'_>,
+    ) -> Result<(), GrpcOpenRefusal> {
+        let opening = GrpcOpening {
+            upstream: &request.upstream,
+            service: &request.service,
+            method: &request.method,
+            metadata: &request.initial_metadata,
+            body: Bytes::new(),
+            timeout: None,
+        };
+        self.accept_grpc(call, callout, opening)
+    }
+
+    fn grpc_send(
+        &self,
+        _call: Invocation,
+        callout: CalloutId,
+        message: &[u8],
+        end_of_stream: bool,
+    ) -> Result<(), Status> {
+        // A message for a stream that has ended is dropped with `OK`, because a guest of the
+        // Rust SDK panics on any other status, and the plugin gets the close of the stream
+        if let Some(handle) = self.grpc_callout(callout) {
+            handle.queue_command(GrpcCommand::Send {
+                message: Bytes::copy_from_slice(message),
+                end_of_stream,
+            });
+        }
+        Ok(())
+    }
+
+    fn grpc_cancel(&self, _call: Invocation, callout: CalloutId) {
+        if let Some(handle) = self.grpc_callouts.lock().remove(&callout) {
+            handle.cancel();
+        }
+        let mut call_in_progress = self.call_in_progress.lock();
+        call_in_progress
+            .accepted
+            .retain(|accepted| accepted.id != callout);
+    }
+
+    fn grpc_close(&self, _call: Invocation, callout: CalloutId) {
+        if let Some(handle) = self.grpc_callout(callout) {
+            handle.queue_command(GrpcCommand::Close);
+        }
     }
 }
 

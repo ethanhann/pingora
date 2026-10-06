@@ -156,7 +156,7 @@ fn run_root_callback_loop(
 
 #[cfg(test)]
 mod tests {
-    use crate::callout::CalloutResult;
+    use crate::callout::{CalloutDelivery, HttpCalloutResult};
     use crate::observability::PrometheusMetricSink;
     use crate::runtime::pool::events::{GuestAddress, SlotIndex};
     use crate::test_support::callouts::{authz_services, callout_ctx_with_services, FixedSender};
@@ -492,7 +492,7 @@ mod tests {
             let loaded = guard.as_ref().unwrap();
             (loaded.guest.id(), loaded.root)
         };
-        let finished = super::root_callouts::FinishedCallout {
+        let arrived = super::root_callouts::ArrivedDelivery {
             address: GuestAddress {
                 slot: SlotIndex {
                     pool_index: 0,
@@ -502,14 +502,11 @@ mod tests {
             },
             context: root,
             id: CalloutId::try_from(7).unwrap(),
-            result: CalloutResult::Failed,
+            delivery: CalloutDelivery::Http(HttpCalloutResult::Failed),
         };
 
         let mut callback_loop = super::callback_loop::RootCallbackLoop::default();
-        callback_loop.run_work(
-            &runtime.inner,
-            &super::work::Work::DeliverCalloutResult(finished),
-        );
+        callback_loop.run_work(&runtime.inner, &super::work::Work::DeliverCallout(arrived));
 
         let warnings = crate_log_lines_with("closed-callout: proxy_on_http_call_response failed");
         assert!(warnings.is_empty(), "{warnings:?}");

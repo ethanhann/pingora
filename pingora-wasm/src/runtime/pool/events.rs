@@ -14,9 +14,9 @@
 
 //! Root callback events
 
-use crate::callout::AcceptedCallout;
+use crate::callout::{AcceptedCallout, GrpcPending};
 use crate::root_callbacks::{EndProgress, RootCallbackPluginState};
-use proxy_wasm_host::abi::v0_2_1::{CalloutId, Changes, ContextId, GuestId, QueueId};
+use proxy_wasm_host::abi::v0_2_1::{CalloutId, CalloutKind, Changes, ContextId, GuestId, QueueId};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::watch;
@@ -53,7 +53,14 @@ pub(crate) enum RootCallbackEvent {
     OpenCalloutsToFail {
         address: GuestAddress,
         context: ContextId,
-        callouts: Vec<CalloutId>,
+        callouts: Vec<(CalloutId, CalloutKind)>,
+    },
+    /// gRPC streams a held context opened during its request, whose events are delivered
+    /// outside of a request from now on.
+    StreamsToAdopt {
+        address: GuestAddress,
+        context: ContextId,
+        streams: Vec<(CalloutId, GrpcPending)>,
     },
     /// The guest called `proxy_done` for a held context.
     HeldContextDone {

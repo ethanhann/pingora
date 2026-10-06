@@ -17,10 +17,13 @@
 //! Each service has a port, a runtime, and a chain of that runtime's plugins.
 
 use super::callout_origins::{CalloutOrigin, CalloutOriginPerPlugin};
+use super::grpc_origin::GrpcOrigin;
 use super::{fixture, guests};
 use once_cell::sync::Lazy;
+use pingora_core::upstreams::peer::HttpPeer;
 use pingora_wasm::{
-    FailPolicy, PrometheusMetricSink, WasmConf, WasmPluginConf, WasmRuntime, WasmServices,
+    FailPolicy, PrometheusMetricSink, StaticCalloutUpstreams, WasmConf, WasmPluginConf,
+    WasmRuntime, WasmServices,
 };
 use prometheus::{Encoder, Registry, TextEncoder};
 use std::fs;
@@ -52,8 +55,16 @@ static CALLOUT_ORIGINS: Lazy<Arc<CalloutOriginPerPlugin>> = Lazy::new(|| {
         ("held-earlier", None),
         ("stay-paused", Some("0")),
         ("callout-chain", Some("0")),
+        ("exercise-upstream", Some("from upstream")),
     ])
 });
+
+static GRPC_ORIGIN: Lazy<Arc<GrpcOrigin>> = Lazy::new(GrpcOrigin::start);
+
+/// Return the gRPC origin of the gRPC test plugins.
+pub fn grpc_origin() -> Arc<GrpcOrigin> {
+    GRPC_ORIGIN.clone()
+}
 
 /// The Prometheus registry for the test metrics, and the one sink every runtime publishes to.
 static METRIC_REGISTRY_AND_SINK: Lazy<(Registry, Arc<PrometheusMetricSink>)> = Lazy::new(|| {
@@ -142,6 +153,17 @@ impl ServicePlans {
         self.services.push((port, runtime, chain, threads));
     }
 
+    /// Add a service on `port` with its own runtime built with `services`.
+    fn service_with(&mut self, port: u16, plugin: WasmPluginConf, services: WasmServices) {
+        let chain = chain_of(std::slice::from_ref(&plugin));
+        self.runtimes.push(RuntimePlan {
+            plugins: vec![plugin],
+            services,
+        });
+        self.services
+            .push((port, self.runtimes.len() - 1, chain, None));
+    }
+
     /// Add a service on `port` running one plugin whose callouts go to its own origin.
     fn service_with_callout_origin(&mut self, port: u16, plugin: WasmPluginConf) {
         let chain = chain_of(std::slice::from_ref(&plugin));
@@ -166,6 +188,12 @@ fn conf_file_with_two_plugins() -> PathBuf {
     let path = first.with_extension("yaml");
     fs::write(&path, yaml).unwrap();
     path
+}
+
+fn services_with_upstreams(upstreams: StaticCalloutUpstreams) -> WasmServices {
+    let mut services = WasmServices::default();
+    services.callout_upstreams = Arc::new(upstreams);
+    services
 }
 
 fn chain_of(plugins: &[WasmPluginConf]) -> Vec<&'static str> {
@@ -310,6 +338,24 @@ pub fn services() -> Vec<(u16, WasmRuntime, Vec<&'static str>, Option<usize>)> {
     let trap_after_logger = guests::trap_on_request_headers("trap-after-logger");
     plans.service(6419, vec![code_logger, trap_after_logger], None);
     plans.service(6420, vec![open(guests::hold("hold-limit-open", 16))], None);
+    let grpc_peer = || HttpPeer::new(GRPC_ORIGIN.addr(), false, String::new());
+    let mut grpcbin = StaticCalloutUpstreams::new();
+    grpcbin.insert("grpcbin", grpc_peer());
+    let grpc_auth = plugin("grpc-auth", fixture("sdk-grpc-auth-random"), 1, "");
+    plans.service_with(6423, grpc_auth, services_with_upstreams(grpcbin));
+    let mut exercise_upstreams = StaticCalloutUpstreams::new();
+    exercise_upstreams.insert("grpc", grpc_peer());
+    let upstream = callout_origin("exercise-upstream").addr();
+    exercise_upstreams.insert("upstream", HttpPeer::new(upstream, false, String::new()));
+    let mut exercise_services = services_with_upstreams(exercise_upstreams);
+    exercise_services
+        .foreign_functions
+        .insert("exercise_echo", |call| {
+            Ok([b"echo ", call.arguments].concat())
+        });
+    let mut exercise = plugin("exercise", fixture("exercise-all"), 1, "");
+    exercise.root_id = "http".to_string();
+    plans.service_with(6424, exercise, exercise_services);
 
     let runtimes: Vec<WasmRuntime> = thread::scope(|scope| {
         let builds: Vec<_> = plans

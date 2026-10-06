@@ -37,6 +37,7 @@ use crate::invalid_conf;
 use crate::observability::WasmMetricSink;
 use crate::properties::WasmProperties;
 use crate::root_callbacks::RootCallbackThread;
+use crate::WasmForeignFunctions;
 use lifecycle::Lifecycle;
 use pingora_core::connectors::http::Connector;
 use pingora_error::{ErrorType, OrErr, Result};
@@ -83,6 +84,7 @@ pub(crate) struct RuntimeInner {
     pub(crate) callout_launcher: CalloutLauncher,
     pub(crate) root_callback_thread: RootCallbackThread,
     pub(crate) fixed_properties: Arc<WasmProperties>,
+    pub(crate) foreign_functions: Arc<WasmForeignFunctions>,
     pub(crate) metric_sink: Arc<dyn WasmMetricSink>,
     names: HashMap<String, usize>,
     shutdown_wait_limit: Duration,
@@ -181,6 +183,7 @@ impl WasmRuntime {
         let metric_sink = services.metric_sink;
         let shared_store = new_shared_store(&root_callback_thread, metric_sink.clone());
         let fixed_properties = Arc::new(services.fixed_properties);
+        let foreign_functions = Arc::new(services.foreign_functions);
         let inputs = PoolInputs {
             engine: &engine,
             host: &host,
@@ -189,6 +192,7 @@ impl WasmRuntime {
             upstreams: services.callout_upstreams,
             metric_sink: metric_sink.clone(),
             fixed_properties: fixed_properties.clone(),
+            foreign_functions: foreign_functions.clone(),
             root_callback_thread: &root_callback_thread,
             threads: services.threads,
         };
@@ -209,6 +213,7 @@ impl WasmRuntime {
                 callout_launcher,
                 root_callback_thread,
                 fixed_properties,
+                foreign_functions,
                 metric_sink,
                 names,
                 shutdown_wait_limit,

@@ -64,22 +64,22 @@ use std::collections::HashMap;
 pub trait CalloutUpstreams: Send + Sync {
     /// Return whether the plugin may send callouts to the upstream.
     ///
-    /// This is called from inside the plugin's `proxy_http_call`, so it must not block. If it
-    /// returns `false`, `proxy_http_call` returns `BAD_ARGUMENT` to the plugin and no callout is
-    /// sent.
+    /// This is called from inside the plugin's `proxy_http_call`, `proxy_grpc_call`, or
+    /// `proxy_grpc_stream`, so it must not block. If it returns `false`, no callout is sent, and
+    /// the plugin gets `BAD_ARGUMENT` from `proxy_http_call` or `PARSE_FAILURE` from a gRPC
+    /// callout.
     fn has_upstream(&self, plugin_name: &str, upstream_name: &str) -> bool;
 
     /// Select the peer for one callout.
     ///
-    /// The time spent here counts against the callout's timeout, and the future is dropped if
-    /// that timeout expires. Return an error if the upstream has no peer to offer, e.g. because
-    /// every backend is unhealthy. The plugin then gets a 503 response with the body
-    /// `no healthy upstream`.
+    /// The time spent here counts against the timeout of an HTTP callout or a gRPC call, and the
+    /// future is dropped if that timeout expires. Return an error if the upstream has no peer to
+    /// offer, e.g. because every backend is unhealthy. The plugin then gets a 503 response with
+    /// the body `no healthy upstream`, or the gRPC status `UNAVAILABLE` for a gRPC callout.
     ///
     /// `HttpPeer::new` resolves a hostname with a blocking call, so build your peers before the
     /// server starts or pass an IP address. A TLS peer needs one of this crate's TLS features,
-    /// such as `openssl` or `rustls`, to be enabled. Without one, the callout fails when its
-    /// timeout expires.
+    /// such as `openssl` or `rustls`, to be enabled. Without one, the callout does not connect.
     async fn callout_peer(&self, target: &CalloutTarget<'_>) -> Result<Box<HttpPeer>>;
 }
 
@@ -89,10 +89,15 @@ pub trait CalloutUpstreams: Send + Sync {
 pub struct CalloutTarget<'a> {
     /// The name of the plugin that made the callout.
     pub plugin_name: &'a str,
-    /// The upstream name the plugin passed to `proxy_http_call`.
+    /// The upstream name the plugin passed with the callout.
+    ///
+    /// A plugin can pass a serialized `GrpcService` message of the xDS API to `proxy_grpc_call`
+    /// or `proxy_grpc_stream`. The name is then its `envoy_grpc.cluster_name` or
+    /// `google_grpc.target_uri`.
     pub upstream_name: &'a str,
-    /// The request header of the callout. Its `host` header holds the `:authority` the plugin
-    /// passed, which you can use as a load balancing key.
+    /// The request header of the callout. For an HTTP callout, its `host` header holds the
+    /// `:authority` the plugin passed, which you can use as a load balancing key. For a gRPC
+    /// callout, it holds the upstream name.
     pub request: &'a RequestHeader,
 }
 

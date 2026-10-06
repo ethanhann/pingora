@@ -14,23 +14,30 @@
 
 //! Recording metric sink for tests
 
-use crate::{PluginFailure, PluginFailureOutcome, PluginFailureReport, WasmMetricSink};
+use crate::{
+    CalloutFailure, PluginFailure, PluginFailureOutcome, PluginFailureReport, WasmMetricSink,
+};
 use parking_lot::Mutex;
 
 /// A failure report as [RecordedFailures] stores it, made up of the plugin name, the failure, the
 /// outcome, and the callback.
 pub(crate) type RecordedFailure = (String, PluginFailure, PluginFailureOutcome, Option<String>);
 
-/// A metric sink that records every plugin failure and every replaced guest.
+/// A metric sink that records every plugin failure, callout failure, and replaced guest.
 #[derive(Default)]
 pub(crate) struct RecordedFailures {
     failures: Mutex<Vec<RecordedFailure>>,
+    callouts: Mutex<Vec<CalloutFailure>>,
     replaced: Mutex<Vec<String>>,
 }
 
 impl RecordedFailures {
     pub(crate) fn failures(&self) -> Vec<RecordedFailure> {
         self.failures.lock().clone()
+    }
+
+    pub(crate) fn callout_failures(&self) -> Vec<CalloutFailure> {
+        self.callouts.lock().clone()
     }
 
     /// Return the plugin name of each replaced guest, in the order they were reported.
@@ -47,6 +54,10 @@ impl WasmMetricSink for RecordedFailures {
             report.outcome,
             report.callback.map(str::to_string),
         ));
+    }
+
+    fn callout_failed(&self, _plugin_name: &str, failure: CalloutFailure) {
+        self.callouts.lock().push(failure);
     }
 
     fn guest_replaced(&self, plugin_name: &str) {

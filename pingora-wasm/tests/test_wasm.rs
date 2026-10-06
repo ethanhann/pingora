@@ -18,6 +18,8 @@ mod utils;
 mod configuration;
 #[path = "test_wasm/fail_policy.rs"]
 mod fail_policy;
+#[path = "test_wasm/grpc.rs"]
+mod grpc;
 #[path = "test_wasm/lifecycle.rs"]
 mod lifecycle;
 #[path = "test_wasm/plugin_services.rs"]

@@ -118,12 +118,14 @@ impl RuntimeInner {
 
 #[cfg(test)]
 mod tests {
+    use crate::callout::GrpcCalloutEvent;
     use crate::test_support::callouts::{authz_services, FixedSender};
     use crate::test_support::{
         crate_log_lines_with, eventually, plugin, record_crate_logs, session, wat_guest,
         RecordedGuestLogs, Wat, GET,
     };
     use crate::WasmRuntime;
+    use bytes::Bytes;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -149,6 +151,31 @@ mod tests {
             (else (i32.const 1)))",
         http_call_response: Some(LOG_RESULT_THEN_DONE),
         delete: LOG_DELETED,
+        ..ROOT_DONE_AT_ONCE
+    };
+
+    /// A guest whose root opens a gRPC stream and sends a gRPC call from `proxy_on_done`, and
+    /// calls `proxy_done` when the call's response arrives.
+    const ROOT_SENDS_GRPC_ON_DONE: Wat = Wat {
+        done: "(if (result i32) (i32.eq (local.get 0) (i32.load (i32.const 600)))
+            (then (call $open_grpc_stream) (drop (call $grpc_call_and_pause)) (i32.const 0))
+            (else (i32.const 1)))",
+        grpc_receive: Some("(call $log_grpc_message (local.get 2)) (drop (call $proxy_done))"),
+        ..ROOT_DONE_AT_ONCE
+    };
+
+    /// A guest whose request context opens a gRPC stream and is held after its request until a
+    /// message arrives on the stream.
+    const HOLDS_CONTEXT_WITH_STREAM: Wat = Wat {
+        request_headers: "(call $open_grpc_stream) (i32.const 0)",
+        done: "(if (result i32) (i32.eq (local.get 0) (i32.load (i32.const 600)))
+            (then (i32.const 1))
+            (else (i32.store (i32.const 604) (local.get 0)) (i32.const 0)))",
+        grpc_receive: Some(
+            "(call $log_grpc_message (local.get 2))
+            (drop (call $set_effective_context (i32.load (i32.const 604))))
+            (drop (call $proxy_done))",
+        ),
         ..ROOT_DONE_AT_ONCE
     };
 
@@ -186,6 +213,8 @@ mod tests {
         response_body: None,
         response_trailers: None,
         http_call_response: None,
+        grpc_receive: None,
+        grpc_close: None,
         log: None,
         tick: None,
         queue_ready: None,
@@ -247,6 +276,49 @@ mod tests {
             "root deleted",
         ];
         assert_eq!(guest_lines(&logs), want);
+    }
+
+    #[tokio::test]
+    async fn end_delivers_grpc_response_then_cancels_open_stream() {
+        let answer = GrpcCalloutEvent::Message(Bytes::from_static(b"answer"));
+        let sender = FixedSender::grpc(vec![answer], Vec::new(), false);
+        let limit = Duration::from_secs(5);
+        let (runtime, logs) = runtime_with("a", ROOT_SENDS_GRPC_ON_DONE, sender.clone(), limit);
+        let mut ctx = runtime.chain(&["a"]).unwrap().new_ctx();
+        let (mut session, _client) = session(GET).await;
+        ctx.request_filter(&mut session).await.unwrap();
+        drop(ctx);
+
+        let ended = timeout(limit, runtime.inner.end()).await;
+
+        assert!(ended.is_ok());
+        assert_eq!(
+            guest_lines(&logs),
+            ["stream deleted", "answer", "root deleted"]
+        );
+        let running_streams = || sender.running_streams.load(Ordering::Relaxed);
+        assert!(eventually(|| running_streams() == 0).await);
+    }
+
+    #[tokio::test]
+    async fn held_context_keeps_stream_until_proxy_done() {
+        let gate = Arc::new(Notify::new());
+        let late = GrpcCalloutEvent::Message(Bytes::from_static(b"late"));
+        let sender = FixedSender::grpc_released_by(gate.clone(), vec![late]);
+        let limit = Duration::from_secs(5);
+        let (runtime, logs) = runtime_with("a", HOLDS_CONTEXT_WITH_STREAM, sender.clone(), limit);
+        let mut ctx = runtime.chain(&["a"]).unwrap().new_ctx();
+        let (mut session, _client) = session(GET).await;
+        ctx.request_filter(&mut session).await.unwrap();
+        ctx.logging(&mut session).await;
+        let running_streams = || sender.running_streams.load(Ordering::Relaxed);
+        assert!(eventually(|| running_streams() == 1).await);
+
+        gate.notify_one();
+
+        assert!(eventually(|| guest_lines(&logs).len() == 2).await);
+        assert_eq!(guest_lines(&logs), ["late", "stream deleted"]);
+        assert!(eventually(|| running_streams() == 0).await);
     }
 
     #[tokio::test]

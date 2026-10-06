@@ -15,9 +15,10 @@
 //! Stream state for callbacks outside of a request
 
 use crate::properties::{join_path, WasmProperties};
+use crate::WasmForeignFunctions;
 use log::warn;
 use proxy_wasm_host::abi::v0_2_1::types::{BufferType, MapType, Status, StreamType};
-use proxy_wasm_host::abi::v0_2_1::{Access, Invocation, LocalResponse, StreamState};
+use proxy_wasm_host::abi::v0_2_1::{Access, ForeignCall, Invocation, LocalResponse, StreamState};
 use proxy_wasm_host::{Buffer, HeaderMap, VecHeaderMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -26,14 +27,20 @@ use std::sync::Arc;
 pub(crate) struct RootCallbackPluginState {
     pub(crate) plugin_name: String,
     pub(crate) fixed_properties: Arc<WasmProperties>,
+    foreign_functions: Arc<WasmForeignFunctions>,
     request_change_warning_logged: AtomicBool,
 }
 
 impl RootCallbackPluginState {
-    pub(crate) fn new(plugin_name: &str, fixed_properties: Arc<WasmProperties>) -> Self {
+    pub(crate) fn new(
+        plugin_name: &str,
+        fixed_properties: Arc<WasmProperties>,
+        foreign_functions: Arc<WasmForeignFunctions>,
+    ) -> Self {
         RootCallbackPluginState {
             plugin_name: plugin_name.to_string(),
             fixed_properties,
+            foreign_functions,
             request_change_warning_logged: AtomicBool::new(false),
         }
     }
@@ -126,6 +133,17 @@ impl StreamState for RootStream {
         }
     }
 
+    fn call_foreign_function(
+        &mut self,
+        _call: Invocation,
+        request: ForeignCall<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Status> {
+        let plugin = &self.plugin;
+        let functions = &plugin.foreign_functions;
+        functions.call(&plugin.plugin_name, &request.name, &request.arguments, out)
+    }
+
     fn set_property(
         &mut self,
         _call: Invocation,
@@ -147,10 +165,31 @@ mod tests {
             .with_callback(Callback::Tick)
     }
 
+    #[test]
+    fn root_callback_calls_foreign_function() {
+        let mut functions = WasmForeignFunctions::new();
+        functions.insert("echo", |call| {
+            Ok([call.plugin_name.as_bytes(), call.arguments].concat())
+        });
+        let plugin = RootCallbackPluginState::new("a", Arc::default(), Arc::new(functions));
+        let mut stream = RootStream::new(Arc::new(plugin));
+        let mut out = Vec::new();
+
+        let called = stream.call_foreign_function(
+            tick_invocation(),
+            ForeignCall::new(&b"echo"[..], &b"-ping"[..]),
+            &mut out,
+        );
+
+        assert_eq!(called, Ok(()));
+        assert_eq!(out, b"a-ping");
+    }
+
     fn root_stream(plugin_name: &str, fixed_properties: WasmProperties) -> RootStream {
         RootStream::new(Arc::new(RootCallbackPluginState::new(
             plugin_name,
             Arc::new(fixed_properties),
+            Arc::default(),
         )))
     }
 

@@ -98,10 +98,10 @@ pub struct WasmPluginConf {
     pub response_body_limit: usize,
     /// The longest a single callout from the plugin may take. Default 10 seconds.
     ///
-    /// A callout normally uses the timeout the plugin passes to `proxy_http_call`. If that
-    /// timeout is zero or longer than this limit, the limit is used instead and a warning is
-    /// logged the first time it happens. Must be greater than zero and less than
-    /// [callout_wait_limit](Self::callout_wait_limit).
+    /// A callout normally uses the timeout the plugin passes to `proxy_http_call` or
+    /// `proxy_grpc_call`. If that timeout is zero or longer than this limit, the limit is used
+    /// instead and a warning is logged the first time it happens. A gRPC stream has no timeout.
+    /// Must be greater than zero and less than [callout_wait_limit](Self::callout_wait_limit).
     pub callout_timeout_limit: Duration,
     /// The longest a filter may wait for the plugin's callouts. Default 30 seconds.
     ///
@@ -121,10 +121,12 @@ pub struct WasmPluginConf {
     /// A timeout of your own around a filter cannot replace this limit. A filter cancelled during
     /// a callout wait fails every later filter of the request. See [FailPolicy].
     pub callout_wait_limit: Duration,
-    /// The maximum size in bytes of a callout response body. Default 1 MiB.
+    /// The maximum size in bytes of a callout response body, or of one gRPC message. Default
+    /// 1 MiB.
     ///
     /// A callout with a larger response body fails, and the plugin receives a result with no
-    /// headers and no body. Must be greater than zero.
+    /// headers and no body. A gRPC callout with a larger message ends with the status
+    /// `RESOURCE_EXHAUSTED`. Must be greater than zero.
     pub callout_response_limit: usize,
     /// The shortest time between two builds of the guest in a slot. Default 1 second.
     ///

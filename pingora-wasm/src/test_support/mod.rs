@@ -57,13 +57,15 @@ pub(crate) struct Wat {
     pub(crate) configure: &'static str,
     pub(crate) request_headers: &'static str,
     pub(crate) done: &'static str,
-    /// Optional callbacks are left out of the guest when `None`, except `http_call_response`
-    /// and `log`, which are then exported with an empty body.
+    /// Optional callbacks are left out of the guest when `None`, except `http_call_response`,
+    /// the gRPC callbacks, and `log`, which are then exported with an empty body.
     pub(crate) request_body: Option<&'static str>,
     pub(crate) response_headers: Option<&'static str>,
     pub(crate) response_body: Option<&'static str>,
     pub(crate) response_trailers: Option<&'static str>,
     pub(crate) http_call_response: Option<&'static str>,
+    pub(crate) grpc_receive: Option<&'static str>,
+    pub(crate) grpc_close: Option<&'static str>,
     pub(crate) log: Option<&'static str>,
     pub(crate) tick: Option<&'static str>,
     pub(crate) queue_ready: Option<&'static str>,
@@ -112,6 +114,8 @@ impl Default for Wat {
             response_body: None,
             response_trailers: None,
             http_call_response: None,
+            grpc_receive: None,
+            grpc_close: None,
             log: None,
             tick: None,
             queue_ready: None,
@@ -201,6 +205,18 @@ pub(crate) fn wat_guest(label: &str, guest: Wat) -> PathBuf {
             "i32 i32 i32 i32 i32",
             guest.http_call_response,
         ),
+        export_with_no_result(
+            "proxy_on_grpc_receive_initial_metadata",
+            "i32 i32 i32",
+            None,
+        ),
+        export_with_no_result("proxy_on_grpc_receive", "i32 i32 i32", guest.grpc_receive),
+        export_with_no_result(
+            "proxy_on_grpc_receive_trailing_metadata",
+            "i32 i32 i32",
+            None,
+        ),
+        export_with_no_result("proxy_on_grpc_close", "i32 i32 i32", guest.grpc_close),
         export_with_no_result("proxy_on_log", "i32", guest.log),
         match guest.tick {
             Some(body) => export_with_no_result("proxy_on_tick", "i32", Some(body)),

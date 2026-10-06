@@ -30,7 +30,7 @@ const CHUNKED: &str = "chunked";
 
 fn response_pause_failure(origin: ResponseSource) -> FilterFailure {
     let what = match origin {
-        ResponseSource::Upstream => "paused on response headers with no callout pending",
+        ResponseSource::Upstream => "paused on response headers with no callout to wait for",
         ResponseSource::Plugin => "paused on plugin response headers, callouts not started",
     };
     FilterFailure::paused(Callback::ResponseHeaders, what)

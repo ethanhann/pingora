@@ -14,8 +14,9 @@
 
 //! Callout client
 
+use super::grpc::{GrpcCommand, GrpcEventSender};
 use super::result::{connect_failure, session_failure, OwnedHeaderPairs, PSEUDO_STATUS};
-use super::{AcceptedCallout, CalloutResult, CalloutTarget, CalloutUpstreams};
+use super::{AcceptedCallout, CalloutTarget, CalloutUpstreams, HttpCalloutResult};
 use crate::observability::{CalloutFailure, WasmMetricSink};
 use crate::WasmServices;
 use async_trait::async_trait;
@@ -29,6 +30,7 @@ use pingora_error::{Error, ErrorType, Result};
 use pingora_timeout::timeout;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 /// The transport a callout is sent over.
 ///
@@ -36,7 +38,15 @@ use std::time::Instant;
 /// without a socket.
 #[async_trait]
 pub(crate) trait CalloutSender: Send + Sync {
-    async fn send(&self, callout: AcceptedCallout) -> CalloutResult;
+    async fn send_http(&self, callout: AcceptedCallout) -> HttpCalloutResult;
+
+    async fn send_grpc(
+        &self,
+        callout: AcceptedCallout,
+        commands: UnboundedReceiver<GrpcCommand>,
+        stream: bool,
+        events: GrpcEventSender,
+    );
 }
 
 pub(crate) struct ConnectorSender {
@@ -64,9 +74,20 @@ impl ConnectorSender {
 
 #[async_trait]
 impl CalloutSender for ConnectorSender {
-    async fn send(&self, callout: AcceptedCallout) -> CalloutResult {
+    async fn send_grpc(
+        &self,
+        callout: AcceptedCallout,
+        commands: UnboundedReceiver<GrpcCommand>,
+        stream: bool,
+        events: GrpcEventSender,
+    ) {
+        self.send_grpc_callout(callout, commands, stream, events)
+            .await;
+    }
+
+    async fn send_http(&self, callout: AcceptedCallout) -> HttpCalloutResult {
         let plugin_name = &callout.plugin_conf.plugin_name;
-        let report_failure = |failure: CalloutFailure, result: CalloutResult| {
+        let report_failure = |failure: CalloutFailure, result: HttpCalloutResult| {
             self.metric_sink.callout_failed(plugin_name, failure);
             result
         };
@@ -77,7 +98,10 @@ impl CalloutSender for ConnectorSender {
                 return report_failure(failure, synthetic_response)
             }
             Err(_) => {
-                return report_failure(CalloutFailure::Timeout, CalloutResult::timeout_response())
+                return report_failure(
+                    CalloutFailure::Timeout,
+                    HttpCalloutResult::timeout_response(),
+                )
             }
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -86,15 +110,17 @@ impl CalloutSender for ConnectorSender {
         let (body, trailers) = match timeout(remaining, body_and_trailers).await {
             Ok(Ok(Some(body_and_trailers))) => body_and_trailers,
             Ok(Ok(None)) => {
-                return report_failure(CalloutFailure::ResponseTooLarge, CalloutResult::Failed)
+                return report_failure(CalloutFailure::ResponseTooLarge, HttpCalloutResult::Failed)
             }
-            _ => return report_failure(CalloutFailure::FailedAfterHeader, CalloutResult::Failed),
+            _ => {
+                return report_failure(CalloutFailure::FailedAfterHeader, HttpCalloutResult::Failed)
+            }
         };
         let idle_timeout = response.peer.idle_timeout();
         self.connector
             .release_http_session(response.session, &*response.peer, idle_timeout)
             .await;
-        CalloutResult::Response {
+        HttpCalloutResult::Response {
             headers: response.headers,
             body,
             trailers,
@@ -106,7 +132,7 @@ impl ConnectorSender {
     async fn send_to_peer(
         &self,
         callout: &AcceptedCallout,
-    ) -> Result<ResponseInProgress, (CalloutFailure, CalloutResult)> {
+    ) -> Result<ResponseInProgress, (CalloutFailure, HttpCalloutResult)> {
         let plugin = &callout.plugin_conf.plugin_name;
         let upstream = &callout.upstream;
         let target = CalloutTarget::new(plugin, upstream, &callout.request);
@@ -114,7 +140,7 @@ impl ConnectorSender {
             Ok(peer) => peer,
             Err(e) => {
                 debug!("wasm plugin {plugin}: no peer for callout upstream {upstream}: {e}");
-                let response = CalloutResult::no_healthy_upstream_response();
+                let response = HttpCalloutResult::no_healthy_upstream_response();
                 return Err((CalloutFailure::NoPeer, response));
             }
         };
@@ -124,7 +150,7 @@ impl ConnectorSender {
                 Ok(connected) => connected,
                 Err(e) => {
                     debug!("wasm plugin {plugin}: failed to connect to callout upstream {upstream}: {e}");
-                    let response = CalloutResult::connect_failure_response(&e);
+                    let response = HttpCalloutResult::connect_failure_response(&e);
                     return Err((connect_failure(&e), response));
                 }
             };
@@ -147,7 +173,7 @@ impl ConnectorSender {
                 continue;
             }
             debug!("wasm plugin {plugin}: callout to upstream {upstream} failed: {e}");
-            let response = CalloutResult::response_for_session_error(&e);
+            let response = HttpCalloutResult::response_for_session_error(&e);
             return Err((session_failure(&e), response));
         }
     }
@@ -306,19 +332,20 @@ mod tests {
             body: Bytes::from_static(body.as_bytes()),
             timeout,
             callback: None,
+            grpc: None,
         }
     }
 
-    async fn send_to(addr: SocketAddr, timeout: Duration) -> CalloutResult {
+    async fn send_to(addr: SocketAddr, timeout: Duration) -> HttpCalloutResult {
         let callout = post_callout("", timeout);
-        sender_to(authz_peer(addr)).send(callout).await
+        sender_to(authz_peer(addr)).send_http(callout).await
     }
 
     /// Return the status and body of a response, asserting that `:status` is its first header.
     ///
     /// A failed callout is returned as the status `failed` with an empty body.
-    fn status_and_body(result: &CalloutResult) -> (String, String) {
-        let CalloutResult::Response { headers, body, .. } = result else {
+    fn status_and_body(result: &HttpCalloutResult) -> (String, String) {
+        let HttpCalloutResult::Response { headers, body, .. } = result else {
             return ("failed".to_string(), String::new());
         };
         let (name, status) = &headers[0];
@@ -379,7 +406,7 @@ mod tests {
         });
         let callout = post_callout("body", NO_TIMEOUT_EXPECTED);
 
-        let result = sender_to(authz_peer(addr)).send(callout).await;
+        let result = sender_to(authz_peer(addr)).send_http(callout).await;
 
         assert_eq!(status_and_body(&result).0, "200");
         let received = received.lock();
@@ -425,7 +452,7 @@ mod tests {
             let result = send_to(addr, timeout).await;
 
             assert_eq!(status_and_body(&result), (status.to_string(), body));
-            let CalloutResult::Response { headers, body, .. } = result else {
+            let HttpCalloutResult::Response { headers, body, .. } = result else {
                 panic!("expected a response");
             };
             let names: Vec<_> = headers.iter().map(|(name, _)| &name[..]).collect();
@@ -441,7 +468,7 @@ mod tests {
         peer.options.read_timeout = Some(SHORT_TIMEOUT);
         let callout = post_callout("", NO_TIMEOUT_EXPECTED);
 
-        let result = sender_to(peer).send(callout).await;
+        let result = sender_to(peer).send_http(callout).await;
 
         let want = ("504".to_string(), "upstream request timeout".to_string());
         assert_eq!(status_and_body(&result), want);
@@ -467,7 +494,7 @@ mod tests {
 
             let result = send_to(addr, timeout).await;
 
-            assert_eq!(result, CalloutResult::Failed);
+            assert_eq!(result, HttpCalloutResult::Failed);
         }
     }
 
@@ -494,9 +521,13 @@ mod tests {
     async fn callout_retries_on_closed_pooled_connection() {
         let addr = start_origin_that_closes_a_pooled_connection().await;
         let sender = sender_to(authz_peer(addr));
-        let first = sender.send(post_callout("", NO_TIMEOUT_EXPECTED)).await;
+        let first = sender
+            .send_http(post_callout("", NO_TIMEOUT_EXPECTED))
+            .await;
 
-        let second = sender.send(post_callout("", NO_TIMEOUT_EXPECTED)).await;
+        let second = sender
+            .send_http(post_callout("", NO_TIMEOUT_EXPECTED))
+            .await;
 
         let ok = ("200".to_string(), "ok".to_string());
         assert_eq!(status_and_body(&first), ok);
@@ -524,7 +555,9 @@ mod tests {
             metric_sink: Arc::new(NoMetricSink),
         };
 
-        let result = sender.send(post_callout("", NO_TIMEOUT_EXPECTED)).await;
+        let result = sender
+            .send_http(post_callout("", NO_TIMEOUT_EXPECTED))
+            .await;
 
         let want = ("503".to_string(), "no healthy upstream".to_string());
         assert_eq!(status_and_body(&result), want);
@@ -555,9 +588,9 @@ mod tests {
         peer.options.set_http_version(2, 2);
         let callout = post_callout("", NO_TIMEOUT_EXPECTED);
 
-        let result = sender_to(peer).send(callout).await;
+        let result = sender_to(peer).send_http(callout).await;
 
-        let CalloutResult::Response {
+        let HttpCalloutResult::Response {
             headers,
             body,
             trailers,

@@ -28,7 +28,7 @@ use proxy_wasm_host::abi::v0_2_1::{Callback, StreamKind};
 use std::time::{Instant, SystemTime};
 
 fn request_pause_failure() -> FilterFailure {
-    let what = "paused on request headers with no callout pending";
+    let what = "paused on request headers with no callout to wait for";
     FilterFailure::paused(Callback::RequestHeaders, what)
 }
 

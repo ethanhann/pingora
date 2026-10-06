@@ -83,7 +83,7 @@ impl WasmCtx {
     ) -> Result<BodyHold> {
         if end_of_stream {
             // No later chunk can release the bytes, so a pause here is a plugin failure
-            let what = "paused on the last body chunk with no callout pending";
+            let what = "paused on the last body chunk with no callout to wait for";
             let failure = FilterFailure::paused(direction.callback(), what);
             self.skip_plugin_or_fail_request(position, failure)?;
             return Ok(BodyHold::EndedBySkip);
