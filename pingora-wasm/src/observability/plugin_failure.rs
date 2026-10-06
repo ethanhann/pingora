@@ -45,10 +45,10 @@ pub enum PluginFailure {
     /// The plugin failed while a body or TCP data it had changed could still have bytes to come.
     ///
     /// Only reported for a plugin with [FailPolicy::Open](crate::FailPolicy::Open), where it is
-    /// the reason the request or connection failed and the plugin was not skipped, so the outcome is always
-    /// [PluginFailureOutcome::Failed]. [FailPolicy](crate::FailPolicy) describes when a changed
-    /// body has this effect. For a plugin with `Closed`, the report has the failure itself, e.g.
-    /// [GuestError](Self::GuestError).
+    /// the reason the request or connection failed and the plugin was not skipped, so the
+    /// outcome is always [PluginFailureOutcome::Failed]. [FailPolicy](crate::FailPolicy)
+    /// describes when a changed body has this effect. For a plugin with `Closed`, the report has
+    /// the failure itself, e.g. [GuestError](Self::GuestError).
     BodyChanged,
     /// The plugin held more body bytes than its limit.
     BodyLimit,

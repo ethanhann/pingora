@@ -163,7 +163,7 @@ impl TcpPlugins {
             if self.wait_deadlines[position].is_some() {
                 return Ok(());
             }
-            // No data arrives before every plugin continued, so nothing would run it again
+            // No data is read until every plugin has continued, so nothing would call this plugin again
             self.new_connection_paused = None;
             let detail = "paused on new connection with no callout to wait for";
             let failure = FilterFailure::paused(Callback::NewConnection, detail);
@@ -437,8 +437,6 @@ mod tests {
 
     #[tokio::test]
     async fn continue_stream_resumes_paused_direction() {
-        // Each case sends its first bytes and, if it has second bytes, waits for the pause and
-        // sends them
         struct Case {
             name: &'static str,
             wat: Wat,
@@ -711,7 +709,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_request_of_skipped_call_is_dropped() {
+    async fn close_request_of_failed_call_is_dropped() {
         let mut closes_and_traps = tcp_plugin(
             "a",
             Wat {

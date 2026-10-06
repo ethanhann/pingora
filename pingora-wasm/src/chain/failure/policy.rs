@@ -109,7 +109,7 @@ impl WasmCtx {
         self.callouts.forget_pending(position);
         let stream = self.stream();
         stream.plugin_response = None;
-        stream.clear_continue_requests();
+        stream.clear_requests();
         Ok(())
     }
 

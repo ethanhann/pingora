@@ -49,7 +49,7 @@ impl TcpPlugins {
     /// Fail each plugin that stays paused with no callout once neither side can send more bytes,
     /// since nothing would run it again.
     pub(in crate::chain::tcp) fn fail_stalled_pauses(&mut self) -> Result<()> {
-        // A callout result can still run a paused plugin, through a resume of another direction
+        // A callout result can resume a direction whose data then calls a paused plugin again
         if self.next_wait_deadline().is_some() {
             return Ok(());
         }
@@ -58,7 +58,7 @@ impl TcpPlugins {
                 continue;
             }
             let callback = self.paused_callback(position);
-            let detail = "paused with no callout to wait for after both directions ended";
+            let detail = "paused with no callout to wait for after both sides stopped sending";
             self.skip_or_fail(position, FilterFailure::paused(callback, detail))?;
         }
         self.run_resumes()

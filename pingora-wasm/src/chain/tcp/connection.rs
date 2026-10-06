@@ -33,8 +33,7 @@ use tokio::sync::Notify;
 
 const READ_SIZE: usize = 16 * 1024;
 
-/// How long a side that a plugin or a peer closed has to write its last bytes when no idle
-/// timeout is set.
+/// How long each side has to write its last bytes after a close, when no idle timeout is set.
 const CLOSE_WRITE_LIMIT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy)]
@@ -109,7 +108,7 @@ pub(super) async fn run_connection<C: ConnectUpstream>(
         Ok(true) if !plugins.close_requested() => {}
         Ok(_) => return close_before_upstream(plugins, connection),
         Err(e) => {
-            error!("TCP connection: closed after plugin failure: {e}");
+            error!("wasm TCP connection: closed after plugin failure: {e}");
             return close_before_upstream(plugins, connection);
         }
     }
@@ -123,7 +122,7 @@ pub(super) async fn run_connection<C: ConnectUpstream>(
             copy(plugins, connection.downstream, upstream, timers, &runtime).await;
         }
         Err(e) => {
-            error!("TCP connection: failed to connect to upstream: {e}");
+            error!("wasm TCP connection: failed to connect to upstream: {e}");
             close_before_upstream(plugins, connection);
         }
     }
@@ -132,7 +131,7 @@ pub(super) async fn run_connection<C: ConnectUpstream>(
 fn close_before_upstream(mut plugins: TcpPlugins, connection: WasmTcpConnection) {
     drop(connection);
     if let Err(e) = plugins.run_close(Direction::Downstream, PeerType::Local) {
-        error!("TCP connection: plugin failure while closing: {e}");
+        error!("wasm TCP connection: plugin failure while closing: {e}");
     }
     plugins.end_contexts();
 }
@@ -199,8 +198,8 @@ impl Side {
         self.read_done && self.writer.has_ended()
     }
 
-    /// Return whether the loop should stop, after a read of `read`. A read of zero bytes ends
-    /// the direction, and a read error ends the connection.
+    /// Pass a read result to the plugins, and return `true` if the loop should stop. A read of
+    /// zero bytes ends the direction, and a read error ends the connection.
     fn on_read(
         &mut self,
         plugins: &mut TcpPlugins,
@@ -224,7 +223,7 @@ impl Side {
                 self.read_done = true;
                 self.ended_by_peer = true;
                 debug!(
-                    "TCP connection: failed to read from {}: {e}",
+                    "wasm TCP connection: failed to read from {}: {e}",
                     direction.name()
                 );
                 Ok(true)
@@ -326,7 +325,7 @@ async fn copy(
             Ok(false) => {}
             Ok(true) => break Stop::Closed,
             Err(e) => {
-                error!("TCP connection: closed after plugin failure: {e}");
+                error!("wasm TCP connection: closed after plugin failure: {e}");
                 break Stop::Closed;
             }
         }
@@ -354,7 +353,7 @@ async fn copy(
         };
         if !ran {
             if let Err(e) = plugins.run_close(side, peer) {
-                error!("TCP connection: plugin failure while closing: {e}");
+                error!("wasm TCP connection: plugin failure while closing: {e}");
             }
         }
     }
@@ -552,7 +551,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_ends_connection_whose_peer_does_not_read() {
+    async fn drain_does_not_wait_for_unread_bytes() {
         let tcp = TcpRuntime::new(vec![tcp_plugin("a", Wat::default())]);
         let mut options = ConnectOptions {
             stream_buffer: 1024,
@@ -587,7 +586,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_that_goes_away_gives_remote_close() {
+    async fn dropped_upstream_gives_remote_close() {
         let tcp = TcpRuntime::new(vec![tcp_plugin("a", logs_closes(Wat::default()))]);
         let mut connection = tcp.connect(ConnectOptions::default());
         send(&mut connection.client, "a").await;

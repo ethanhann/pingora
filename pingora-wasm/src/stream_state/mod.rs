@@ -84,7 +84,7 @@ impl PingoraStream {
         }
     }
 
-    pub(crate) fn clear_continue_requests(&mut self) {
+    pub(crate) fn clear_requests(&mut self) {
         self.asked_to_continue_request = false;
         self.asked_to_continue_response = false;
         if let Some(tcp) = &mut self.tcp {

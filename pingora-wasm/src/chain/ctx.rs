@@ -130,7 +130,7 @@ impl WasmCtx {
         context: ContextId,
         body: impl FnOnce(&mut CallScope<'_, PingoraStream>) -> R,
     ) -> R {
-        self.stream.clear_continue_requests();
+        self.stream.clear_requests();
         self.stream.plugin_name = loaded.plugin_name.clone();
         let service = loaded.callout_service.clone();
         let guest_call = || self.run(&mut loaded.guest, body);

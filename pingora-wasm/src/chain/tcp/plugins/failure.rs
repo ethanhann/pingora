@@ -45,7 +45,6 @@ impl TcpPlugins {
             }
         }
         self.ctx.skip_plugin_or_fail_request(position, failure)?;
-        self.tcp().take_close_request();
         if self.new_connection_paused == Some(position) {
             self.resumes
                 .push_back(super::Resume::NewConnection(position));
