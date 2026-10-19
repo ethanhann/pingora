@@ -76,8 +76,9 @@ jobs:
       - name: Run cargo check
         run: |
           if [[ ${{ matrix.toolchain }} == 1.85.0 ]]; then
-            # pingora-foundations follows Foundations' higher MSRV and is covered by the other toolchains in this matrix.
-            cargo check --workspace --exclude pingora-foundations
+            # pingora-foundations follows Foundations' higher MSRV and pingora-wasm follows wasmtime's.
+            # Both are covered by the other toolchains in this matrix.
+            cargo check --workspace --exclude pingora-foundations --exclude pingora-wasm
           else
             cargo check --workspace
           fi

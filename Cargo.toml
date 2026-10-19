@@ -28,6 +28,7 @@ members = [
     "pingora-prometheus",
     "pingora-foundations",
     "pingora-test-utils",
+    "pingora-wasm",
     "tinyufo",
 ]
 
@@ -53,3 +54,16 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 [profile.bench]
 debug = true
+
+# The pingora-wasm tests compile Wasm modules with Cranelift at run time, which takes up most
+# of the test time unless Cranelift itself is built with optimizations.
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+[profile.dev.package.regalloc2]
+opt-level = 3
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3
+[profile.dev.package.wasmtime-environ]
+opt-level = 3
+[profile.dev.package.wasmparser]
+opt-level = 3

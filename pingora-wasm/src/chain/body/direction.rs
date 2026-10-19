@@ -1,0 +1,86 @@
+// Copyright 2026 Cloudflare, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Body direction
+
+use crate::chain::wait::PausedPhase;
+use crate::runtime::pool::PluginPhases;
+use crate::{ERR_REQUEST_BODY_TOO_LARGE, ERR_RESPONSE_BODY_TOO_LARGE};
+use pingora_error::ErrorType;
+use proxy_wasm_host::abi::v0_2_1::types::StreamType;
+use proxy_wasm_host::abi::v0_2_1::Callback;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BodyDirection {
+    Request,
+    Response,
+}
+
+impl BodyDirection {
+    pub(super) fn runs(self, conf: &PluginPhases) -> bool {
+        match self {
+            BodyDirection::Request => conf.request,
+            BodyDirection::Response => conf.response,
+        }
+    }
+
+    pub(super) fn limit(self, conf: &PluginPhases) -> usize {
+        match self {
+            BodyDirection::Request => conf.request_limit,
+            BodyDirection::Response => conf.response_limit,
+        }
+    }
+
+    pub(crate) fn too_large(self) -> ErrorType {
+        match self {
+            BodyDirection::Request => ERR_REQUEST_BODY_TOO_LARGE,
+            BodyDirection::Response => ERR_RESPONSE_BODY_TOO_LARGE,
+        }
+    }
+
+    pub(crate) fn body_and_limit_names(self) -> (&'static str, &'static str) {
+        match self {
+            BodyDirection::Request => ("request", "request_body_limit"),
+            BodyDirection::Response => ("response", "response_body_limit"),
+        }
+    }
+
+    pub(super) fn stream_type(self) -> StreamType {
+        match self {
+            BodyDirection::Request => StreamType::HttpRequest,
+            BodyDirection::Response => StreamType::HttpResponse,
+        }
+    }
+
+    pub(super) fn paused_phase(self) -> PausedPhase<'static> {
+        match self {
+            BodyDirection::Request => PausedPhase::RequestBody,
+            BodyDirection::Response => PausedPhase::ResponseBody,
+        }
+    }
+
+    pub(super) fn position_at_step(self, step: usize, count: usize) -> usize {
+        match self {
+            BodyDirection::Request => step,
+            BodyDirection::Response => count - 1 - step,
+        }
+    }
+
+    pub(crate) fn callback(self) -> Callback {
+        match self {
+            BodyDirection::Request => Callback::RequestBody,
+            BodyDirection::Response => Callback::ResponseBody,
+        }
+    }
+}

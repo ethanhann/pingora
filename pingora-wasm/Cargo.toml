@@ -1,0 +1,71 @@
+[package]
+name = "pingora-wasm"
+version = "0.9.0"
+authors = ["Ethan Hann <ethanhann@gmail.com>"]
+license = "Apache-2.0"
+edition = "2021"
+rust-version = "1.96"
+repository = "https://github.com/cloudflare/pingora"
+categories = ["asynchronous", "network-programming", "wasm"]
+keywords = ["proxy-wasm", "pingora", "wasm", "proxy"]
+exclude = ["tests/*"]
+description = """
+Proxy-Wasm plugin support for Pingora proxies.
+"""
+
+[lib]
+name = "pingora_wasm"
+path = "src/lib.rs"
+
+[dependencies]
+pingora-core = { version = "0.9.0", path = "../pingora-core", default-features = false }
+pingora-proxy = { version = "0.9.0", path = "../pingora-proxy", default-features = false }
+pingora-http = { version = "0.9.0", path = "../pingora-http" }
+pingora-error = { version = "0.9.0", path = "../pingora-error" }
+pingora-timeout = { version = "0.9.0", path = "../pingora-timeout" }
+proxy-wasm-host = "0.2"
+arc-swap = "1"
+async-trait = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+log = { workspace = true }
+parking_lot = "0.12"
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "time", "net", "macros"] }
+tracing = { version = "0.1", features = ["log"] }
+futures = { workspace = true }
+h2 = { workspace = true }
+once_cell = { workspace = true }
+prometheus = "0.14"
+rand = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+pingora-load-balancing = { version = "0.9.0", path = "../pingora-load-balancing", default-features = false }
+pingora-test-utils = { version = "0.9.0", path = "../pingora-test-utils" }
+pingora-prometheus = { version = "0.9.0", path = "../pingora-prometheus" }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
+reqwest = { version = "0.13", default-features = false, features = ["http2"] }
+wat = "1"
+libc = "0.2"
+criterion = "0.8"
+env_logger = "0.11"
+serde_yaml = "0.9"
+
+[[bench]]
+name = "filters"
+harness = false
+
+[features]
+default = []
+openssl = ["pingora-core/openssl", "pingora-proxy/openssl", "openssl_derived"]
+boringssl = ["pingora-core/boringssl", "pingora-proxy/boringssl", "openssl_derived"]
+rustls = ["pingora-core/rustls", "pingora-proxy/rustls", "any_tls"]
+s2n = ["pingora-core/s2n", "pingora-proxy/s2n", "any_tls"]
+openssl_derived = ["any_tls"]
+any_tls = []
+
+[package.metadata.cargo-machete]
+ignored = ["tracing"]
+
+[lints]
+workspace = true
